@@ -1,0 +1,16 @@
+# binaries
+/aiproxy
+/dist/
+
+# test + coverage output
+*.test
+*.out
+coverage.*
+
+# local state that must never be committed (tokens, usage db)
+*.db
+*.db-wal
+*.db-shm
+/config.json
+
+.DS_Store
