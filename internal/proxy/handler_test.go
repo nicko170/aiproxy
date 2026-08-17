@@ -263,6 +263,36 @@ func TestRouterDoesNotProxyUnknownReservedPaths(t *testing.T) {
 	}
 }
 
+// A wrong METHOD on a KNOWN control path must also terminate locally. chi
+// propagates a parent router's MethodNotAllowed handler into an already-mounted
+// subrouter that has none of its own, so without an explicit cp.MethodNotAllowed
+// the reserved subtree falls through to the proxy catch-all and the control path
+// is forwarded upstream with an account credential injected. The unknown-path
+// test above does not catch that: an unknown path is a NotFound, not a
+// MethodNotAllowed.
+func TestRouterDoesNotProxyWrongMethodsOnReservedPaths(t *testing.T) {
+	const path = ReservedPrefix + "/api/v1/status"
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+		req, _ := http.NewRequest(method, h.srv.URL+path, strings.NewReader(`{}`))
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", method, err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+
+		if res.StatusCode < 400 || res.StatusCode > 499 {
+			t.Errorf("%s %s: status = %d, want a local 4xx", method, path, res.StatusCode)
+		}
+		if n := len(h.up.Requests()); n != 0 {
+			t.Errorf("%s %s: %d upstream requests; a reserved path must never be proxied",
+				method, path, n)
+		}
+	}
+}
+
 // The relay aborts a truncated stream by panicking http.ErrAbortHandler. That
 // must survive the router's recovery middleware: if Recoverer swallowed it, the
 // chunked body would be finished cleanly and the client would accept a partial

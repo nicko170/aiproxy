@@ -28,6 +28,16 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.NotFound(func(w http.ResponseWriter, _ *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found_error", "No such aiproxy endpoint")
 		})
+		// MethodNotAllowed must be set HERE as well, not only on the parent. chi
+		// propagates the parent's handler into an already-mounted subrouter that
+		// has none of its own, so with only the parent's set — which is the proxy
+		// catch-all — a wrong method on a real control path (POST
+		// /_aiproxy/api/v1/status) is forwarded upstream with an account
+		// credential injected and answered by the provider.
+		cp.MethodNotAllowed(func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusMethodNotAllowed, "invalid_request_error",
+				"Method not allowed on this aiproxy endpoint")
+		})
 	})
 
 	if o.Upstream != "" {

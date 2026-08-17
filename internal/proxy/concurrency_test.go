@@ -31,6 +31,8 @@ func TestConcurrentStreamsAllComplete(t *testing.T) {
 
 	var wg sync.WaitGroup
 	statuses := make([]int, n)
+	bodies := make([]string, n)
+	readErrs := make([]error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -41,9 +43,11 @@ func TestConcurrentStreamsAllComplete(t *testing.T) {
 				t.Errorf("request %d: %v", i, err)
 				return
 			}
-			io.Copy(io.Discard, res.Body)
+			body, readErr := io.ReadAll(res.Body)
 			res.Body.Close()
 			statuses[i] = res.StatusCode
+			bodies[i] = string(body)
+			readErrs[i] = readErr
 		}(i)
 	}
 
@@ -59,8 +63,28 @@ func TestConcurrentStreamsAllComplete(t *testing.T) {
 		if s != 200 {
 			t.Errorf("request %d: status %d, want 200", i, s)
 		}
+		// Each stream must have been relayed to completion, not merely started.
+		// Under concurrency a truncated relay shows up here rather than in the
+		// status, which was written before the first chunk.
+		if readErrs[i] != nil {
+			t.Errorf("request %d: body read failed: %v", i, readErrs[i])
+		}
+		if !strings.Contains(bodies[i], "message_delta") {
+			t.Errorf("request %d: stream did not complete: %q", i, bodies[i])
+		}
 	}
-	// Every slot taken must have been released.
+
+	// Slot accounting. A bare "InFlight == 0 at the end" is close to a tautology:
+	// Release runs as soon as response headers arrive, well before the client has
+	// finished reading, so by the time this line runs every slot is long since
+	// returned no matter what happened in between. The count of upstream requests
+	// is what makes it mean something — exactly n admissions were granted and
+	// exactly n were used, with no request silently retried or dropped — and only
+	// then is a non-zero InFlight evidence of a leak rather than of timing.
+	if got := len(h.upstream.Requests()); got != n {
+		t.Errorf("upstream saw %d requests, want exactly %d: every admitted request "+
+			"should be attempted once, with none retried or lost", got, n)
+	}
 	for _, a := range h.mgr.Snapshot() {
 		if a.InFlight != 0 {
 			t.Errorf("account %s left InFlight=%d; a slot leaked", a.ID, a.InFlight)

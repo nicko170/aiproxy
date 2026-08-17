@@ -31,12 +31,37 @@ func quietLogger() *slog.Logger {
 // the proxy does after a 401 would instead be a test of internet access.
 func fakeTokenEndpoint(t *testing.T) string {
 	t.Helper()
+	srv, _ := slowTokenEndpoint(t, 0)
+	return srv
+}
+
+// slowTokenEndpoint is a token endpoint that takes delay to answer, plus a
+// counter of how many refreshes it served. The count is what makes budget
+// accounting for refreshes testable without depending on wall-clock precision.
+func slowTokenEndpoint(t *testing.T, delay time.Duration) (string, func() int) {
+	t.Helper()
+	var mu sync.Mutex
+	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		if delay > 0 {
+			select {
+			case <-time.After(delay):
+			case <-r.Context().Done():
+				return
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"access_token":"at2","refresh_token":"rt2","expires_in":3600}`)
 	}))
 	t.Cleanup(srv.Close)
-	return srv.URL
+	return srv.URL, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls
+	}
 }
 
 // harness wires N accounts against one fake upstream through a real HTTP server,
@@ -63,7 +88,26 @@ func (h *harness) last() Result {
 func newHarness(t *testing.T, nAccounts int, cfg RetryConfig, scripts ...testutil.Script) *harness {
 	t.Helper()
 	up := testutil.NewFakeUpstream(t, scripts...)
+	return newHarnessAgainst(t, up, up.URL(), nAccounts, cfg, harnessTweaks{})
+}
 
+// harnessTweaks are the knobs the budget tests need: a token endpoint that is
+// slow to answer, and credentials already inside the refresh threshold so the
+// attempt loop actually refreshes them.
+type harnessTweaks struct {
+	tokenEndpoint string
+	credExpiresIn time.Duration // 0 means an hour away, i.e. no refresh due
+}
+
+// newHarnessAgainst wires nAccounts at an arbitrary upstream URL. up may be nil
+// when the upstream is not a testutil.FakeUpstream.
+func newHarnessAgainst(t *testing.T, up *testutil.FakeUpstream, upstreamURL string, nAccounts int, cfg RetryConfig, tw harnessTweaks) *harness {
+	t.Helper()
+
+	expiresIn := tw.credExpiresIn
+	if expiresIn == 0 {
+		expiresIn = time.Hour
+	}
 	accts := make([]config.Account, 0, nAccounts)
 	for i := 0; i < nAccounts; i++ {
 		accts = append(accts, config.Account{
@@ -71,16 +115,20 @@ func newHarness(t *testing.T, nAccounts int, cfg RetryConfig, scripts ...testuti
 			Provider: "anthropic",
 			Label:    "acct-" + strconv.Itoa(i),
 			Priority: i,
-			Upstream: up.URL(),
+			Upstream: upstreamURL,
 			Credential: provider.Credential{
 				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
-				ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+				ExpiresAt: time.Now().Add(expiresIn).UnixMilli(),
 			},
 		})
 	}
 
 	p := anthropic.New(http.DefaultClient)
-	p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	if tw.tokenEndpoint != "" {
+		p.TokenEndpointOverride = tw.tokenEndpoint
+	} else {
+		p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	}
 	providers := map[string]provider.Provider{"anthropic": p}
 	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
@@ -156,16 +204,216 @@ func TestAttemptBoundsTotalWaitOnHeaderlessRateLimits(t *testing.T) {
 	if res.StatusCode != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429", res.StatusCode)
 	}
-	// Generous ceiling: the point is that it is bounded at all, and nowhere near
-	// the minutes a fabricated per-account delay would produce.
-	if elapsed > cfg.Budget+2*time.Second {
+	// The real measurement: wall-clock dead air from request to response. This is
+	// deliberately tight. The 2s of slack it used to carry is precisely why two
+	// other unbounded-wait defects — a zero Retry-After spin and refresh time
+	// escaping the budget — sailed through this gate.
+	if elapsed > cfg.Budget+400*time.Millisecond {
 		t.Fatalf("client waited %v with a %v budget — the wait is not bounded", elapsed, cfg.Budget)
 	}
-	if h.last().WaitMS > cfg.Budget.Milliseconds()+250 {
-		t.Errorf("recorded wait %dms exceeds the %v budget", h.last().WaitMS, cfg.Budget)
+	// WaitMS must record the dead air that actually happened. Asserting only an
+	// upper bound cannot fail: WaitMS is Budget - Remaining, so it is bounded by
+	// Budget by construction. The lower bound is the falsifiable half, and it is
+	// what catches the deferred accounting writing to a dead local.
+	wait := h.last().WaitMS
+	if wait <= 0 {
+		t.Errorf("WaitMS = %d; this request spent real time backing off, so the "+
+			"accounting is not reaching the caller", wait)
+	}
+	if wait > cfg.Budget.Milliseconds() {
+		t.Errorf("WaitMS = %d, which exceeds the whole %v budget", wait, cfg.Budget)
 	}
 	if res.Header.Get("Retry-After") == "" {
 		t.Error("a 429 to the client must carry a Retry-After it can act on")
+	}
+}
+
+// LOAD-BEARING. A persistent 429 whose Retry-After is literally "0" used to be
+// an unbounded hot loop: zero classified as a real hint, so the inline
+// absorption waited zero, spent zero budget, excluded nobody, and went straight
+// back to the top. Measured before the fix: 75,933 upstream attempts in 3s with
+// no bytes to the client.
+//
+// This shape is real — Anthropic's /api/oauth/usage has been observed answering
+// exactly 429 with Retry-After: 0 — so it must be assumed possible anywhere.
+func TestAttemptBoundsAttemptsOnZeroRetryAfter(t *testing.T) {
+	cfg := RetryConfig{Budget: time.Second, InlineAbsorbMax: 5 * time.Second, BodyIdle: 5 * time.Second}
+	h := newHarness(t, 3, cfg, testutil.Script{
+		Status: 429, Header: http.Header{"Retry-After": []string{"0"}},
+	}) // repeats forever
+
+	res, elapsed := h.post()
+
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", res.StatusCode)
+	}
+	if elapsed > cfg.Budget+500*time.Millisecond {
+		t.Fatalf("client waited %v with a %v budget — a zero hint is not being floored", elapsed, cfg.Budget)
+	}
+	// The floor, asserted on its own: a zero hint must still yield the socket for
+	// a real minimum rather than retrying instantly. Without this the send cap is
+	// the only thing between us and a spin.
+	if elapsed < minRetryWait {
+		t.Errorf("answered in %v, faster than the %v floor — a zero hint is being retried instantly",
+			elapsed, minRetryWait)
+	}
+	// Each wait is floored at 250ms and drawn from a 1s budget, so a handful of
+	// attempts is the ceiling. Single digits is what separates a bounded retry
+	// from a spin.
+	if n := len(h.upstream.Requests()); n >= 10 {
+		t.Errorf("made %d upstream attempts; a zero retry hint is spinning", n)
+	}
+}
+
+// The per-account send cap must bind on its own, independent of the budget: with
+// a generous budget the wait schedule alone would keep retrying one account for
+// as long as it is allowed to.
+func TestAttemptCapsSendsPerAccountRegardlessOfBudget(t *testing.T) {
+	const accounts = 3
+	cfg := RetryConfig{Budget: 30 * time.Second, InlineAbsorbMax: 5 * time.Second, BodyIdle: 5 * time.Second}
+	h := newHarness(t, accounts, cfg, testutil.Script{
+		Status: 429, Header: http.Header{"Retry-After": []string{"0"}},
+	})
+
+	res, elapsed := h.post()
+
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", res.StatusCode)
+	}
+	// accounts * maxSendsPerAccount, and not one send more, even though the
+	// budget could have paid for a hundred.
+	if n := len(h.upstream.Requests()); n > accounts*maxSendsPerAccount {
+		t.Errorf("made %d upstream attempts, want at most %d (%d accounts x %d sends)",
+			n, accounts*maxSendsPerAccount, accounts, maxSendsPerAccount)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("took %v; the cap should end this well before the 30s budget", elapsed)
+	}
+}
+
+// A credential refresh is dead air, and elapsed dead air must always be charged.
+// Budget.Spend is all-or-nothing, so charging a refresh that outlasted the
+// remaining budget deducted NOTHING: each account then paid a full refresh and
+// the total grew linearly with the account count. Measured before the fix: 2.26s
+// against a 700ms budget with three accounts.
+//
+// The token-endpoint call count is the primary assertion because it does not
+// depend on wall-clock precision: an escaping refresh shows up as one call per
+// account, a charged one stops as soon as the budget is gone.
+func TestAttemptBoundsTotalWaitOnSlowCredentialRefreshes(t *testing.T) {
+	const (
+		accounts     = 6
+		refreshDelay = 300 * time.Millisecond
+		budget       = 400 * time.Millisecond
+	)
+	tokenURL, tokenCalls := slowTokenEndpoint(t, refreshDelay)
+
+	// 403 on every account: it rotates with no backoff of its own, so the only
+	// thing on the clock is the refreshes.
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 403, Body: `{"error":"nope"}`})
+	h := newHarnessAgainst(t, up, up.URL(), accounts,
+		RetryConfig{Budget: budget, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second},
+		harnessTweaks{
+			tokenEndpoint: tokenURL,
+			// Inside the 5-minute refresh threshold, so every account is due.
+			credExpiresIn: time.Minute,
+		})
+
+	res, elapsed := h.post()
+
+	if res.StatusCode == http.StatusForbidden {
+		t.Error("a 403 must not be relayed to the client")
+	}
+	if res.StatusCode < 400 {
+		t.Errorf("status = %d, want a local error", res.StatusCode)
+	}
+	// Two refreshes fit a 400ms budget at 300ms each: the first is charged and
+	// leaves 100ms, the second drains it. A refresh that escapes accounting
+	// instead pays for all six.
+	if got := tokenCalls(); got > 2 {
+		t.Errorf("refreshed %d times, want at most 2; refresh time is escaping the budget "+
+			"(unaccounted, it costs one refresh per account)", got)
+	}
+	if elapsed > accounts*refreshDelay/2 {
+		t.Errorf("took %v with a %v budget and %v refreshes; the cost is scaling with the account count",
+			elapsed, budget, refreshDelay)
+	}
+}
+
+// headerWithholdingUpstream accepts the request and then says nothing, so
+// response headers never arrive. This is the silence the budget exists to bound;
+// before the fix only the transport's 120s ResponseHeaderTimeout governed it.
+func headerWithholdingUpstream(t *testing.T) string {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	// Cleanups run last-registered-first, so the handlers are released before
+	// Close waits on them. Otherwise the test's own teardown blocks on the
+	// silence it is testing.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv.URL
+}
+
+// LOAD-BEARING. Waiting for response headers is dead air exactly like a backoff.
+// An upstream that accepts a request and then goes quiet must not be able to hold
+// the client past the budget, once per account.
+func TestAttemptBoundsWaitWhenUpstreamWithholdsHeaders(t *testing.T) {
+	cfg := RetryConfig{Budget: 600 * time.Millisecond, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second}
+	h := newHarnessAgainst(t, nil, headerWithholdingUpstream(t), 3, cfg, harnessTweaks{})
+
+	res, elapsed := h.post()
+
+	if elapsed > cfg.Budget+700*time.Millisecond {
+		t.Fatalf("client waited %v with a %v budget — a silent upstream is not bounded by "+
+			"the budget (ResponseHeaderTimeout is 120s per attempt)", elapsed, cfg.Budget)
+	}
+	if res.StatusCode < 400 {
+		t.Errorf("status = %d, want a local error", res.StatusCode)
+	}
+}
+
+// The other half of the per-attempt deadline, and the trap in implementing it:
+// the budget bounds PRE-FIRST-BYTE time only. Once headers are relayed the
+// request cannot be retried and the deadline must be gone, because a real
+// completion streams for minutes. If the attempt's cancel leaks into the
+// response body, every answer longer than the budget is severed mid-sentence —
+// which is a worse version of the defect this proxy exists to fix.
+func TestAttemptBudgetDoesNotCutTheResponseBody(t *testing.T) {
+	// Chunks span ~750ms in total, well past the 300ms budget. Headers arrive at
+	// once, so the budget is satisfied and must then stop applying.
+	cfg := RetryConfig{Budget: 300 * time.Millisecond, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second}
+	h := newHarness(t, 1, cfg, testutil.Script{
+		Status: 200,
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		SSE: []testutil.SSEChunk{
+			{Data: "data: one\n\n"},
+			{Delay: 250 * time.Millisecond, Data: "data: two\n\n"},
+			{Delay: 250 * time.Millisecond, Data: "data: three\n\n"},
+			{Delay: 250 * time.Millisecond, Data: "data: four\n\n"},
+		},
+	})
+
+	res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer res.Body.Close()
+
+	body, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("body read failed after %q: %v — the attempt deadline leaked into the "+
+			"response body and severed a healthy stream", body, readErr)
+	}
+	if !strings.Contains(string(body), "data: four") {
+		t.Errorf("stream truncated at %q; a completion that outlives the budget must "+
+			"still be relayed in full", body)
 	}
 }
 

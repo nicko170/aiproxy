@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,11 +32,29 @@ var connectionSpecific = map[string]bool{
 	"upgrade": true, "proxy-connection": true, "te": true, "trailer": true,
 }
 
+// minRetryWait floors every inline retry wait, hinted or not.
+//
+// A hint of zero is a real statement — "retry promptly" — but taking it
+// literally makes the retry free, and a free retry against a persistent
+// 429/Retry-After: 0 is an unbounded hot loop: no wait to draw the budget down,
+// no account excluded, straight back to the top. That shape is not
+// hypothetical; Anthropic's own /api/oauth/usage endpoint has been observed
+// answering exactly 429 with Retry-After: 0. Zero therefore means "as soon as
+// this floor allows", not "instantly, forever".
+const minRetryWait = 250 * time.Millisecond
+
 // noHintBackoff is the schedule for a 429 that carried no usable hint. Short and
 // finite: the point is to yield the socket briefly, not to guess a duration.
 var noHintBackoff = []time.Duration{
-	250 * time.Millisecond, 500 * time.Millisecond, time.Second,
+	minRetryWait, 500 * time.Millisecond, time.Second,
 }
+
+// maxSendsPerAccount bounds how many times one account may be sent to within a
+// single request. Two is the initial try plus one absorbed retry; a forced
+// refresh after a 401 earns one extra, which is itself bounded by the reauthed
+// set. Without this cap the only thing standing between a misbehaving upstream
+// and a spin is the wait schedule, and any wait that rounds to zero removes it.
+const maxSendsPerAccount = 2
 
 // maxHintHold caps how long a hinted rate limit may hold an account.
 const maxHintHold = 5 * time.Minute
@@ -102,13 +121,19 @@ func NewAttempter(m *account.Manager, providers map[string]provider.Provider, rt
 // relayable response, and every path that does not write is bounded by the
 // budget. That is what makes an unbounded silent hang unreachable — not the
 // choice of any individual backoff constant below.
-func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) Result {
+//
+// The result is NAMED so the deferred WaitMS accounting below is observable. With
+// an unnamed result, `return res` copies into the return slot before the defer
+// runs, and the defer then mutates a dead local — every caller saw WaitMS == 0
+// no matter how much dead air the request actually spent.
+func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) (res Result) {
 	budget := NewBudget(a.cfg.Budget)
-	res := Result{TTFBMS: -1}
+	res = Result{TTFBMS: -1}
 
 	exclude := map[string]bool{}
 	refused := map[string]bool{}
 	reauthed := map[string]bool{}
+	sends := map[string]int{}
 	noHintWaits := 0
 	started := time.Now()
 
@@ -137,7 +162,6 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			return res
 		}
 		res.AccountID = acct.ID
-		res.Attempts++
 
 		prov := a.providers[acct.Provider]
 		if prov == nil {
@@ -146,16 +170,39 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			continue
 		}
 
+		// Checked before the refresh so an account that has used up its tries
+		// costs nothing further. A forced refresh earns one extra send; reauthed
+		// is set at most once per account, so the bonus cannot compound.
+		allowance := maxSendsPerAccount
+		if reauthed[acct.ID] {
+			allowance++
+		}
+		if sends[acct.ID] >= allowance {
+			a.log.Info("account exhausted its attempts for this request, rotating",
+				"account", acct.Label, "sends", sends[acct.ID])
+			exclude[acct.ID] = true
+			res.Rotated = true
+			continue
+		}
+
 		// A credential refresh is dead air like any other, so it is charged to
-		// the budget rather than being free.
+		// the budget rather than being free. Charge, not Spend: Spend is
+		// all-or-nothing, so a refresh that outlasted the remaining budget used
+		// to be charged nothing at all and the cost grew with the account count.
 		refreshStart := time.Now()
 		refreshErr := a.mgr.EnsureFresh(ctx, acct.ID, false)
-		budget.Spend(time.Since(refreshStart))
+		budget.Charge(time.Since(refreshStart))
 		if refreshErr != nil {
 			a.log.Warn("credential refresh failed", "account", acct.Label, "err", refreshErr)
 			exclude[acct.ID] = true
 			res.Rotated = true
 			continue
+		}
+		// A refresh can drain the budget on its own. Answer now rather than
+		// spending another round trip discovering it.
+		if budget.Exhausted() {
+			a.writeExhausted(w, &res, "credential refresh exhausted the budget")
+			return res
 		}
 
 		if err := a.mgr.Admit(ctx, acct.ID, budget); err != nil {
@@ -163,7 +210,15 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 				a.writeExhausted(w, &res, "admission exceeded the budget")
 				return res
 			}
+			// Anything else here is a local failure — an unknown account, or a
+			// cancelled context. Returning without writing lets net/http emit a
+			// clean, empty 200, which a client reads as a successful but empty
+			// answer instead of an error worth retrying.
+			a.log.Error("admission failed", "account", acct.Label, "err", err)
 			res.Outcome = provider.OutcomeServerError
+			res.Status = http.StatusBadGateway
+			a.writeJSON(w, http.StatusBadGateway, nil, "proxy_error",
+				"Could not admit the request to an account.")
 			return res
 		}
 
@@ -174,7 +229,9 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			acct = fresh
 		}
 
-		upstreamRes, err := a.send(ctx, prov, acct, req)
+		sends[acct.ID]++
+		res.Attempts++
+		upstreamRes, err := a.sendWithin(ctx, budget, prov, acct, req)
 		a.mgr.Release(acct.ID)
 
 		if err != nil {
@@ -210,8 +267,10 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			a.mgr.PauseAccount(acct.ID, hold)
 			if outcome.RetryAfter <= a.cfg.InlineAbsorbMax {
 				// Upstream stated a short duration, so waiting genuinely works and
-				// the same account keeps its warm cache.
-				if err := budget.Wait(ctx, outcome.RetryAfter); err != nil {
+				// the same account keeps its warm cache. Floored: a hint of zero
+				// would otherwise make the retry free and spin.
+				wait := max(outcome.RetryAfter, minRetryWait)
+				if err := budget.Wait(ctx, wait); err != nil {
 					a.writeRetryAfter(w, &res, outcome.RetryAfter, "rate limited")
 					return res
 				}
@@ -243,7 +302,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 				reauthed[acct.ID] = true
 				forceStart := time.Now()
 				err := a.mgr.EnsureFresh(ctx, acct.ID, true)
-				budget.Spend(time.Since(forceStart))
+				budget.Charge(time.Since(forceStart))
 				if err == nil {
 					continue // same account, fresh credential
 				}
@@ -274,6 +333,66 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 		a.relay(ctx, w, upstreamRes, prov, &res)
 		return res
 	}
+}
+
+// sendWithin performs one upstream attempt under the remaining budget, and
+// charges whatever it consumed. Waiting for response headers is dead air exactly
+// like a backoff, so leaving it unaccounted let ResponseHeaderTimeout (120s)
+// govern instead of the budget — N attempts could each stall for nearly the
+// whole allowance and the total grew with the number of accounts.
+//
+// The deadline must NOT survive into the response body: a streamed completion
+// legitimately runs for minutes, and cancelling it mid-answer is the very defect
+// this proxy exists to avoid. So the timer is armed only around the round trip.
+// If it fires first the attempt is cancelled and fails. If the round trip wins,
+// the timer is stopped WITHOUT cancelling and the cancel is transferred to the
+// response body, firing when the body is closed.
+func (a *Attempter) sendWithin(ctx context.Context, budget *Budget, prov provider.Provider, acct account.Account, req Request) (*http.Response, error) {
+	attemptCtx, cancel := context.WithCancel(ctx)
+
+	remaining := budget.Remaining()
+	timedOut := make(chan struct{})
+	timer := time.AfterFunc(remaining, func() {
+		close(timedOut)
+		cancel()
+	})
+
+	start := time.Now()
+	res, err := a.send(attemptCtx, prov, acct, req)
+	budget.Charge(time.Since(start))
+
+	if !timer.Stop() {
+		// The timer already fired, so the failure is ours rather than the
+		// upstream's. Report it as such; the loop rotates either way.
+		<-timedOut
+		if res != nil {
+			drain(res)
+		}
+		cancel()
+		return nil, fmt.Errorf("upstream produced no response headers within the remaining %v budget", remaining)
+	}
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+
+	// Transfer the cancel to the body so the attempt context is released when the
+	// relay (or drain) finishes with it, and not a moment before.
+	res.Body = &cancelOnCloseBody{ReadCloser: res.Body, cancel: cancel}
+	return res, nil
+}
+
+// cancelOnCloseBody releases an attempt's context when its body is closed.
+// context.CancelFunc is idempotent, so a double Close is harmless.
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseBody) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // send builds and performs one upstream attempt. acct is taken by value: see the

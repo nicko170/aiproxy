@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -204,7 +206,14 @@ func passthroughHandler(o HandlerOptions) http.HandlerFunc {
 			}
 		}
 		w.WriteHeader(res.StatusCode)
-		Relay(r.Context(), w, res.Body, RelayOptions{BodyIdle: 0}) // 0 takes the default
+		n, relayErr := Relay(r.Context(), w, res.Body, RelayOptions{BodyIdle: 0}) // 0 takes the default
+		if relayErr != nil && !errors.Is(relayErr, context.Canceled) {
+			o.Log.Warn("passthrough relay ended early", "path", r.URL.Path, "err", relayErr, "bytes", n)
+			// Same treatment as the account path: returning normally would let
+			// net/http finish the chunked body cleanly, and a client cannot tell
+			// a cleanly-finished truncated stream from a complete one.
+			panic(http.ErrAbortHandler)
+		}
 	}
 }
 

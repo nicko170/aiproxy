@@ -42,6 +42,41 @@ func TestBudgetSpendDrawsDownAndRefusesOverspend(t *testing.T) {
 	}
 }
 
+// Charge is for time ALREADY spent, so it can never decline: the wall-clock is
+// gone either way. Spend's all-or-nothing contract is wrong for that job —
+// charging a refresh that overran the budget would deduct nothing and leave the
+// loop believing it still had its full allowance.
+func TestBudgetChargeNeverSilentlyDeductsNothing(t *testing.T) {
+	b := NewBudget(time.Second)
+
+	b.Charge(400 * time.Millisecond)
+	if got := b.Remaining(); got != 600*time.Millisecond {
+		t.Errorf("Remaining = %v, want 600ms", got)
+	}
+
+	// An overrun draws the budget down to zero rather than being free.
+	b.Charge(10 * time.Second)
+	if got := b.Remaining(); got != 0 {
+		t.Errorf("Remaining = %v, want 0 after an overrun charge", got)
+	}
+	if !b.Exhausted() {
+		t.Error("an overrun charge must exhaust the budget")
+	}
+
+	// It floors at zero rather than going negative, so Remaining stays meaningful.
+	b.Charge(time.Second)
+	if got := b.Remaining(); got != 0 {
+		t.Errorf("Remaining = %v, want it floored at 0", got)
+	}
+
+	// A negative duration is nonsense from a clock read; it must not refund.
+	b2 := NewBudget(time.Second)
+	b2.Charge(-5 * time.Second)
+	if got := b2.Remaining(); got != time.Second {
+		t.Errorf("Remaining = %v, want an unchanged 1s", got)
+	}
+}
+
 func TestBudgetWaitSleepsAndDrawsDown(t *testing.T) {
 	var slept []time.Duration
 	b := NewBudget(time.Second)

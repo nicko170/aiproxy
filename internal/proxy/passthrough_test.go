@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -45,25 +46,98 @@ func TestPassthroughForwardsClientCredentialUntouched(t *testing.T) {
 	}
 }
 
+// Prefix scoping, in both directions. This needs Upstream set: without it
+// NewRouter registers no passthrough routes at all, so the test passed vacuously
+// and proved nothing about which paths the passthrough claims.
 func TestPassthroughDoesNotClaimOrdinaryPaths(t *testing.T) {
-	h := newRouterHarness(t, func(o *HandlerOptions) {
-		o.PassthroughPrefixes = DefaultPassthroughPrefixes
-	}, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	ptUp := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"passthrough":true}`})
 
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Upstream = ptUp.URL()
+		o.PassthroughPrefixes = DefaultPassthroughPrefixes
+	}, testutil.Script{Status: 200, Body: `{"account":true}`})
+
+	// An ordinary inference path must take the account path.
 	res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
 		strings.NewReader(`{"model":"claude-sonnet-5"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	io.Copy(io.Discard, res.Body)
+	body, _ := io.ReadAll(res.Body)
 	res.Body.Close()
 
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d", res.StatusCode)
 	}
-	// It went through the account path, so a result was recorded.
+	if !strings.Contains(string(body), "account") {
+		t.Errorf("body = %s; /v1/messages was answered by the passthrough upstream", body)
+	}
 	if r := h.lastResult(t); r.AccountID != "acct-0" {
 		t.Errorf("result = %+v; /v1/messages must use account selection", r)
+	}
+	if n := len(ptUp.Requests()); n != 0 {
+		t.Errorf("passthrough upstream saw %d requests; it must not claim /v1/messages", n)
+	}
+	if n := len(h.up.Requests()); n != 1 {
+		t.Errorf("account upstream saw %d requests, want 1", n)
+	}
+
+	// A passthrough prefix, by contrast, must NOT take the account path: no
+	// account is selected and no attempt result is recorded.
+	h.mu.Lock()
+	before := len(h.results)
+	h.mu.Unlock()
+
+	res2, err := http.Get(h.srv.URL + "/v1/code/sessions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body2, _ := io.ReadAll(res2.Body)
+	res2.Body.Close()
+
+	if !strings.Contains(string(body2), "passthrough") {
+		t.Errorf("body = %s; /v1/code/ was not answered by the passthrough upstream", body2)
+	}
+	if n := len(ptUp.Requests()); n != 1 {
+		t.Errorf("passthrough upstream saw %d requests, want 1", n)
+	}
+	if n := len(h.up.Requests()); n != 1 {
+		t.Errorf("account upstream saw %d requests; a passthrough path must not select an account", n)
+	}
+	h.mu.Lock()
+	after := len(h.results)
+	h.mu.Unlock()
+	if after != before {
+		t.Errorf("%d attempt results recorded for a passthrough path; it must not run the attempt loop",
+			after-before)
+	}
+}
+
+// The passthrough must treat a truncated stream exactly as the account path does.
+// Discarding Relay's error finishes the chunked body cleanly, and a client cannot
+// tell that from a complete response — the opposite of the behaviour the account
+// path is careful to get right.
+func TestPassthroughDoesNotEndATruncatedStreamCleanly(t *testing.T) {
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Upstream = truncatingUpstream(t)
+		o.PassthroughPrefixes = DefaultPassthroughPrefixes
+	}, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Get(h.srv.URL + "/v1/code/stream")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (upstream headers were already relayed)", res.StatusCode)
+	}
+	body, readErr := io.ReadAll(res.Body)
+	if !strings.Contains(string(body), "content_block_delta") {
+		t.Errorf("bytes received before the break should still be relayed: %q", body)
+	}
+	if readErr == nil || errors.Is(readErr, io.EOF) {
+		t.Fatalf("read ended with %v; a truncated passthrough stream must not look like a clean finish", readErr)
 	}
 }
 

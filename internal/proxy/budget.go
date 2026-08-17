@@ -56,8 +56,29 @@ func (b *Budget) Remaining() time.Duration {
 
 func (b *Budget) Exhausted() bool { return b.Remaining() <= 0 }
 
+// Charge deducts time that has ALREADY elapsed, clamped to what is left and
+// floored at zero. Unlike Spend it cannot decline: the wall-clock is gone
+// whether or not the budget had room for it, so refusing would leave the caller
+// believing it still holds an allowance it has in fact spent. That is not a
+// hypothetical — charging an elapsed credential refresh through Spend deducted
+// nothing whenever the refresh outlasted the budget, so N accounts each cost a
+// full refresh and the total grew linearly with the account count.
+func (b *Budget) Charge(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if d > b.remaining {
+		b.remaining = 0
+		return
+	}
+	b.remaining -= d
+}
+
 // Spend draws down d, reporting false and changing nothing if d exceeds what is
-// left. Use it for time already consumed, such as an elapsed refresh.
+// left. Use it for time about to be consumed, where all-or-nothing is the point;
+// Wait depends on that contract. For time already elapsed, use Charge.
 func (b *Budget) Spend(d time.Duration) bool {
 	if d < 0 {
 		d = 0
