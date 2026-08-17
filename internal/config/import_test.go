@@ -88,6 +88,49 @@ func TestImportClaudeCodeCredentials(t *testing.T) {
 	}
 }
 
+// A legacy file predating unix-ms timestamps may carry a seconds-scale
+// expiresAt. If that value is stored as-is, a real expiry gets read as a
+// moment in 1970 and the credential looks permanently expired, forcing a
+// refresh on every request.
+func TestImportLegacyNormalizesSecondsScaleExpiresAt(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "legacy.json", `{
+	  "accounts": [
+	    {"name": "seconds@example.com", "type": "oauth",
+	     "accessToken": "at-1", "refreshToken": "rt-1", "expiresAt": 1786986000}
+	  ]
+	}`)
+
+	got, err := ImportFile(p, ImportSourceLegacy)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d accounts, want 1", len(got))
+	}
+	if got[0].Credential.ExpiresAt != 1786986000_000 {
+		t.Errorf("ExpiresAt = %d, want normalized unix ms 1786986000000", got[0].Credential.ExpiresAt)
+	}
+}
+
+// Same defect, Claude Code branch.
+func TestImportClaudeCodeNormalizesSecondsScaleExpiresAt(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "creds.json", `{
+	  "claudeAiOauth": {"accessToken": "at-9", "refreshToken": "rt-9",
+	                    "expiresAt": 1786986000, "subscriptionType": "max"}
+	}`)
+
+	got, err := ImportFile(p, ImportSourceClaudeCode)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d accounts, want 1", len(got))
+	}
+	if got[0].Credential.ExpiresAt != 1786986000_000 {
+		t.Errorf("ExpiresAt = %d, want normalized unix ms 1786986000000", got[0].Credential.ExpiresAt)
+	}
+}
+
 func TestImportSkipsAccountsWithNoUsableCredential(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "legacy.json",
 		`{"accounts":[{"name":"broken","type":"oauth"},{"name":"ok","type":"apikey","apiKey":"k"}]}`)

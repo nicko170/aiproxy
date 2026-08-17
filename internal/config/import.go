@@ -49,6 +49,25 @@ func NewID() string {
 	return hex.EncodeToString(b)
 }
 
+// normalizeExpiresAt converts a possibly-seconds timestamp to unix millis.
+// Values below 1e12 are seconds; anything at or above it is already millis.
+//
+// This is a deliberate duplicate of anthropic.NormalizeExpiresAt: internal/config
+// sits below internal/provider/anthropic in the dependency graph (providers
+// depend on config-shaped types, not the reverse), so config cannot import it.
+// Both copies normalize once, at their own ingestion boundary — here, when
+// reading an external credential file; there, when parsing a token refresh
+// response — rather than at comparison time.
+func normalizeExpiresAt(v int64) int64 {
+	if v == 0 {
+		return 0
+	}
+	if v < 1e12 {
+		return v * 1000
+	}
+	return v
+}
+
 type legacyFile struct {
 	Accounts []legacyAccount `json:"accounts"`
 }
@@ -119,7 +138,7 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 				Type:         provider.CredentialOAuth,
 				AccessToken:  f.ClaudeAiOauth.AccessToken,
 				RefreshToken: f.ClaudeAiOauth.RefreshToken,
-				ExpiresAt:    f.ClaudeAiOauth.ExpiresAt,
+				ExpiresAt:    normalizeExpiresAt(f.ClaudeAiOauth.ExpiresAt),
 			},
 			Identity: Identity{Plan: f.ClaudeAiOauth.SubscriptionType},
 		}}, nil
@@ -143,7 +162,7 @@ func fromLegacy(la legacyAccount) (Account, bool) {
 			Type:         provider.CredentialOAuth,
 			AccessToken:  la.AccessToken,
 			RefreshToken: la.RefreshToken,
-			ExpiresAt:    la.ExpiresAt,
+			ExpiresAt:    normalizeExpiresAt(la.ExpiresAt),
 		}
 	}
 	return Account{
