@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -28,6 +29,17 @@ func NewRouter(o HandlerOptions) http.Handler {
 			writeError(w, http.StatusNotFound, "not_found_error", "No such aiproxy endpoint")
 		})
 	})
+
+	if o.Upstream != "" {
+		pt := passthroughHandler(o)
+		for _, prefix := range o.PassthroughPrefixes {
+			// Register both the bare path and its subtree: a prefix like
+			// "/api/oauth/file_upload" is itself a valid endpoint, while
+			// "/v1/code/" only ever appears with more path after it.
+			r.Handle(strings.TrimSuffix(prefix, "/"), pt)
+			r.Handle(strings.TrimSuffix(prefix, "/")+"/*", pt)
+		}
+	}
 
 	r.NotFound(proxyHandler(o))
 	r.MethodNotAllowed(proxyHandler(o))

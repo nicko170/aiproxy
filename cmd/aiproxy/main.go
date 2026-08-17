@@ -159,6 +159,10 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 		APIKey:        cfg.Listen.APIKey,
 		BlockedModels: cfg.Routing.BlockedModels,
 		Log:           log,
+		// Paths bound to the client's own paired identity, relayed with its
+		// credential rather than a rotated account's.
+		Upstream:            anthropic.DefaultBaseURL,
+		PassthroughPrefixes: proxy.DefaultPassthroughPrefixes,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,

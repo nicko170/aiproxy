@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,7 +46,18 @@ type harness struct {
 	mgr      *account.Manager
 	upstream *testutil.FakeUpstream
 	srv      *httptest.Server
-	lastRes  Result
+
+	// lastRes is written by every handler goroutine, so it is guarded: the
+	// concurrency hammer in concurrency_test.go drives 40 at once.
+	mu      sync.Mutex
+	lastRes Result
+}
+
+// last returns the most recently completed attempt's result.
+func (h *harness) last() Result {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.lastRes
 }
 
 func newHarness(t *testing.T, nAccounts int, cfg RetryConfig, scripts ...testutil.Script) *harness {
@@ -80,10 +92,13 @@ func newHarness(t *testing.T, nAccounts int, cfg RetryConfig, scripts ...testuti
 	at := NewAttempter(mgr, providers, NewTransport(TransportOptions{}), cfg, quietLogger())
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		h.lastRes = at.Do(r.Context(), w, Request{
+		res := at.Do(r.Context(), w, Request{
 			Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header.Clone(),
 			Body: body, Model: "claude-sonnet-5", SessionID: r.Header.Get("x-session"),
 		})
+		h.mu.Lock()
+		h.lastRes = res
+		h.mu.Unlock()
 	}))
 	t.Cleanup(h.srv.Close)
 	return h
@@ -117,8 +132,8 @@ func TestAttemptRelaysASuccessfulResponse(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
-	if h.lastRes.AccountID != "acct-0" || h.lastRes.Attempts != 1 {
-		t.Errorf("result = %+v", h.lastRes)
+	if h.last().AccountID != "acct-0" || h.last().Attempts != 1 {
+		t.Errorf("result = %+v", h.last())
 	}
 	if h.upstream.Requests()[0].Header.Get("Authorization") != "Bearer at" {
 		t.Error("credential was not injected")
@@ -146,8 +161,8 @@ func TestAttemptBoundsTotalWaitOnHeaderlessRateLimits(t *testing.T) {
 	if elapsed > cfg.Budget+2*time.Second {
 		t.Fatalf("client waited %v with a %v budget — the wait is not bounded", elapsed, cfg.Budget)
 	}
-	if h.lastRes.WaitMS > cfg.Budget.Milliseconds()+250 {
-		t.Errorf("recorded wait %dms exceeds the %v budget", h.lastRes.WaitMS, cfg.Budget)
+	if h.last().WaitMS > cfg.Budget.Milliseconds()+250 {
+		t.Errorf("recorded wait %dms exceeds the %v budget", h.last().WaitMS, cfg.Budget)
 	}
 	if res.Header.Get("Retry-After") == "" {
 		t.Error("a 429 to the client must carry a Retry-After it can act on")
@@ -167,10 +182,10 @@ func TestAttemptRotatesOnHeaderlessRateLimit(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200 after rotating to a healthy account", res.StatusCode)
 	}
-	if !h.lastRes.Rotated {
+	if !h.last().Rotated {
 		t.Error("Rotated should be true")
 	}
-	if h.lastRes.AccountID == "acct-0" {
+	if h.last().AccountID == "acct-0" {
 		t.Error("the third attempt should be on a different account")
 	}
 	if n := len(h.upstream.Requests()); n != 3 {
@@ -218,8 +233,8 @@ func TestAttemptAbsorbsShortHintOnTheSameAccount(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
-	if h.lastRes.AccountID != "acct-0" {
-		t.Errorf("served by %q; a hinted throttle must retry the same account", h.lastRes.AccountID)
+	if h.last().AccountID != "acct-0" {
+		t.Errorf("served by %q; a hinted throttle must retry the same account", h.last().AccountID)
 	}
 }
 
@@ -253,8 +268,8 @@ func TestAttemptForcesOneRefreshOn401ThenRetriesSameAccount(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d, want 200", res.StatusCode)
 	}
-	if h.lastRes.AccountID != "acct-0" {
-		t.Errorf("served by %q; a 401 should retry the same account after a refresh", h.lastRes.AccountID)
+	if h.last().AccountID != "acct-0" {
+		t.Errorf("served by %q; a 401 should retry the same account after a refresh", h.last().AccountID)
 	}
 }
 
@@ -289,7 +304,7 @@ func TestAttemptStreamsSSEThrough(t *testing.T) {
 	if res.StatusCode != 200 {
 		t.Fatalf("status = %d", res.StatusCode)
 	}
-	if h.lastRes.Bytes == 0 {
+	if h.last().Bytes == 0 {
 		t.Error("no bytes recorded for a streamed response")
 	}
 }

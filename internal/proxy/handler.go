@@ -94,6 +94,10 @@ type HandlerOptions struct {
 	Log           *slog.Logger
 	// OnResult receives every completed attempt. Stage 2 wires metrics here.
 	OnResult func(Request, Result)
+	// Upstream is the base URL for passthrough paths (no account selection).
+	Upstream string
+	// PassthroughPrefixes are relayed with the client's own credential.
+	PassthroughPrefixes []string
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
@@ -138,6 +142,69 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 		if o.OnResult != nil {
 			o.OnResult(req, res)
 		}
+	}
+}
+
+// DefaultPassthroughPrefixes are upstream paths bound to the CLIENT's own paired
+// identity rather than to a rotated account. Injecting one of our credentials
+// here gets refused upstream and the client quietly loses the feature, so these
+// relay transparently: the client's headers survive, no account is selected, and
+// the body is streamed rather than buffered (some are long-poll channels that
+// withhold response headers for minutes).
+var DefaultPassthroughPrefixes = []string{
+	"/v1/code/",
+	"/api/oauth/files/",
+	"/api/oauth/file_upload",
+	"/v1/oauth/token",
+}
+
+func passthroughHandler(o HandlerOptions) http.HandlerFunc {
+	upstream := strings.TrimSuffix(o.Upstream, "/")
+	client := &http.Client{
+		Transport: NewTransport(TransportOptions{}),
+		// No timeout: these include long-poll channels.
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
+			return
+		}
+
+		out, err := http.NewRequestWithContext(r.Context(), r.Method, upstream+r.URL.RequestURI(), r.Body)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "proxy_error", "Could not build upstream request")
+			return
+		}
+		for k, vs := range r.Header {
+			lk := strings.ToLower(k)
+			// Authorization is deliberately NOT stripped: it is the point.
+			if hopByHop[lk] || lk == "accept-encoding" {
+				continue
+			}
+			for _, v := range vs {
+				out.Header.Add(k, v)
+			}
+		}
+		out.ContentLength = r.ContentLength
+
+		res, err := client.Do(out)
+		if err != nil {
+			o.Log.Warn("passthrough failed", "path", r.URL.Path, "err", err)
+			writeError(w, http.StatusBadGateway, "proxy_error", "Upstream unreachable")
+			return
+		}
+		defer res.Body.Close()
+
+		for k, vs := range res.Header {
+			if connectionSpecific[strings.ToLower(k)] {
+				continue
+			}
+			for _, v := range vs {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(res.StatusCode)
+		Relay(r.Context(), w, res.Body, RelayOptions{BodyIdle: 0}) // 0 takes the default
 	}
 }
 
