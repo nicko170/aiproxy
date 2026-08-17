@@ -89,6 +89,68 @@ func TestEndToEndProxiesAStreamingCompletion(t *testing.T) {
 	}
 }
 
+// buildHandler must wire the upstream transport's ResponseHeaderTimeout from
+// cfg.Retry.HeaderTimeoutMS, not leave it at internal/proxy's fixed 120s
+// default. Proven here with a short configured value against a header-
+// withholding upstream: if the transport default still governed, this request
+// would hang for a full two minutes before anything gave up. Bounding elapsed
+// well under that shows the attempt loop's own timer — sized from this
+// config value — is what fired instead.
+func TestBuildHandlerWiresTransportHeaderTimeoutFromConfig(t *testing.T) {
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	// Cleanups run last-registered-first: release the handler before Close waits
+	// on it, or teardown blocks on the very silence this test is exercising.
+	t.Cleanup(up.Close)
+	t.Cleanup(func() { close(release) })
+
+	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	cfg, err := store.Update(func(c *config.Config) error {
+		c.Retry.HeaderTimeoutMS = 300 // far below the transport's own 120s default
+		c.Retry.BudgetMS = 5000
+		c.Accounts = []config.Account{{
+			ID: "a1", Provider: "anthropic", Label: "test", Upstream: up.URL,
+			Credential: provider.Credential{
+				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+				ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+			},
+		}}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+
+	h, err := buildHandler(cfg, store, quiet())
+	if err != nil {
+		t.Fatalf("buildHandler: %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	start := time.Now()
+	res, err := http.Post(srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-sonnet-5","messages":[]}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	elapsed := time.Since(start)
+	defer res.Body.Close()
+
+	if elapsed > 5*time.Second {
+		t.Fatalf("client waited %v; the transport's ResponseHeaderTimeout is not "+
+			"tracking retry.headerTimeoutMs (it would take 120s if it were)", elapsed)
+	}
+	if res.StatusCode < 400 {
+		t.Errorf("status = %d, want an error — the account never answered", res.StatusCode)
+	}
+}
+
 func TestEndToEndStatusEndpoint(t *testing.T) {
 	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	cfg, _ := store.Update(func(c *config.Config) error { return nil })

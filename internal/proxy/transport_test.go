@@ -77,6 +77,43 @@ func TestNewTransportAppliesOptionsAndDefaults(t *testing.T) {
 	}
 }
 
+// The failure mode this guards against: an operator raises retry.headerTimeoutMs
+// above this package's own 120s default expecting the attempt loop to honour it
+// (§6.2 invites raising it for slower models). If the upstream transport's own
+// ResponseHeaderTimeout were left at that fixed 120s default, the transport-level
+// cutoff would fire first — silently, with a generic error that never mentions
+// headerTimeoutMs at all. TransportHeaderTimeout exists so the transport is
+// derived from the same configured value instead, whatever it is, and NewTransport
+// must pass a value that large straight through rather than re-clamping it.
+func TestTransportHeaderTimeoutHonoursValuesAboveThePackageDefault(t *testing.T) {
+	const configured = 130 * time.Second // above the 120s package default
+
+	derived := TransportHeaderTimeout(configured)
+	if derived <= configured {
+		t.Fatalf("TransportHeaderTimeout(%v) = %v; must exceed the configured value so "+
+			"the attempt loop's own timer always fires first", configured, derived)
+	}
+	if derived <= 120*time.Second {
+		t.Fatalf("TransportHeaderTimeout(%v) = %v; must exceed the package's own 120s "+
+			"default, or a raised headerTimeoutMs is still silently capped there", configured, derived)
+	}
+
+	tr := NewTransport(TransportOptions{ResponseHeaderTimeout: derived})
+	if tr.ResponseHeaderTimeout != derived {
+		t.Fatalf("transport.ResponseHeaderTimeout = %v, want %v — NewTransport must not "+
+			"silently re-clamp a value above its own 120s default", tr.ResponseHeaderTimeout, derived)
+	}
+}
+
+// A caller that has not resolved its config defaults yet (headerTimeout <= 0)
+// must still get a transport timeout consistent with what sendWithin will
+// actually enforce (defaultHeaderTimeout), not the package's unrelated 120s.
+func TestTransportHeaderTimeoutFallsBackToTheAttemptLoopDefault(t *testing.T) {
+	if got, want := TransportHeaderTimeout(0), defaultHeaderTimeout+HeaderTimeoutMargin; got != want {
+		t.Errorf("TransportHeaderTimeout(0) = %v, want %v", got, want)
+	}
+}
+
 // Observes the socket option itself rather than merely asserting a hook was
 // installed: the transport's own DialContext is used to dial a real listener and
 // TCP_NODELAY is read back off the resulting file descriptor.

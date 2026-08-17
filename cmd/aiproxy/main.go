@@ -146,13 +146,22 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 		},
 	})
 
+	// The attempt loop enforces retry.headerTimeoutMs itself (see sendWithin in
+	// internal/proxy/attempt.go); the transport's own ResponseHeaderTimeout must
+	// be derived from that same value rather than left at its package default, or
+	// an operator raising headerTimeoutMs above that default (§6.2 invites this
+	// for slower models) would silently hit the transport's coarser cutoff
+	// instead, with an error that never mentions headerTimeoutMs at all.
+	headerTimeout := time.Duration(cfg.Retry.HeaderTimeoutMS) * time.Millisecond
 	attempter := proxy.NewAttempter(mgr, providers,
-		proxy.NewTransport(proxy.TransportOptions{}),
+		proxy.NewTransport(proxy.TransportOptions{
+			ResponseHeaderTimeout: proxy.TransportHeaderTimeout(headerTimeout),
+		}),
 		proxy.RetryConfig{
 			Budget:          time.Duration(cfg.Retry.BudgetMS) * time.Millisecond,
 			InlineAbsorbMax: time.Duration(cfg.Retry.InlineAbsorbMaxMS) * time.Millisecond,
 			BodyIdle:        time.Duration(cfg.Retry.BodyIdleMS) * time.Millisecond,
-			HeaderTimeout:   time.Duration(cfg.Retry.HeaderTimeoutMS) * time.Millisecond,
+			HeaderTimeout:   headerTimeout,
 		}, log)
 
 	return proxy.NewRouter(proxy.HandlerOptions{

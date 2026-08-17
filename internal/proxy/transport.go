@@ -10,7 +10,15 @@ import (
 
 // TransportOptions tunes the upstream transport. Zero values take defaults.
 type TransportOptions struct {
-	MaxConnsPerHost       int
+	MaxConnsPerHost int
+	// ResponseHeaderTimeout is a coarse, connection-level backstop, not the
+	// per-attempt bound the retry engine enforces (that is retry.headerTimeoutMs,
+	// applied by the attempt loop itself; see attempt.go). Zero takes a 120s
+	// default here, but that default is arbitrary from the retry engine's point
+	// of view and must never be left to silently race retry.headerTimeoutMs: a
+	// caller on that path should pass TransportHeaderTimeout(configuredTimeout)
+	// instead of the zero value, so this field is always derived from, and kept
+	// safely above, the knob an operator actually tunes.
 	ResponseHeaderTimeout time.Duration
 	IdleConnTimeout       time.Duration
 }
@@ -62,4 +70,31 @@ func NewTransport(opts TransportOptions) *http.Transport {
 		TLSHandshakeTimeout:   15 * time.Second,
 		ExpectContinueTimeout: time.Second,
 	}
+}
+
+// HeaderTimeoutMargin is added on top of the configured per-attempt header
+// timeout (retry.headerTimeoutMs) when deriving the upstream transport's own
+// ResponseHeaderTimeout via TransportHeaderTimeout. The margin exists purely so
+// the attempt loop's own timer — which produces the honest, attributable
+// server_error outcome named after headerTimeoutMs (see sendWithin in
+// attempt.go) — always fires first. Without it, an operator raising
+// headerTimeoutMs above whatever this transport happened to be capped at would
+// get a generic, unlabelled transport timeout instead, silently disagreeing
+// with the knob they just changed.
+const HeaderTimeoutMargin = 30 * time.Second
+
+// TransportHeaderTimeout derives the upstream transport's ResponseHeaderTimeout
+// from the same value the attempt loop enforces per attempt, so the two can
+// never silently disagree. Whatever headerTimeout is configured (including
+// values above the 120s this package would otherwise default to), the
+// transport's own coarser, backstop-only cutoff is always set safely above it.
+//
+// headerTimeout <= 0 is treated as "use the attempt loop's own default" so a
+// caller that has not resolved its config defaults yet still gets a transport
+// timeout consistent with what sendWithin will actually enforce.
+func TransportHeaderTimeout(headerTimeout time.Duration) time.Duration {
+	if headerTimeout <= 0 {
+		headerTimeout = defaultHeaderTimeout
+	}
+	return headerTimeout + HeaderTimeoutMargin
 }
