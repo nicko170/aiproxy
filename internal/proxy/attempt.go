@@ -65,10 +65,38 @@ const maxHintHold = 5 * time.Minute
 // that a default client-facing delay is not.
 const defaultQuotaHold = 5 * time.Minute
 
+// defaultHeaderTimeout bounds how long ONE attempt may wait for response
+// headers. It is a different clock from the budget and must stay that way.
+//
+// The budget (§4.2) covers only time WE add: retry backoff, waiting on a paused
+// account in Admit, inline absorption of a hinted rate limit, credential
+// refresh, and the drain of a response we are discarding. Waiting for an
+// upstream's first token is not time we added — a large context with extended
+// thinking legitimately takes seconds to produce response headers, and that is
+// real work, not dead air. Charging it to the budget severed healthy requests:
+// with budgetMs at 1000 against an upstream taking 1.3s to first token, every
+// attempt was cancelled and the client got a 429 with nothing wrong upstream.
+//
+// What the two clocks bound together is the worst case, and it is chosen rather
+// than accidental:
+//
+//	pre-first-byte <= budgetMs + (attempts x headerTimeoutMs)
+//
+// where attempts is itself capped by maxSendsPerAccount x the number of enabled
+// accounts. With the defaults (10s budget, 60s header timeout, 2 sends each)
+// three accounts bound the worst case at 10s + 6x60s. That is deliberately
+// generous: it exists to make an upstream that accepts a connection and then
+// withholds headers forever terminate at all, not to be tight. Tightness on the
+// paths we control is the budget's job.
+const defaultHeaderTimeout = 60 * time.Second
+
 type RetryConfig struct {
 	Budget          time.Duration
 	InlineAbsorbMax time.Duration
 	BodyIdle        time.Duration
+	// HeaderTimeout bounds one attempt's wait for response headers. It does NOT
+	// draw down the budget; see defaultHeaderTimeout.
+	HeaderTimeout time.Duration
 }
 
 // Request is a client request ready to be attempted, body already buffered so it
@@ -111,6 +139,9 @@ func NewAttempter(m *account.Manager, providers map[string]provider.Provider, rt
 	}
 	if cfg.BodyIdle <= 0 {
 		cfg.BodyIdle = 120 * time.Second
+	}
+	if cfg.HeaderTimeout <= 0 {
+		cfg.HeaderTimeout = defaultHeaderTimeout
 	}
 	return &Attempter{mgr: m, providers: providers, rt: rt, cfg: cfg, log: log}
 }
@@ -257,6 +288,17 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 
 		if err != nil {
 			a.log.Warn("upstream request failed", "account", acct.Label, "err", err)
+			// An attempt that was SENT and failed is not "no account was ready".
+			// Leaving the outcome at its zero value let writeExhausted default it to
+			// OutcomeNoAccountReady, so a header timeout — or a dropped connection —
+			// was reported as a fleet with no capacity, which is the opposite of what
+			// happened: an account was selected, admitted, and sent to.
+			//
+			// OutcomeServerError rather than a new kind: the values are persisted and
+			// append-only, and this is not policy-distinct — it rotates like any other
+			// failed send, and the label already means "the attempt failed for a
+			// reason that is neither the client's nor a quota or credential state".
+			res.Outcome = provider.OutcomeServerError
 			exclude[acct.ID] = true
 			res.Rotated = true
 			continue
@@ -372,11 +414,22 @@ func (a *Attempter) ensureFreshWithin(ctx context.Context, budget *Budget, id st
 	return a.mgr.EnsureFresh(refreshCtx, id, force)
 }
 
-// sendWithin performs one upstream attempt under the remaining budget, and
-// charges whatever it consumed. Waiting for response headers is dead air exactly
-// like a backoff, so leaving it unaccounted let ResponseHeaderTimeout (120s)
-// govern instead of the budget — N attempts could each stall for nearly the
-// whole allowance and the total grew with the number of accounts.
+// sendWithin performs one upstream attempt under the HEADER TIMEOUT, which is a
+// different clock from the budget on purpose.
+//
+// The budget is not consulted here and the round trip is not charged to it. The
+// budget covers time the proxy ADDS (§4.2); an upstream thinking its way to a
+// first token adds nothing — it is the work being paid for. Bounding the round
+// trip by budget.Remaining() conflated the two and severed healthy requests: a
+// 1s budget against a 1.3s time-to-first-token cancelled every attempt and
+// answered 429 with a perfectly healthy account on the other end. See
+// defaultHeaderTimeout for the worst case the two clocks bound together.
+//
+// What survives from that earlier fix is the concern underneath it, which was
+// real: an upstream may accept a connection and then withhold headers
+// indefinitely, and the transport's own ResponseHeaderTimeout (120s) is too
+// coarse to be the only answer. HeaderTimeout is that answer instead — finite,
+// per attempt, and generous enough for a slow first token.
 //
 // The deadline must NOT survive into the response body: a streamed completion
 // legitimately runs for minutes, and cancelling it mid-answer is the very defect
@@ -387,26 +440,26 @@ func (a *Attempter) ensureFreshWithin(ctx context.Context, budget *Budget, id st
 func (a *Attempter) sendWithin(ctx context.Context, budget *Budget, prov provider.Provider, acct account.Account, req Request) (*http.Response, error) {
 	attemptCtx, cancel := context.WithCancel(ctx)
 
-	remaining := budget.Remaining()
+	limit := a.cfg.HeaderTimeout
 	timedOut := make(chan struct{})
-	timer := time.AfterFunc(remaining, func() {
+	timer := time.AfterFunc(limit, func() {
 		close(timedOut)
 		cancel()
 	})
 
-	start := time.Now()
 	res, err := a.send(attemptCtx, prov, acct, req)
-	budget.Charge(time.Since(start))
 
 	if !timer.Stop() {
 		// The timer already fired, so the failure is ours rather than the
-		// upstream's. Report it as such; the loop rotates either way.
+		// upstream's. Report it as such; the loop rotates either way. The drain
+		// below IS budget-bounded: discarding a body we have decided not to relay
+		// is time the proxy adds.
 		<-timedOut
 		if res != nil {
 			drainWithin(budget, res)
 		}
 		cancel()
-		return nil, fmt.Errorf("upstream produced no response headers within the remaining %v budget", remaining)
+		return nil, fmt.Errorf("upstream produced no response headers within the %v header timeout", limit)
 	}
 	if err != nil {
 		cancel()

@@ -22,6 +22,11 @@ func TestLoadMissingFileReturnsDefaults(t *testing.T) {
 	if cfg.Retry.InlineAbsorbMaxMS != 5000 {
 		t.Errorf("InlineAbsorbMaxMS = %d, want 5000", cfg.Retry.InlineAbsorbMaxMS)
 	}
+	// The second clock. It is separate from the budget on purpose: it bounds the
+	// upstream's own time-to-first-token, which the budget must not.
+	if cfg.Retry.HeaderTimeoutMS != 60000 {
+		t.Errorf("HeaderTimeoutMS = %d, want 60000", cfg.Retry.HeaderTimeoutMS)
+	}
 	if cfg.QuotaProbe.IntervalSeconds != 300 {
 		t.Errorf("probe interval = %d, want 300", cfg.QuotaProbe.IntervalSeconds)
 	}
@@ -71,6 +76,30 @@ func TestUpdatePersistsAndEnforcesPermissions(t *testing.T) {
 	}
 	if perm := di.Mode().Perm(); perm != 0o700 {
 		t.Errorf("dir perm = %o, want 700", perm)
+	}
+}
+
+// A config written before retry.headerTimeoutMs existed must pick up the default
+// rather than zero. Zero would mean "no per-attempt header timeout at all" to any
+// reader that took the number literally, and the whole point of the field is that
+// it is a chosen, finite bound.
+func TestLoadFillsHeaderTimeoutForAPreExistingConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	// The retry block exactly as it was serialized before this field was added.
+	old := `{"retry":{"budgetMs":3000,"inlineAbsorbMaxMs":5000,"bodyIdleMs":120000}}`
+	if err := os.WriteFile(path, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Retry.BudgetMS != 3000 {
+		t.Errorf("BudgetMS = %d, want the on-disk 3000", cfg.Retry.BudgetMS)
+	}
+	if cfg.Retry.HeaderTimeoutMS != 60000 {
+		t.Errorf("HeaderTimeoutMS = %d, want the 60000 default", cfg.Retry.HeaderTimeoutMS)
 	}
 }
 

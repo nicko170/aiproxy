@@ -18,11 +18,18 @@ type SSEChunk struct {
 
 // Script is one canned response. When SSE is non-empty the response streams
 // those chunks and Body is ignored.
+//
+// HeaderDelay withholds the response HEADERS for that long before writing
+// anything. It models the one thing SSEChunk.Delay cannot: time-to-first-token.
+// A large context with extended thinking legitimately spends seconds upstream
+// before the first byte of the response line exists, and that is the shape a
+// per-attempt deadline has to tolerate rather than sever.
 type Script struct {
-	Status int
-	Header http.Header
-	Body   string
-	SSE    []SSEChunk
+	Status      int
+	Header      http.Header
+	Body        string
+	SSE         []SSEChunk
+	HeaderDelay time.Duration
 }
 
 // RecordedRequest is what the fake upstream observed.
@@ -88,6 +95,14 @@ func (f *FakeUpstream) serve(w http.ResponseWriter, r *http.Request) {
 		Header: r.Header.Clone(),
 		Body:   body,
 	})
+
+	if s.HeaderDelay > 0 {
+		select {
+		case <-time.After(s.HeaderDelay):
+		case <-r.Context().Done():
+			return
+		}
+	}
 
 	for k, vs := range s.Header {
 		for _, v := range vs {

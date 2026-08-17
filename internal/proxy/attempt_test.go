@@ -600,21 +600,188 @@ func headerWithholdingUpstream(t *testing.T) string {
 	return srv.URL
 }
 
-// LOAD-BEARING. Waiting for response headers is dead air exactly like a backoff.
-// An upstream that accepts a request and then goes quiet must not be able to hold
-// the client past the budget, once per account.
+// LOAD-BEARING, and deliberately RESTATED. This test previously asserted that a
+// header-withholding upstream was bounded by the BUDGET. That was the wrong
+// clock and it is the defect being fixed here, not a property being weakened:
+// bounding the round trip by budget.Remaining() cannot distinguish an upstream
+// that is silent from one that is thinking, so a healthy account taking 1.3s to
+// its first token was severed by a 1s budget and answered 429. The property that
+// actually mattered — a silent upstream must terminate rather than hang — is
+// preserved here in full, moved onto the clock that can express it.
+//
+// So: a SHORT headerTimeout and a LONG budget. If the round trip were still
+// drawing on the budget this would run for the whole budget instead, which is
+// what the elapsed ceiling below catches.
 func TestAttemptBoundsWaitWhenUpstreamWithholdsHeaders(t *testing.T) {
-	cfg := RetryConfig{Budget: 600 * time.Millisecond, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second}
-	h := newHarnessAgainst(t, nil, headerWithholdingUpstream(t), 3, cfg, harnessTweaks{})
+	const (
+		accounts      = 3
+		headerTimeout = 200 * time.Millisecond
+		budget        = 10 * time.Second
+	)
+	cfg := RetryConfig{
+		Budget: budget, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second,
+		HeaderTimeout: headerTimeout,
+	}
+	h := newHarnessAgainst(t, nil, headerWithholdingUpstream(t), accounts, cfg, harnessTweaks{})
 
 	res, elapsed := h.post()
 
-	if elapsed > cfg.Budget+700*time.Millisecond {
-		t.Fatalf("client waited %v with a %v budget — a silent upstream is not bounded by "+
-			"the budget (ResponseHeaderTimeout is 120s per attempt)", elapsed, cfg.Budget)
+	// One send per account: a failed attempt excludes the account outright.
+	if ceiling := accounts*headerTimeout + time.Second; elapsed > ceiling {
+		t.Fatalf("client waited %v, want under %v — a silent upstream is not bounded by "+
+			"headerTimeoutMs (the transport's own ResponseHeaderTimeout is 120s)", elapsed, ceiling)
+	}
+	// The other half, and the one that fails if the round trip is still charged to
+	// the budget: the budget is 10s and must have had nothing to do with this.
+	if elapsed >= budget {
+		t.Fatalf("client waited %v with a %v budget — the header timeout is not what "+
+			"bounded this request", elapsed, budget)
 	}
 	if res.StatusCode < 400 {
 		t.Errorf("status = %d, want a local error", res.StatusCode)
+	}
+	// Every attempt died on its own timeout, so the budget is untouched. WaitMS
+	// reports time WE added, and we added none.
+	if wait := h.last().WaitMS; wait > 100 {
+		t.Errorf("WaitMS = %d; waiting for an upstream's headers is not time the proxy "+
+			"added, so it must not be reported as such", wait)
+	}
+}
+
+// THE REGRESSION THIS FIX EXISTS FOR. A healthy account whose first token takes
+// longer than the whole retry budget must still be served.
+//
+// Reproduced against a real account with budgetMs: 1000 and an upstream taking
+// ~1.3s to produce response headers: every attempt was cancelled with "upstream
+// produced no response headers within the remaining 999ms budget", the client
+// got 429 no_account_ready, and Claude Code retried eleven times over three
+// minutes without ever getting through. Nothing was wrong upstream — the round
+// trip was simply drawing on a clock that does not cover it.
+func TestAttemptServesAnUpstreamSlowerThanTheBudget(t *testing.T) {
+	const (
+		budget      = 500 * time.Millisecond
+		headerDelay = 1500 * time.Millisecond
+	)
+	cfg := RetryConfig{
+		Budget: budget, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second,
+		HeaderTimeout: 10 * time.Second,
+	}
+	h := newHarness(t, 1, cfg, testutil.Script{
+		Status:      200,
+		HeaderDelay: headerDelay,
+		Header:      http.Header{"Content-Type": []string{"text/event-stream"}},
+		SSE: []testutil.SSEChunk{
+			{Data: "data: one\n\n"},
+			{Delay: 50 * time.Millisecond, Data: "data: two\n\n"},
+		},
+	})
+
+	res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 — an upstream that takes %v to its first token "+
+			"is doing legitimate work and must not draw down the %v retry budget",
+			res.StatusCode, headerDelay, budget)
+	}
+	body, readErr := io.ReadAll(res.Body)
+	if readErr != nil {
+		t.Fatalf("body read failed after %q: %v", body, readErr)
+	}
+	if !strings.Contains(string(body), "data: two") {
+		t.Errorf("body = %q, want the full stream", body)
+	}
+	if got := h.last().Attempts; got != 1 {
+		t.Errorf("Attempts = %d, want 1 — a slow first token must not trigger a retry", got)
+	}
+}
+
+// An attempt abandoned on the header timeout must not be recorded as
+// no_account_ready. There WAS a ready account; it was sent to, and it timed out.
+//
+// OutcomeServerError is the label chosen, over adding a new kind: the OutcomeKind
+// values are persisted and append-only, and this case is not policy-distinct —
+// nothing in the retry engine branches on it, it rotates exactly like any other
+// failed send. OutcomeServerError already carries the meaning "the attempt failed
+// for a reason that is neither the client's nor a quota or credential state",
+// which is precisely this. What matters is that no_account_ready keeps meaning
+// what its name says, or stage 2's outcome breakdown counts a timed-out upstream
+// as a fleet with no capacity.
+func TestAttemptDoesNotReportNoAccountReadyForAHeaderTimeout(t *testing.T) {
+	cfg := RetryConfig{
+		Budget: 10 * time.Second, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second,
+		HeaderTimeout: 200 * time.Millisecond,
+	}
+	h := newHarnessAgainst(t, nil, headerWithholdingUpstream(t), 2, cfg, harnessTweaks{})
+
+	res, _ := h.post()
+
+	if res.StatusCode < 400 {
+		t.Fatalf("status = %d, want a local error", res.StatusCode)
+	}
+	got := h.last()
+	if got.Attempts == 0 {
+		t.Fatalf("Attempts = 0; this test is not exercising a send at all")
+	}
+	if got.Outcome == provider.OutcomeNoAccountReady {
+		t.Errorf("Outcome = no_account_ready after %d attempts against a ready account; "+
+			"a header timeout is an attempt that failed, not an absence of capacity",
+			got.Attempts)
+	}
+	if got.Outcome != provider.OutcomeServerError {
+		t.Errorf("Outcome = %v, want server_error", got.Outcome)
+	}
+}
+
+// WaitMS is the dead air the PROXY added. A clean single-attempt success adds
+// none, so it must report ~zero even when the upstream itself was slow.
+//
+// The observed defect: a successful single-attempt request logged waitMs=1345
+// alongside ttfbMs=1344 — the round trip reported as though the proxy had spent
+// it backing off. Anything derived from that number in stage 2 would read a
+// healthy fleet as one permanently starved of budget.
+func TestAttemptReportsZeroWaitForACleanSingleAttempt(t *testing.T) {
+	cfg := RetryConfig{
+		Budget: 10 * time.Second, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second,
+		HeaderTimeout: 10 * time.Second,
+	}
+	h := newHarness(t, 1, cfg, testutil.Script{
+		Status:      200,
+		HeaderDelay: 400 * time.Millisecond, // real upstream time, none of it ours
+		Body:        `{"ok":true}`,
+	})
+
+	res, _ := h.post()
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+	got := h.last()
+	if got.Attempts != 1 || got.Rotated {
+		t.Fatalf("result = %+v, want a single clean attempt", got)
+	}
+	if got.WaitMS > 50 {
+		t.Errorf("WaitMS = %d after a single clean attempt (ttfbMs = %d); the upstream "+
+			"round trip is being reported as proxy-added wait", got.WaitMS, got.TTFBMS)
+	}
+	// The counterpart, so the assertion above cannot be satisfied by WaitMS being
+	// dead: real backoff must still show up. Two header-less 429s force two
+	// rotations with a floored backoff each.
+	h2 := newHarness(t, 3, cfg,
+		testutil.Script{Status: 429},
+		testutil.Script{Status: 429},
+		testutil.Script{Status: 200, Body: `{"ok":true}`},
+	)
+	res2, _ := h2.post()
+	if res2.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 after rotating", res2.StatusCode)
+	}
+	if wait := h2.last().WaitMS; wait < minRetryWait.Milliseconds() {
+		t.Errorf("WaitMS = %d after two backed-off rotations, want at least %d — real "+
+			"dead air must still reach the caller", wait, minRetryWait.Milliseconds())
 	}
 }
 

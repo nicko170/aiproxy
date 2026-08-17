@@ -44,10 +44,22 @@ type Routing struct {
 	BlockedModels   []string `json:"blockedModels"`
 }
 
+// Retry holds two independent clocks, and conflating them is a defect that has
+// already shipped once.
+//
+// BudgetMS bounds only time the PROXY adds before the first byte: retry backoff,
+// waiting on a paused account, inline absorption of a rate limit, credential
+// refresh, and discarding a response we are rotating away from.
+//
+// HeaderTimeoutMS bounds one attempt's wait for response headers, which is the
+// upstream's own work and must not draw the budget down. Time-to-first-token on
+// a large context with extended thinking is seconds; a budget of 1 000 applied
+// to it cancels healthy requests and answers 429.
 type Retry struct {
 	BudgetMS          int `json:"budgetMs"`
 	InlineAbsorbMaxMS int `json:"inlineAbsorbMaxMs"`
 	BodyIdleMS        int `json:"bodyIdleMs"`
+	HeaderTimeoutMS   int `json:"headerTimeoutMs"`
 }
 
 type QuotaProbe struct {
@@ -83,7 +95,7 @@ func Default() Config {
 		Listen:     Listen{Addr: "127.0.0.1:3456", APIKey: newAPIKey()},
 		Accounts:   []Account{},
 		Routing:    Routing{SwitchThreshold: 0.98, SessionAffinity: true, BlockedModels: []string{}},
-		Retry:      Retry{BudgetMS: 10000, InlineAbsorbMaxMS: 5000, BodyIdleMS: 120000},
+		Retry:      Retry{BudgetMS: 10000, InlineAbsorbMaxMS: 5000, BodyIdleMS: 120000, HeaderTimeoutMS: 60000},
 		QuotaProbe: QuotaProbe{IntervalSeconds: 300},
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},

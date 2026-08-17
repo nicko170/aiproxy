@@ -138,23 +138,61 @@ other upstream path not reserved under `/_aiproxy`):
 
 ### 4.2 The budget invariant
 
-Every request carries a **pre-first-byte budget** (`retry.budgetMs`, default
-10 000). All time spent *not* transferring response bytes draws it down:
+Pre-first-byte time runs on **two separate clocks**, and conflating them is a
+defect in its own right. One bounds time the proxy *adds*; the other bounds one
+attempt's wait on the *upstream*.
+
+**Clock 1 — the budget (`retry.budgetMs`, default 10 000).** All time the proxy
+itself spends not transferring response bytes draws it down, and nothing else
+does:
 
 - retry backoff between attempts,
 - waiting on a paused account inside `admit()`,
 - inline absorption of a rate limit,
-- token refresh.
+- token refresh,
+- draining a response body the request is rotating away from.
+
+The upstream round trip is **not** on that list and must never be charged to it.
+Time-to-first-token on a large context with extended thinking is legitimate work,
+not dead air. Bounding the round trip by the remaining budget cannot tell an
+upstream that is silent from one that is thinking: observed in production with
+`budgetMs: 1000` against a healthy account whose first token took ~1.3 s, every
+attempt was cancelled and the client was answered 429 `no_account_ready` eleven
+times over three minutes with nothing wrong upstream.
+
+**Clock 2 — the header timeout (`retry.headerTimeoutMs`, default 60 000).** How
+long a *single* attempt may wait for response headers. It covers the real hazard
+the budget cannot express: an upstream that accepts a connection and then
+withholds headers indefinitely, which the transport's own 120 s
+`ResponseHeaderTimeout` bounds far too coarsely. 60 s is generous enough for a
+slow first token and still finite. An attempt abandoned here is a *failed
+attempt*: it rotates, and it is recorded as `server_error`, never as
+`no_account_ready` — an account was selected, admitted, and sent to.
+
+Together they give a worst case that is chosen rather than accidental:
+
+```
+pre-first-byte  <=  budgetMs + (attempts x headerTimeoutMs)
+```
+
+where `attempts` is capped by `maxSendsPerAccount` (2) times the number of
+enabled accounts. That bound is deliberately loose: its job is to make an
+indefinite hang unreachable, not to be tight. Tightness on the paths the proxy
+controls is the budget's job, and the budget alone is what the reported `waitMs`
+measures — a clean single-attempt success reports `waitMs` at or near zero
+however long the upstream itself took.
 
 When the budget is exhausted, the request is answered immediately with the most
 informative status available (usually 429 plus a `Retry-After` derived from real
 observed reset times, else 503) and the outcome is recorded.
 
-Once response headers are written, no retry is possible and the budget is no
-longer consulted. It therefore governs exactly one thing: how long a client can
-be left with no bytes. This makes an unbounded silent hang unreachable by
-construction rather than by tuning, which is the point — every constant below
-can be wrong without producing a multi-minute stall.
+Once response headers are written, no retry is possible and neither clock is
+consulted again: a streamed completion legitimately runs for minutes, so no
+pre-first-byte deadline may survive into the response body. Between them the two
+clocks govern exactly one thing: how long a client can be left with no bytes.
+This makes an unbounded silent hang unreachable by construction rather than by
+tuning, which is the point — every constant below can be wrong without producing
+a multi-minute stall.
 
 ### 4.3 429 taxonomy
 
@@ -195,6 +233,27 @@ is considered spent for selection purposes before upstream rejects it.
 One `http.Transport` per provider origin with `ForceAttemptHTTP2: false`,
 `MaxConnsPerHost` bounded (default 256), keep-alive on, and a response-header
 timeout that is cleared once headers arrive.
+
+That per-attempt header timeout is `retry.headerTimeoutMs` (default 60 000) —
+clock 2 of §4.2 — and it is applied by the attempt loop, not left to the
+transport's coarser `ResponseHeaderTimeout`. Three properties are load-bearing:
+
+1. It is derived from `headerTimeoutMs` and **never** from the remaining budget.
+   The budget covers time the proxy adds; an upstream's time-to-first-token is
+   not that, and charging it there severs healthy requests (§4.2).
+2. It is armed around the round trip **only**. The moment response headers
+   arrive the timer is stopped *without* cancelling, and cancellation is
+   transferred to the response body so the attempt's context is released when the
+   body is closed and not a moment sooner. A streamed completion runs for
+   minutes; a deadline leaking into the body is a worse version of the stall this
+   proxy exists to remove.
+3. It bounds one attempt, so the total is `attempts x headerTimeoutMs` and the
+   attempt count is capped independently (§4.2). It is not a request-level bound
+   and must not be read as one.
+
+Everything after headers is the relay's problem, governed by `retry.bodyIdleMs`
+(§4.6). The two windows abut exactly: neither leaves a gap in which an upstream
+can be silent without something eventually giving up.
 
 HTTP/2 is deliberately disabled. A single h2 connection multiplexes all requests
 to an origin and shares one flow-control window; agent clients post large context
@@ -301,7 +360,7 @@ the config file drops rotated tokens and invalidates accounts on next start.
   "routing": { "switchThreshold": 0.98, "sessionAffinity": true,
                "blockedModels": [] },
   "retry":   { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000,
-               "bodyIdleMs": 120000 },
+               "bodyIdleMs": 120000, "headerTimeoutMs": 60000 },
   "quotaProbe": { "intervalSeconds": 300 },
   "metrics":    { "retentionDays": 90 },
   "mitm":       { "enabled": true }
@@ -311,6 +370,14 @@ the config file drops rotated tokens and invalidates accounts on next start.
 Accounts carry a **stable ULID `id`**, assigned once. Identity is never array
 position: reordering or renaming must not repoint anything, and metrics rows
 reference `id` so history survives a relabel.
+
+`retry.budgetMs` and `retry.headerTimeoutMs` are the two clocks of §4.2 and are
+tuned independently. `budgetMs` is the only one an operator should shorten to
+make the proxy give up sooner; shortening it does **not** shorten how long a
+single upstream attempt may take, which is deliberate — a small `budgetMs` used
+to cancel healthy slow-first-token requests, and that is the defect the split
+removes. `headerTimeoutMs` is a safety net against an upstream that never
+answers, so it is set generously (60 000) rather than tightly.
 
 `quotaProbe.intervalSeconds` defaults to **300**. The zero-spend usage endpoint
 has its own rate limit; polling it every 30 s gets the probe itself throttled,
@@ -528,13 +595,23 @@ and SSE chunk timing. Every classification and retry case is a table test —
 bare 429, hinted 429, quota-rejected 429, model-scoped rejection, 401 then
 refresh, 403 rotation, mid-stream stall.
 
-Two tests are load-bearing and are written before the code they cover:
+Four tests are load-bearing and are written before the code they cover:
 
 1. **Budget enforcement.** Fake upstream returns a bare 429 with no headers on
    every account. Assert the client is answered within a small multiple of
-   `retry.budgetMs`, and that measured pre-first-byte time never exceeds the
+   `retry.budgetMs`, and that the measured proxy-added wait never exceeds the
    budget. This is the acceptance criterion for the retry engine.
-2. **Streaming fidelity.** Fake upstream emits SSE chunks 100 ms apart. Assert
+2. **The budget does not bound the upstream.** Fake upstream withholds response
+   *headers* for longer than `retry.budgetMs` and then answers 200. Assert the
+   request succeeds in one attempt and streams its body. A healthy account with a
+   slow first token must not be severed by the retry budget, and `waitMs` for
+   that request must be at or near zero — the round trip is not time the proxy
+   added.
+3. **The header timeout bounds one attempt.** Fake upstream withholds headers
+   indefinitely under a short `retry.headerTimeoutMs` and a long `retry.budgetMs`.
+   Assert the attempt is abandoned on the header timeout, well inside the budget,
+   and that the outcome is `server_error` rather than `no_account_ready`.
+4. **Streaming fidelity.** Fake upstream emits SSE chunks 100 ms apart. Assert
    the client observes them incrementally, with arrival times tracking the
    upstream's, proving no whole-response buffering.
 

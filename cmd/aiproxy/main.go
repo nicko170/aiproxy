@@ -152,6 +152,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 			Budget:          time.Duration(cfg.Retry.BudgetMS) * time.Millisecond,
 			InlineAbsorbMax: time.Duration(cfg.Retry.InlineAbsorbMaxMS) * time.Millisecond,
 			BodyIdle:        time.Duration(cfg.Retry.BodyIdleMS) * time.Millisecond,
+			HeaderTimeout:   time.Duration(cfg.Retry.HeaderTimeoutMS) * time.Millisecond,
 		}, log)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
