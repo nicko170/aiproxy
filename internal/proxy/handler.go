@@ -176,8 +176,15 @@ var DefaultPassthroughPrefixes = []string{
 func passthroughHandler(o HandlerOptions) http.HandlerFunc {
 	upstream := strings.TrimSuffix(o.Upstream, "/")
 	client := &http.Client{
-		Transport: NewTransport(TransportOptions{}),
-		// No timeout: these include long-poll channels.
+		// Client.Timeout is left unset, which really does mean "no timeout" for
+		// the overall request/response. But a zero TransportOptions is NOT the
+		// same thing: NewTransport applies its own 120s ResponseHeaderTimeout
+		// default, which would sever exactly the long-poll channels this comment
+		// used to claim were unbounded (§4.6 — the client keeps the request open
+		// indefinitely and upstream may withhold response headers for minutes).
+		// DisableResponseHeaderTimeout turns that default off instead of merely
+		// raising it, so this path is genuinely unbounded end to end.
+		Transport: NewTransport(TransportOptions{DisableResponseHeaderTimeout: true}),
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {

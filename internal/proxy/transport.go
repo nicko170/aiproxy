@@ -20,7 +20,20 @@ type TransportOptions struct {
 	// instead of the zero value, so this field is always derived from, and kept
 	// safely above, the knob an operator actually tunes.
 	ResponseHeaderTimeout time.Duration
-	IdleConnTimeout       time.Duration
+	// DisableResponseHeaderTimeout, when true, leaves the transport's
+	// ResponseHeaderTimeout at zero — net/http's own "wait forever for
+	// headers" — instead of falling back to this package's 120s default.
+	// It takes priority over ResponseHeaderTimeout: when set, that field is
+	// ignored and no header deadline is applied at the transport level at all.
+	//
+	// This is for the passthrough client only (§4.6 long-poll channels, e.g.
+	// /v1/code/*, that may withhold response headers for minutes and have no
+	// other clock bounding the wait). The account path must never set this:
+	// its per-attempt header timeout (retry.headerTimeoutMs, enforced by the
+	// attempt loop itself; see sendWithin in attempt.go) is load-bearing and
+	// depends on TransportHeaderTimeout deriving a finite backstop above it.
+	DisableResponseHeaderTimeout bool
+	IdleConnTimeout              time.Duration
 }
 
 // NewTransport builds the upstream transport.
@@ -40,7 +53,9 @@ func NewTransport(opts TransportOptions) *http.Transport {
 	if opts.MaxConnsPerHost <= 0 {
 		opts.MaxConnsPerHost = 256
 	}
-	if opts.ResponseHeaderTimeout <= 0 {
+	if opts.DisableResponseHeaderTimeout {
+		opts.ResponseHeaderTimeout = 0
+	} else if opts.ResponseHeaderTimeout <= 0 {
 		opts.ResponseHeaderTimeout = 120 * time.Second
 	}
 	if opts.IdleConnTimeout <= 0 {

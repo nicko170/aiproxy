@@ -77,6 +77,34 @@ func TestNewTransportAppliesOptionsAndDefaults(t *testing.T) {
 	}
 }
 
+// The defect this guards against: the passthrough client (handler.go) builds
+// its transport from a zero TransportOptions and claims in a comment that the
+// result has "no timeout". That was false — a zero ResponseHeaderTimeout falls
+// back to this package's 120s default, silently severing the long-poll
+// channels (§4.6) the comment claimed were unbounded. This is the real guard
+// for that fix: the behavioural alternative (holding an upstream's headers
+// open for longer than 120s in a unit test) is impractical, so what must hold
+// is the config-level fact this asserts — that DisableResponseHeaderTimeout
+// actually leaves ResponseHeaderTimeout at zero rather than merely raising it.
+func TestNewTransportDisableResponseHeaderTimeoutLeavesItAtZero(t *testing.T) {
+	tr := NewTransport(TransportOptions{DisableResponseHeaderTimeout: true})
+	if tr.ResponseHeaderTimeout != 0 {
+		t.Errorf("ResponseHeaderTimeout = %v, want 0 (net/http's own \"no timeout\") when "+
+			"DisableResponseHeaderTimeout is set", tr.ResponseHeaderTimeout)
+	}
+
+	// It must win even if a positive ResponseHeaderTimeout is also set, so a
+	// caller cannot end up in a state where the two fields disagree.
+	tr2 := NewTransport(TransportOptions{
+		DisableResponseHeaderTimeout: true,
+		ResponseHeaderTimeout:        30 * time.Second,
+	})
+	if tr2.ResponseHeaderTimeout != 0 {
+		t.Errorf("ResponseHeaderTimeout = %v, want 0 — DisableResponseHeaderTimeout must "+
+			"take priority over an explicit ResponseHeaderTimeout", tr2.ResponseHeaderTimeout)
+	}
+}
+
 // The failure mode this guards against: an operator raises retry.headerTimeoutMs
 // above this package's own 120s default expecting the attempt loop to honour it
 // (§6.2 invites raising it for slower models). If the upstream transport's own

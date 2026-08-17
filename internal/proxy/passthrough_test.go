@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
@@ -193,5 +194,53 @@ func TestPassthroughReturns502WhenUpstreamUnreachable(t *testing.T) {
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", res.StatusCode)
+	}
+}
+
+// A behavioural companion to TestNewTransportDisableResponseHeaderTimeoutLeavesItAtZero.
+// This cannot literally prove the passthrough survives longer than the old 120s
+// default — that is not a practical thing to wait for in a unit test — so it is
+// not the load-bearing guard against a regression here. What it does check is
+// that the passthrough client isn't left with some OTHER small, hardcoded
+// timeout that would also fail on a real long-poll upstream: a response that
+// withholds headers for a short but non-trivial interval must still complete.
+// The real guard remains the config-level assertion that
+// ResponseHeaderTimeout is genuinely 0, since only that generalizes to "any
+// delay, including ones that exceed the package's usual 120s default".
+func TestPassthroughSurvivesAShortHeaderDelay(t *testing.T) {
+	const delay = 500 * time.Millisecond
+	up := testutil.NewFakeUpstream(t, testutil.Script{
+		Status:      200,
+		HeaderDelay: delay,
+		Body:        `{"ok":true}`,
+	})
+
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Upstream = up.URL()
+		o.PassthroughPrefixes = DefaultPassthroughPrefixes
+	}, testutil.Script{Status: 500, Body: `should not be used`})
+
+	start := time.Now()
+	res, err := http.Get(h.srv.URL + "/v1/code/sessions")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer res.Body.Close()
+	elapsed := time.Since(start)
+
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 — an upstream that took %v to produce headers "+
+			"is not misbehaving, and the passthrough client must wait it out", res.StatusCode, delay)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatalf("body read failed after %q: %v", body, err)
+	}
+	if !strings.Contains(string(body), "ok") {
+		t.Errorf("body = %q, want the upstream's response", body)
+	}
+	if elapsed < delay {
+		t.Errorf("elapsed = %v, want at least the upstream's %v header delay — "+
+			"this request did not actually wait on the delayed upstream", elapsed, delay)
 	}
 }
