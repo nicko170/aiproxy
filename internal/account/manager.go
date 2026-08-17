@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -31,6 +32,8 @@ type Options struct {
 	Ramp            Ramp
 	// RefreshTimeout bounds one refresh. Zero takes defaultRefreshTimeout.
 	RefreshTimeout time.Duration
+	// Log receives the manager's own diagnostics. Nil takes slog.Default().
+	Log *slog.Logger
 }
 
 // refreshCall is one in-flight refresh other callers wait on.
@@ -225,17 +228,48 @@ func (m *Manager) runRefresh(id string, a *Account, p provider.Provider, cred pr
 			a.Status = StatusActive
 			a.LastError = ""
 			m.mu.Unlock()
+			// A failed Persist is NOT a failed refresh. The credential is good and
+			// already in memory, so the account keeps serving; sidelining it here
+			// threw away a working credential over a disk problem. It is logged
+			// loudly and recorded on the account because the consequence is real:
+			// the rotated token is lost on the next restart, and the refresh token
+			// it replaced may already have been invalidated upstream.
 			if m.opts.Persist != nil {
-				err = m.opts.Persist(id, next)
+				if perr := m.opts.Persist(id, next); perr != nil {
+					m.log().Error("could not persist a rotated credential; it is live "+
+						"in memory but WILL BE LOST on restart",
+						"account", a.Label, "id", id, "err", perr)
+					m.mu.Lock()
+					a.LastError = "persist rotated credential: " + perr.Error()
+					m.mu.Unlock()
+				}
 			}
 		}
 	}
 	if err != nil {
 		m.mu.Lock()
-		a.Status = StatusErrored
 		a.LastError = err.Error()
+		// Only a genuine credential rejection sidelines an account. Spec §11:
+		// transport errors are not credential errors. StatusErrored makes an
+		// account ineligible in Select, and only a SUCCESSFUL refresh clears it —
+		// which can now only be reached through Select. So marking one on a DNS
+		// blip removed the account until the process restarted, and with two
+		// accounts the proxy answered 429 forever. Leaving the status alone means
+		// the next request simply tries again.
+		if errors.Is(err, provider.ErrCredentialRejected) {
+			a.Status = StatusErrored
+		}
 		m.mu.Unlock()
 	}
+}
+
+// log returns the manager's logger, defaulting to slog's so a Manager built
+// without one still reports a lost credential rather than swallowing it.
+func (m *Manager) log() *slog.Logger {
+	if m.opts.Log != nil {
+		return m.opts.Log
+	}
+	return slog.Default()
 }
 
 func (m *Manager) needsRefreshLocked(a *Account) bool {

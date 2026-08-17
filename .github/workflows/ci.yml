@@ -14,6 +14,12 @@ jobs:
         with:
           go-version: '1.26'
       - run: go vet ./...
+      # Spec §12 mandates staticcheck alongside vet. install-go is false so it
+      # analyses under the Go version set up above rather than its own.
+      - uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
       - run: go test -race ./...
 
   build:

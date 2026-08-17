@@ -136,6 +136,9 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 	sends := map[string]int{}
 	noHintWaits := 0
 	started := time.Now()
+	// lastSent is the account the previous attempt in THIS request went to, which
+	// is what makes a rotation onto a different account observable below.
+	lastSent := ""
 
 	defer func() {
 		res.WaitMS = a.cfg.Budget.Milliseconds() - budget.Remaining().Milliseconds()
@@ -183,6 +186,17 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			exclude[acct.ID] = true
 			res.Rotated = true
 			continue
+		}
+
+		// Spec §4.1 step 6: pace the burst onto an account we have just failed over
+		// to. This is the ramp's whole stated purpose and its only production
+		// trigger — without it the mechanism arms solely from PauseAccount, which
+		// covers the hinted-throttle queue and nothing else. A fleet of agents
+		// rotating at the same instant otherwise arrives on the next account as one
+		// burst, trips its limit, and cascades onward. Armed before Admit, so this
+		// request is itself subject to the cap it just created.
+		if lastSent != "" && acct.ID != lastSent {
+			a.mgr.BeginRamp(acct.ID)
 		}
 
 		// A credential refresh is dead air like any other, so it is both CAPPED by
@@ -236,6 +250,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 		}
 
 		sends[acct.ID]++
+		lastSent = acct.ID
 		res.Attempts++
 		upstreamRes, err := a.sendWithin(ctx, budget, prov, acct, req)
 		a.mgr.Release(acct.ID)
@@ -253,7 +268,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 
 		switch outcome.Kind {
 		case provider.OutcomeQuotaRejected:
-			drain(upstreamRes)
+			drainWithin(budget, upstreamRes)
 			// A model-scoped rejection leaves the account fine for other models,
 			// so the recorded bucket does the excluding rather than a global hold.
 			if outcome.ScopedModel == "" {
@@ -265,7 +280,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			continue
 
 		case provider.OutcomeThrottledWithHint:
-			drain(upstreamRes)
+			drainWithin(budget, upstreamRes)
 			hold := outcome.RetryAfter
 			if hold > maxHintHold {
 				hold = maxHintHold
@@ -286,7 +301,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			return res
 
 		case provider.OutcomeThrottledNoHint:
-			drain(upstreamRes)
+			drainWithin(budget, upstreamRes)
 			// Nothing was stated, so no duration is invented. Yield briefly and
 			// let another account try — spending the rest of the budget here
 			// would be betting on a claim upstream never made.
@@ -303,7 +318,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			continue
 
 		case provider.OutcomeCredentialStale:
-			drain(upstreamRes)
+			drainWithin(budget, upstreamRes)
 			if !reauthed[acct.ID] {
 				reauthed[acct.ID] = true
 				forceStart := time.Now()
@@ -319,7 +334,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			continue
 
 		case provider.OutcomeCredentialRefused:
-			drain(upstreamRes)
+			drainWithin(budget, upstreamRes)
 			// Never relayed: the client has no part in this and reads a 403 as
 			// its own session being dead.
 			a.log.Error("upstream refused the account credential", "account", acct.Label)
@@ -388,7 +403,7 @@ func (a *Attempter) sendWithin(ctx context.Context, budget *Budget, prov provide
 		// upstream's. Report it as such; the loop rotates either way.
 		<-timedOut
 		if res != nil {
-			drain(res)
+			drainWithin(budget, res)
 		}
 		cancel()
 		return nil, fmt.Errorf("upstream produced no response headers within the remaining %v budget", remaining)
@@ -516,9 +531,39 @@ func holdFor(o provider.Outcome, fallback time.Duration) time.Duration {
 	return time.Hour
 }
 
-func drain(res *http.Response) {
+// maxDrain caps how long discarding a rotated-away response body may take, on
+// top of the budget cap. A body we have already decided not to relay is worth a
+// moment's read so the connection can be reused, and not one second more.
+const maxDrain = 250 * time.Millisecond
+
+// drainWithin discards a response body we are rotating away from, bounded by
+// what the request has left and charged for what it costs.
+//
+// The bound is the point. sendWithin stops its timer the instant response
+// headers arrive and transfers cancellation to the body, so from here on the
+// attempt context carries NO deadline. An upstream that flushes a bare 429
+// promptly and then withholds the body therefore stalled the request forever —
+// once per account, on every rotation path — with nothing written to the client.
+// That is the same unbounded-silence class the budget exists to make unreachable.
+//
+// Closing the body is what unblocks the read: Close fires cancelOnCloseBody,
+// which cancels the attempt context and severs the connection underneath the
+// pending Read. Charging afterwards matters as much as capping: a drain cut
+// short still burned real wall-clock, and an uncharged cost lets the next
+// account spend the same allowance again.
+func drainWithin(b *Budget, res *http.Response) {
+	limit := min(b.Remaining(), maxDrain)
+	if limit <= 0 {
+		res.Body.Close()
+		return
+	}
+	t := time.AfterFunc(limit, func() { res.Body.Close() })
+	defer t.Stop()
+
+	start := time.Now()
 	io.Copy(io.Discard, io.LimitReader(res.Body, 1<<16))
 	res.Body.Close()
+	b.Charge(time.Since(start))
 }
 
 func (a *Attempter) writeJSON(w http.ResponseWriter, status int, hdr map[string]string, errType, msg string) {
@@ -566,7 +611,16 @@ func (a *Attempter) writeRetryAfter(w http.ResponseWriter, res *Result, d time.D
 // writeNoAccount distinguishes "every account was refused", which waiting cannot
 // fix, from "everything is out of quota", which a reset will.
 func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused map[string]bool) {
-	total := len(a.mgr.All())
+	// Enabled accounts only. Counting disabled ones too made "every account
+	// refused" all but unreachable the moment an operator switched one off, so a
+	// dead credential — which no amount of waiting fixes — came back as a 429
+	// telling the client to retry later.
+	var total int
+	for _, acct := range a.mgr.All() {
+		if !acct.Disabled {
+			total++
+		}
+	}
 	if len(refused) > 0 && len(refused) >= total {
 		names := make([]string, 0, len(refused))
 		for id := range refused {

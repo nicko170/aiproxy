@@ -46,6 +46,45 @@ func TestPassthroughForwardsClientCredentialUntouched(t *testing.T) {
 	}
 }
 
+// The passthrough carries the client's OWN credential, which is its entire
+// purpose — but x-api-key is not that credential. It authenticates the client to
+// US, and the obvious client setup (ANTHROPIC_API_KEY set to the aiproxy key)
+// therefore shipped the user's proxy key to api.anthropic.com on every /v1/code/
+// and /api/oauth/files/ request. The account path has always stripped it; this
+// path did not.
+func TestPassthroughStripsTheProxyKeyButKeepsAuthorization(t *testing.T) {
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Upstream = up.URL()
+		o.PassthroughPrefixes = DefaultPassthroughPrefixes
+	}, testutil.Script{Status: 500, Body: `should not be used`})
+
+	req, _ := http.NewRequest("GET", h.srv.URL+"/v1/code/sessions", nil)
+	req.Header.Set("x-api-key", "the-users-aiproxy-key")
+	req.Header.Set("Authorization", "Bearer client-own-token")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+
+	recs := up.Requests()
+	if len(recs) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(recs))
+	}
+	if got := recs[0].Header.Get("x-api-key"); got != "" {
+		t.Errorf("x-api-key = %q reached upstream; the client's proxy key "+
+			"authenticates it to us and must never leave this process", got)
+	}
+	// The other half: stripping must not go so far as to break the feature.
+	if got := recs[0].Header.Get("Authorization"); got != "Bearer client-own-token" {
+		t.Errorf("Authorization = %q; the client's own credential is the whole point "+
+			"of the passthrough and must survive", got)
+	}
+}
+
 // Prefix scoping, in both directions. This needs Upstream set: without it
 // NewRouter registers no passthrough routes at all, so the test passed vacuously
 // and proved nothing about which paths the passthrough claims.

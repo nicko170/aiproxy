@@ -22,8 +22,6 @@ type Store struct {
 
 func NewStore(path string) *Store { return &Store{path: path} }
 
-func (s *Store) Path() string { return s.path }
-
 // Load reads the config, filling in defaults for a missing file or absent
 // fields. A freshly defaulted config is not written; the first Update does that.
 func (s *Store) Load() (Config, error) {

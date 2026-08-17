@@ -129,6 +129,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 		SwitchThreshold: cfg.Routing.SwitchThreshold,
 		SessionAffinity: cfg.Routing.SessionAffinity,
 		Ramp:            account.Ramp{Enabled: true},
+		Log:             log,
 		// A rotated credential is the only way back into an account, so it is
 		// written through immediately rather than at shutdown.
 		Persist: func(id string, c provider.Credential) error {

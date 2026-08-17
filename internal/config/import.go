@@ -147,7 +147,7 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 }
 
 func fromLegacy(la legacyAccount) (Account, bool) {
-	cred := provider.Credential{}
+	var cred provider.Credential
 	switch la.Type {
 	case "apikey":
 		if la.APIKey == "" {

@@ -105,6 +105,19 @@ type HandlerOptions struct {
 // proxyHandler buffers the request and hands it to the attempt loop.
 func proxyHandler(o HandlerOptions) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// The reserved namespace is refused HERE, at the point of harm, rather
+		// than only in the router. chi matches on r.URL.RawPath when it is set, so
+		// any spelling that survives escaping unchanged — a percent-encoded
+		// character in the prefix (/%5Faiproxy/...), a ..%2f traversal that
+		// normalizes into it — misses the mounted subrouter, falls through to the
+		// catch-all, and is forwarded to the provider with an ACCOUNT CREDENTIAL
+		// attached. This is the second such door found; guarding the one place
+		// that can do the damage means there is no third.
+		if strings.HasPrefix(path.Clean(r.URL.Path), ReservedPrefix) {
+			writeError(w, http.StatusNotFound, "not_found_error", "No such aiproxy endpoint")
+			return
+		}
+
 		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
@@ -179,8 +192,14 @@ func passthroughHandler(o HandlerOptions) http.HandlerFunc {
 		}
 		for k, vs := range r.Header {
 			lk := strings.ToLower(k)
-			// Authorization is deliberately NOT stripped: it is the point.
-			if hopByHop[lk] || lk == "accept-encoding" {
+			// Authorization is deliberately NOT stripped: carrying the client's
+			// own credential is the entire purpose of this path.
+			//
+			// x-api-key IS stripped, exactly as on the account path. It
+			// authenticates the client to US, and a user who follows the obvious
+			// setup — ANTHROPIC_API_KEY set to their aiproxy key — would otherwise
+			// ship that key to api.anthropic.com on every passthrough request.
+			if hopByHop[lk] || lk == "accept-encoding" || lk == "x-api-key" {
 				continue
 			}
 			for _, v := range vs {

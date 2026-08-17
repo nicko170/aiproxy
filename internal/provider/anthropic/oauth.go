@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,7 +22,11 @@ const (
 
 // ErrRefreshRejected reports that the refresh token was refused. It is not
 // transient: the account needs a fresh login, and retrying wastes a budget.
-var ErrRefreshRejected = errors.New("refresh token rejected")
+//
+// It wraps provider.ErrCredentialRejected so the account registry can tell a
+// dead credential from a network failure without importing this package. Only
+// the former may sideline an account.
+var ErrRefreshRejected = fmt.Errorf("%w: refresh token rejected", provider.ErrCredentialRejected)
 
 // NormalizeExpiresAt converts a possibly-seconds timestamp to unix millis.
 // Values below 1e12 are seconds; anything at or above it is already millis.

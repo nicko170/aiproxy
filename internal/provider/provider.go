@@ -14,6 +14,18 @@ import (
 // implement, such as Quota for an endpoint with no usage API.
 var ErrUnsupported = errors.New("unsupported by this provider")
 
+// ErrCredentialRejected reports that the upstream REFUSED a credential, as
+// opposed to the proxy having failed to reach the upstream at all. Providers
+// wrap it around their own rejection errors.
+//
+// It lives here, on the provider seam, because the distinction has to be legible
+// to internal/account — which decides whether a failed refresh sidelines an
+// account — without internal/account importing any concrete provider. The
+// distinction is load-bearing: a rejection is permanent and the account needs a
+// fresh login, while a DNS hiccup or a dropped connection says nothing about the
+// credential and must never remove an account from rotation.
+var ErrCredentialRejected = errors.New("credential rejected")
+
 type CredentialType string
 
 const (

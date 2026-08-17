@@ -3,6 +3,10 @@ package account
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -231,8 +235,16 @@ func TestEnsureFreshCoalescesConcurrentCallersOnError(t *testing.T) {
 	}
 }
 
+// rejected is a refusal of the credential ITSELF, the only failure that may
+// sideline an account. Providers wrap provider.ErrCredentialRejected around
+// their own rejection sentinels so this distinction crosses the seam without
+// internal/account importing a concrete provider.
+func rejected(msg string) error {
+	return fmt.Errorf("%w: %s", provider.ErrCredentialRejected, msg)
+}
+
 func TestEnsureFreshMarksAccountErroredOnRejection(t *testing.T) {
-	p := &stubProvider{err: errors.New("invalid_grant")}
+	p := &stubProvider{err: rejected("invalid_grant")}
 	m, _ := newTestManager(t, p, config.Account{
 		ID: "a", Provider: "stub", Credential: expiredOAuth(),
 	})
@@ -247,6 +259,108 @@ func TestEnsureFreshMarksAccountErroredOnRejection(t *testing.T) {
 	if acc.Status != StatusErrored {
 		t.Errorf("Status = %v, want StatusErrored", acc.Status)
 	}
+	// The sidelining half, stated as the thing that actually matters: a rejected
+	// credential must drop out of selection until someone logs in again.
+	if _, err := m.Select(SelectRequest{}); !errors.Is(err, ErrNoAccount) {
+		t.Errorf("Select = %v, want ErrNoAccount — a rejected credential stayed selectable", err)
+	}
+}
+
+// Spec §11: transport errors are not credential errors, and must never sideline
+// an account.
+//
+// The defect this pins down: ANY refresh error set StatusErrored, StatusErrored
+// makes an account ineligible in Select, and only a successful refresh clears it
+// — which can only be reached THROUGH Select. So a single DNS hiccup or dropped
+// connection removed an account permanently, and with two accounts the proxy
+// answered 429 for every request until the process was restarted.
+func TestEnsureFreshDoesNotSidelineAnAccountOnTransportFailure(t *testing.T) {
+	p := &stubProvider{err: &net.OpError{
+		Op: "dial", Net: "tcp", Err: errors.New("connection refused"),
+	}}
+	m, _ := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	if err := m.EnsureFresh(context.Background(), "a", false); err == nil {
+		t.Fatal("expected the transport error to propagate to the caller")
+	}
+
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusActive {
+		t.Errorf("Status = %v, want StatusActive; a network failure says nothing about "+
+			"the credential and must not sideline the account", acc.Status)
+	}
+	if acc.LastError == "" {
+		t.Error("LastError should still record what went wrong, so the status readout explains it")
+	}
+	// The consequence, asserted directly: the account is still there to try again.
+	got, err := m.Select(SelectRequest{})
+	if err != nil {
+		t.Fatalf("Select after a transport failure: %v — one network blip removed the "+
+			"account until the process restarts", err)
+	}
+	if got.ID != "a" {
+		t.Errorf("Select = %q, want a", got.ID)
+	}
+
+	// And the retry genuinely happens rather than short-circuiting on a recorded
+	// error, so the account recovers on its own the moment the network does.
+	p.err = nil
+	if err := m.EnsureFresh(context.Background(), "a", false); err != nil {
+		t.Fatalf("second EnsureFresh: %v", err)
+	}
+	if n := p.refreshes.Load(); n != 2 {
+		t.Errorf("refreshed %d times, want 2 — the retry never reached the provider", n)
+	}
+	acc, _ = m.Get("a")
+	if acc.Credential.AccessToken != "refreshed" {
+		t.Errorf("AccessToken = %q, want refreshed", acc.Credential.AccessToken)
+	}
+}
+
+// A refresh that SUCCEEDED but could not be written to disk leaves a working
+// credential in memory. Marking the account errored threw that away and rotated
+// off a perfectly good account because of a disk problem. The loss is real and
+// must be visible — the rotated token is gone on restart — but it is not a reason
+// to stop serving.
+func TestEnsureFreshKeepsAWorkingCredentialWhenPersistFails(t *testing.T) {
+	p := &stubProvider{}
+	m := New([]config.Account{{
+		ID: "a", Provider: "stub", Label: "a", Credential: expiredOAuth(),
+	}}, map[string]provider.Provider{"stub": p}, Options{
+		SwitchThreshold: 0.98,
+		Log:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Persist: func(string, provider.Credential) error {
+			return errors.New("read-only file system")
+		},
+	})
+
+	if err := m.EnsureFresh(context.Background(), "a", false); err != nil {
+		t.Fatalf("EnsureFresh: %v — a persistence failure must not fail the refresh, "+
+			"which the caller reads as a reason to rotate away", err)
+	}
+
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusActive {
+		t.Errorf("Status = %v, want StatusActive; the credential in memory works", acc.Status)
+	}
+	if acc.Credential.AccessToken != "refreshed" {
+		t.Errorf("AccessToken = %q, want the refreshed credential", acc.Credential.AccessToken)
+	}
+	if !strings.Contains(acc.LastError, "persist") {
+		t.Errorf("LastError = %q; a lost rotated credential must be visible in the "+
+			"status readout, since it will not survive a restart", acc.LastError)
+	}
+	if _, err := m.Select(SelectRequest{}); err != nil {
+		t.Errorf("Select = %v; an account whose credential works must keep serving", err)
+	}
 }
 
 // A dead refresh token must not be retried on every sequential call: once an
@@ -254,7 +368,7 @@ func TestEnsureFreshMarksAccountErroredOnRejection(t *testing.T) {
 // (not merely inside the renew-soon threshold), EnsureFresh returns the
 // recorded error immediately instead of paying another 3-attempt retry.
 func TestEnsureFreshShortCircuitsAfterHardRejectionWithoutRetrying(t *testing.T) {
-	p := &stubProvider{err: errors.New("invalid_grant")}
+	p := &stubProvider{err: rejected("invalid_grant")}
 	m, _ := newTestManager(t, p, config.Account{
 		ID: "a", Provider: "stub", Credential: expiredOAuth(),
 	})
@@ -415,9 +529,13 @@ func TestEnsureFreshReturnsWhenTheCallersContextExpiresFirst(t *testing.T) {
 	}
 }
 
-// A refresh that outruns RefreshTimeout must fail like any other refresh: the
-// account is marked errored, and crucially the single-flight entry is released so
-// a later EnsureFresh runs instead of hanging on it forever.
+// A refresh that outruns RefreshTimeout must fail like any other refresh, and
+// crucially the single-flight entry is released so a later EnsureFresh runs
+// instead of hanging on it forever.
+//
+// It must NOT sideline the account. A token endpoint that stopped answering is a
+// transport failure, not a statement about the credential, and this test used to
+// assert the opposite — which is precisely the behaviour spec §11 forbids.
 func TestEnsureFreshTimesOutASlowRefreshAndStaysUsable(t *testing.T) {
 	p := &stubProvider{delay: 5 * time.Second}
 	var mu sync.Mutex
@@ -445,12 +563,15 @@ func TestEnsureFreshTimesOutASlowRefreshAndStaysUsable(t *testing.T) {
 	if !ok {
 		t.Fatal("Get: account not found")
 	}
-	if acc.Status != StatusErrored {
-		t.Errorf("Status = %v, want StatusErrored after a timed-out refresh", acc.Status)
+	if acc.Status != StatusActive {
+		t.Errorf("Status = %v, want StatusActive after a timed-out refresh: a slow token "+
+			"endpoint is a transport failure and must not sideline the account", acc.Status)
+	}
+	if acc.LastError == "" {
+		t.Error("LastError should record the timeout even though the account keeps serving")
 	}
 
-	// The single-flight entry must have been released. force bypasses the
-	// errored-account short-circuit so this is a real attempt.
+	// The single-flight entry must have been released.
 	p.delay = 0
 	done := make(chan error, 1)
 	go func() { done <- m.EnsureFresh(context.Background(), "a", true) }()

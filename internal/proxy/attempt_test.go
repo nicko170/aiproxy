@@ -109,6 +109,12 @@ type harnessTweaks struct {
 	// refreshTimeout bounds the manager's own refresh. Kept short in tests so a
 	// deliberately slow token endpoint does not stall teardown.
 	refreshTimeout time.Duration
+	// ramp configures admission pacing. The zero value leaves it disabled, which
+	// is what every test that is not about the ramp wants.
+	ramp account.Ramp
+	// nDisabled switches off the LAST n accounts, so a test can assert against a
+	// manager that holds accounts no request may ever use.
+	nDisabled int
 }
 
 // newHarnessAgainst wires nAccounts at an arbitrary upstream URL. up may be nil
@@ -128,6 +134,7 @@ func newHarnessAgainst(t *testing.T, up *testutil.FakeUpstream, upstreamURL stri
 			Label:    "acct-" + strconv.Itoa(i),
 			Priority: i,
 			Upstream: upstreamURL,
+			Disabled: i >= nAccounts-tw.nDisabled,
 			Credential: provider.Credential{
 				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
 				ExpiresAt: time.Now().Add(expiresIn).UnixMilli(),
@@ -144,7 +151,7 @@ func newHarnessAgainst(t *testing.T, up *testutil.FakeUpstream, upstreamURL stri
 	providers := map[string]provider.Provider{"anthropic": p}
 	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
-		Ramp:            account.Ramp{Enabled: false},
+		Ramp:            tw.ramp,
 		RefreshTimeout:  tw.refreshTimeout,
 		Persist:         func(string, provider.Credential) error { return nil },
 	})
@@ -611,6 +618,145 @@ func TestAttemptBoundsWaitWhenUpstreamWithholdsHeaders(t *testing.T) {
 	}
 }
 
+// bodyWithholdingUpstream flushes a bare 429's HEADERS immediately and then
+// never writes the body.
+//
+// Headers arriving promptly is exactly what makes this shape dangerous: it
+// satisfies sendWithin, which stops its timer and hands cancellation to the body,
+// so the attempt context no longer carries any deadline at all. Everything after
+// that point — the drain on the rotation path — is on its own.
+func bodyWithholdingUpstream(t *testing.T) string {
+	t.Helper()
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // headers on the wire, body withheld
+		}
+		// The hold is finite ONLY so that a regression fails this test instead of
+		// hanging it. httptest's Close waits on in-flight handlers, and an
+		// unbounded drain sits inside one — the proxy's — which in turn waits on
+		// this one, so a truly endless hold wedges teardown and the whole package
+		// stalls until the 10-minute panic. Two seconds is far past the budget
+		// under test, so the body is withheld totally as far as any assertion here
+		// is concerned.
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		case <-time.After(2 * time.Second):
+		}
+	}))
+	// Cleanups run last-registered-first, so handlers are released before Close
+	// waits on them; otherwise teardown blocks on the silence under test.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+	return srv.URL
+}
+
+// LOAD-BEARING. Discarding a response we are rotating away from is dead air like
+// any other, and must be bounded by the budget and charged to it.
+//
+// Before the fix, drain() ran io.Copy over the body with no deadline and no
+// charge, on all five rotation paths. An upstream that flushes a 429's headers
+// and then withholds the body therefore held the request indefinitely — once per
+// account, with nothing written to the client. Measured before the fix: three
+// accounts, a 700ms budget, no response after 6 seconds. That is precisely the
+// two-minute silence this proxy exists to make impossible, reached through a
+// different door.
+//
+// The POST runs on its own goroutine because the defect's signature is a HANG:
+// a test that simply called h.post() would block forever instead of failing.
+func TestAttemptBoundsTheDrainOfAWithheldResponseBody(t *testing.T) {
+	const accounts = 3
+	cfg := RetryConfig{Budget: 700 * time.Millisecond, InlineAbsorbMax: 5 * time.Second, BodyIdle: 5 * time.Second}
+	h := newHarnessAgainst(t, nil, bodyWithholdingUpstream(t), accounts, cfg, harnessTweaks{})
+
+	type answer struct {
+		status  int
+		elapsed time.Duration
+		err     error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		start := time.Now()
+		res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+			strings.NewReader(`{"model":"claude-sonnet-5","messages":[]}`))
+		if err != nil {
+			done <- answer{err: err, elapsed: time.Since(start)}
+			return
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		done <- answer{status: res.StatusCode, elapsed: time.Since(start)}
+	}()
+
+	select {
+	case a := <-done:
+		if a.err != nil {
+			t.Fatalf("POST: %v", a.err)
+		}
+		// The real measurement: wall-clock dead air with a 700ms allowance and
+		// three accounts each capable of swallowing the request whole.
+		if a.elapsed > cfg.Budget+time.Second {
+			t.Errorf("client waited %v with a %v budget — draining a withheld body is "+
+				"not bounded by the budget", a.elapsed, cfg.Budget)
+		}
+		if a.status != http.StatusTooManyRequests {
+			t.Errorf("status = %d, want 429", a.status)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("no response after 4s: an upstream that flushes 429 headers and then " +
+			"withholds the body is stalling the request, once per account")
+	}
+}
+
+// The ramp's stated purpose (spec §4.1 step 6) is pacing a burst onto an account
+// a request has just failed over to. It was built, tested, and unreachable: the
+// only production caller of BeginRamp was PauseAccount, which covers the
+// hinted-throttle queue and nothing else. Failover — the case the ramp exists
+// for — never armed it.
+//
+// Ramp{Enabled: true} is the production configuration, and a header-less 429
+// rotates WITHOUT calling PauseAccount, so a window on the second account can
+// only have come from the failover itself.
+func TestAttemptRampsTheAccountItFailsOverTo(t *testing.T) {
+	cfg := RetryConfig{Budget: 3 * time.Second, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second}
+	up := testutil.NewFakeUpstream(t,
+		testutil.Script{Status: 429},                      // acct-0 refuses, no hint
+		testutil.Script{Status: 200, Body: `{"ok":true}`}, // acct-1 serves
+	)
+	h := newHarnessAgainst(t, up, up.URL(), 2, cfg, harnessTweaks{
+		ramp: account.Ramp{Enabled: true},
+	})
+
+	res, _ := h.post()
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 after failover", res.StatusCode)
+	}
+	if got := h.last().AccountID; got != "acct-1" {
+		t.Fatalf("served by %q, want acct-1 — the request did not fail over", got)
+	}
+
+	second, ok := h.mgr.Get("acct-1")
+	if !ok {
+		t.Fatal("acct-1 vanished")
+	}
+	if second.RampStartedAt == 0 {
+		t.Error("no ramp window on the account the request failed over to; the ramp is " +
+			"unreachable in production and a synchronised failover still arrives as one burst")
+	}
+
+	first, ok := h.mgr.Get("acct-0")
+	if !ok {
+		t.Fatal("acct-0 vanished")
+	}
+	if first.RampStartedAt != 0 {
+		t.Errorf("acct-0 has a ramp window (%d); nothing failed over ONTO it, so pacing "+
+			"the very first selection would throttle every request for no reason",
+			first.RampStartedAt)
+	}
+}
+
 // The other half of the per-attempt deadline, and the trap in implementing it:
 // the budget bounds PRE-FIRST-BYTE time only. Once headers are relayed the
 // request cannot be retried and the deadline must be gone, because a real
@@ -768,6 +914,36 @@ func TestAttemptReportsProxyErrorWhenEveryAccountIsRefused(t *testing.T) {
 	}
 	if n := len(h.upstream.Requests()); n != 2 {
 		t.Errorf("made %d attempts, want one per account", n)
+	}
+}
+
+// The all-refused 502 must compare the refused set against the ENABLED accounts.
+// Counting disabled ones too made the condition all but unreachable the moment an
+// operator switched one off: a credential every live account rejects came back as
+// a 429 telling the client to wait, when waiting cannot possibly help.
+func TestAttemptReportsProxyErrorWhenEveryEnabledAccountIsRefused(t *testing.T) {
+	const (
+		accounts = 3
+		disabled = 1
+	)
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 403, Body: `{"error":"not allowed"}`})
+	h := newHarnessAgainst(t, up, up.URL(), accounts, defaultRetry(),
+		harnessTweaks{nDisabled: disabled})
+
+	res, _ := h.post()
+
+	if res.StatusCode == http.StatusForbidden {
+		t.Fatal("a 403 must not be relayed to the client")
+	}
+	if res.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502; a disabled account must not make "+
+			"\"every account refused\" unreachable", res.StatusCode)
+	}
+	if got := h.last().Outcome; got != provider.OutcomeCredentialRefused {
+		t.Errorf("Outcome = %v, want credential_refused", got)
+	}
+	if n := len(up.Requests()); n != accounts-disabled {
+		t.Errorf("made %d attempts, want %d — one per ENABLED account", n, accounts-disabled)
 	}
 }
 

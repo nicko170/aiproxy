@@ -293,6 +293,74 @@ func TestRouterDoesNotProxyWrongMethodsOnReservedPaths(t *testing.T) {
 	}
 }
 
+// A reserved path that chi's router cannot see must still never be proxied.
+//
+// chi matches on r.URL.RawPath whenever it is set, so any spelling of the prefix
+// that survives escaping unchanged misses the mounted subrouter entirely, falls
+// through to r.NotFound — the proxy catch-all — and is forwarded to the provider
+// WITH AN ACCOUNT CREDENTIAL ATTACHED. Verified before the fix: the fake upstream
+// received GET /_aiproxy/api/v1/status carrying Bearer at.
+//
+// The guard therefore lives in proxyHandler, at the point of harm, rather than in
+// the router: there is no third spelling to discover because nothing that reaches
+// the proxy path can be under the reserved prefix, however it was written.
+func TestRouterDoesNotProxyEscapedReservedPaths(t *testing.T) {
+	cases := []struct {
+		name string
+		path string
+	}{
+		// %5F is "_": the prefix decodes correctly but RawPath differs, so the
+		// mounted subrouter never matches.
+		{"percent-encoded prefix", "/%5Faiproxy/api/v1/status"},
+		{"percent-encoded prefix, unknown route", "/%5Faiproxy/api/v1/not-a-route"},
+		// %2F is "/": r.URL.Path normalizes back into the reserved namespace while
+		// RawPath keeps chi looking at an ordinary-looking /v1 path.
+		{"traversal into the prefix", "/v1/..%2F_aiproxy/api/v1/status"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+			res, err := http.Get(h.srv.URL + c.path)
+			if err != nil {
+				t.Fatalf("GET %s: %v", c.path, err)
+			}
+			io.Copy(io.Discard, res.Body)
+			res.Body.Close()
+
+			if res.StatusCode != http.StatusNotFound {
+				t.Errorf("status = %d, want 404", res.StatusCode)
+			}
+			// The assertion that matters. A reserved path reaching the provider
+			// hands it one of our account credentials.
+			if n := len(h.up.Requests()); n != 0 {
+				t.Errorf("upstream saw %d requests for %q; a reserved path must never "+
+					"be proxied, however it is spelled", n, c.path)
+			}
+		})
+	}
+}
+
+// The guard above must not shadow the control plane it protects: the ordinary
+// spellings still have to be served locally.
+func TestRouterStillServesUnescapedReservedPaths(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200; the reserved-prefix guard swallowed a real "+
+			"control endpoint", res.StatusCode)
+	}
+	if n := len(h.up.Requests()); n != 0 {
+		t.Errorf("upstream saw %d requests", n)
+	}
+}
+
 // The relay aborts a truncated stream by panicking http.ErrAbortHandler. That
 // must survive the router's recovery middleware: if Recoverer swallowed it, the
 // chunked body would be finished cleanly and the client would accept a partial
