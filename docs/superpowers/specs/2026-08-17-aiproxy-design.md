@@ -476,7 +476,34 @@ together makes every cost figure wrong.
 §2.1 observable. A p95 TTFB line surfaces a stalling proxy in seconds; `wait_ms`
 attributes the stall to budget consumption specifically.
 
-### 7.2 Ingestion
+### 7.2 Capturing token counts
+
+Three requirements that stage 1 surfaced and this section was previously silent
+on. Each is a way to produce numbers that look plausible and are wrong, which is
+worse than having none.
+
+**Output tokens are cumulative, not incremental.** A streamed message reports
+usage twice: `message_start` carries the one-shot input, cache-read and
+cache-creation counts, and each `message_delta` carries `output_tokens` as a
+running total **for that message**, not a delta since the last event. Summing
+`UsageDelta.OutputTokens` across events therefore inflates output badly on long
+completions — the longer the answer, the worse the error. The accumulator takes
+the **last** value seen for output within a message and **sums** the one-shot
+input and cache figures across messages. A test asserts a multi-`message_delta`
+stream reports the final count, not the sum of the running totals.
+
+**Non-streaming responses count too.** The relay tees usage only when the
+response is `text/event-stream`, so a JSON response's `usage` object is never
+read. `count_tokens` and any non-streaming call currently contribute nothing.
+Usage capture must cover both shapes, with the provider parsing whichever
+envelope it receives.
+
+**The sink is real, not a hook.** Stage 1 wired `OnUsage` to a no-op closure and
+`Result` carries no token fields. Both change here: `Result` gains the four token
+counts so the request log line and the metrics row read the same numbers from one
+place, without a second lookup or a second parse.
+
+### 7.3 Ingestion
 
 The proxy hands a `metrics.Sample` to a buffered channel (capacity 4096). One
 writer goroutine batches inserts inside a transaction every 200 ms or 100 rows.
@@ -491,12 +518,19 @@ Charts read rollups; `requests` backs drill-down and is pruned at
 `metrics.retentionDays`. Rollups are never pruned — they are small, and they are
 what makes a 90-day query cheap.
 
-### 7.3 Queries
+### 7.4 Queries
 
 Exposed only through `view.Source`: `UsageSeries` (window, granularity,
 `groupBy` ∈ {account, model, outcome}), `Totals`, `LatencyPercentiles` (p50/p95
 TTFB and duration), `AccountQuotaHistory`. Both front-ends read these, so they
 cannot disagree.
+
+`outcome` is a persisted, append-only enumeration, so its granularity is fixed
+the moment rows exist. Before ingestion is switched on, `OutcomeServerError` is
+split into distinct kinds — it currently conflates an upstream 5xx, a local
+admission failure, and a failed send, which are three different operational
+stories that an outcome breakdown must be able to tell apart. Splitting later
+means migrating rows; splitting now is free.
 
 Cost estimation uses a small embedded model→price table. Unknown models record
 `NULL` cost rather than a plausible wrong number, and the UI shows unpriced
