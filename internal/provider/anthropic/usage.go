@@ -117,6 +117,14 @@ var nonAlnum = regexp.MustCompile(`[^a-z0-9]+`)
 
 // modelBucketName turns a display name like "Claude Fable 5" into a stable
 // bucket key like "7d_fable", so a bucket survives cosmetic renames upstream.
+//
+// When no name token survives (e.g. "Claude 5", or an empty display name),
+// this must fail closed rather than open: BucketAppliesTo treats any "_"
+// suffix as a model scope, so returning something like "7d_model" would make
+// a spent bucket silently non-binding for every real model — the exact
+// opposite of safe. Returning the plain, unscoped "7d" instead makes it merge
+// with the general weekly bucket, which is the conservative outcome: the
+// bucket then binds every model, same as an ordinary window bucket.
 func modelBucketName(displayName string) string {
 	s := strings.ToLower(displayName)
 	s = strings.ReplaceAll(s, "claude", " ")
@@ -129,7 +137,7 @@ func modelBucketName(displayName string) string {
 		}
 		return "7d_" + word
 	}
-	return "7d_model"
+	return "7d"
 }
 
 func bucketValue(b *usageBucketJSON) (float64, bool) {

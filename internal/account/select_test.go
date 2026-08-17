@@ -1,7 +1,9 @@
 package account
 
 import (
+	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,8 +44,11 @@ func TestSelectPrefersLowestPriority(t *testing.T) {
 
 func TestSelectSkipsDisabledErroredAndExcluded(t *testing.T) {
 	m := mgr(t, acct("a", 0), acct("b", 1), acct("c", 2))
-	m.Get("a").Disabled = true
-	m.Get("b").Status = StatusErrored
+	// Whitebox: mutate the live account directly. Get/All/Select hand out
+	// value copies now, so there is no pointer-returning accessor to mutate
+	// through from outside the package.
+	m.byID["a"].Disabled = true
+	m.byID["b"].Status = StatusErrored
 
 	got, err := m.Select(SelectRequest{})
 	if err != nil {
@@ -119,6 +124,53 @@ func TestSelectBreaksPriorityTiesBySoonestReset(t *testing.T) {
 	}
 }
 
+// An unknown reset (0) must sort last: a bucket with a known reset is spent
+// before one whose reset we cannot observe, even at equal priority. The
+// existing tie-break test never exercises this because both its accounts have
+// known resets.
+func TestSelectPrefersKnownResetOverUnknown(t *testing.T) {
+	m := mgr(t, acct("known", 0), acct("unknown", 0))
+	m.UpdateQuota("known", []provider.QuotaBucket{
+		{Name: "7d", Utilization: 0.5, ResetsAt: time.Now().Add(2 * time.Hour).UnixMilli()},
+	})
+	// "unknown" carries no bucket at all, so soonestReset reports 0.
+
+	got, err := m.Select(SelectRequest{})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "known" {
+		t.Errorf("selected %q, want known — an unknown reset must sort last", got.ID)
+	}
+}
+
+// A paused account stays selectable (a hinted throttle should queue requests
+// on the same warm account rather than push the burst elsewhere) but must not
+// be preferred over a healthy one.
+func TestSelectDeprioritizesPausedAccountWithoutExcludingIt(t *testing.T) {
+	m := mgr(t, acct("better", 0), acct("worse", 5))
+	m.PauseAccount("better", time.Hour)
+
+	got, err := m.Select(SelectRequest{})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "worse" {
+		t.Errorf("selected %q, want worse — a paused account must not outrank a healthy one", got.ID)
+	}
+
+	// With nothing healthier available, the paused account is still returned
+	// rather than refused outright.
+	m.PauseAccount("worse", time.Hour)
+	got, err = m.Select(SelectRequest{})
+	if err != nil {
+		t.Fatalf("Select with both paused: %v", err)
+	}
+	if got.ID != "better" {
+		t.Errorf("selected %q, want better — priority still breaks the tie among paused accounts", got.ID)
+	}
+}
+
 func TestSelectHonoursSessionAffinityThenYields(t *testing.T) {
 	m := mgr(t, acct("a", 0), acct("b", 5))
 	m.RecordSession("sess-1", "b")
@@ -134,6 +186,68 @@ func TestSelectHonoursSessionAffinityThenYields(t *testing.T) {
 	if got.ID != "a" {
 		t.Errorf("selected %q, want a once b is ineligible", got.ID)
 	}
+}
+
+// A bucket with no identifiable model token must fail closed: it binds every
+// model rather than being silently ignored for all of them. modelBucketName
+// (internal/provider/anthropic) guarantees such a bucket is never named with
+// an unresolved "_<token>" suffix; this exercises the consequence end to end.
+func TestSelectUnscopedRejectedBucketBlocksEveryModel(t *testing.T) {
+	m := mgr(t, acct("a", 0), acct("b", 1))
+	m.UpdateQuota("a", []provider.QuotaBucket{
+		{Name: "7d", Utilization: 1, Status: "rejected"},
+	})
+
+	for _, model := range []string{"claude-sonnet-5", "claude-fable-5", ""} {
+		got, err := m.Select(SelectRequest{Model: model})
+		if err != nil {
+			t.Fatalf("Select(%q): %v", model, err)
+		}
+		if got.ID != "b" {
+			t.Errorf("Select(%q) = %q, want b — an unscoped rejected bucket must block every model", model, got.ID)
+		}
+	}
+}
+
+// Select must never hand out a live *Account: a caller reading the result
+// would then race EnsureFresh writing a.Credential under the lock, and
+// Credential is three plain strings — a torn read produces a garbage token,
+// not merely a stale one. This is the gate for that: Select runs in a loop
+// concurrently with a forced EnsureFresh on the same account, reading the
+// returned Account's Credential every time. It must pass under -race, and it
+// must do so because Select/Get/All return value copies, not because nothing
+// happened to race.
+func TestSelectDoesNotRaceWithEnsureFresh(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = m.EnsureFresh(context.Background(), "a", true)
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		got, err := m.Select(SelectRequest{})
+		if err != nil {
+			continue // may be transiently ineligible; not what this test checks
+		}
+		// Read every field a consumer would read; under -race a torn write
+		// would be caught here if this were still a live pointer.
+		_ = got.Credential.AccessToken
+		_ = got.Credential.RefreshToken
+		_ = got.Credential.ExpiresAt
+	}
+	close(stop)
+	wg.Wait()
 }
 
 func TestBucketAppliesTo(t *testing.T) {

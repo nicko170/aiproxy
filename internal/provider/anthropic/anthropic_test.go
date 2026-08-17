@@ -8,10 +8,6 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
-func TestSatisfiesProviderInterface(t *testing.T) {
-	var _ provider.Provider = New(http.DefaultClient)
-}
-
 func TestEndpointUsesAccountOverride(t *testing.T) {
 	p := New(http.DefaultClient)
 
@@ -21,6 +17,20 @@ func TestEndpointUsesAccountOverride(t *testing.T) {
 	got := p.Endpoint(provider.Account{Upstream: "https://api.example.com"}).String()
 	if got != "https://api.example.com" {
 		t.Errorf("override endpoint = %q", got)
+	}
+}
+
+// An override with no scheme parses successfully as a relative URL rather
+// than erroring, so it must be caught by an explicit IsAbs check and fall
+// back to the default — otherwise it is silently accepted here and only
+// fails, confusingly, when something later tries to issue a request against
+// it.
+func TestEndpointFallsBackWhenUpstreamNotAbsolute(t *testing.T) {
+	p := New(http.DefaultClient)
+
+	got := p.Endpoint(provider.Account{Upstream: "api.example.com"}).String()
+	if got != DefaultBaseURL {
+		t.Errorf("endpoint = %q, want fallback to %q for a non-absolute override", got, DefaultBaseURL)
 	}
 }
 
@@ -136,5 +146,18 @@ func TestParseUsageReadsMessageStartAndDelta(t *testing.T) {
 	}
 	if _, ok := p.ParseUsage([]byte("data: [DONE]\n")); ok {
 		t.Error("a non-JSON data line must report false, not panic")
+	}
+}
+
+// Usage must be accepted only from message_start and message_delta. Without
+// that gate, an event of any other type that happens to carry the same usage
+// object — a retry, a replay, some event we haven't accounted for — would be
+// parsed too, and double-count tokens already reported.
+func TestParseUsageIgnoresUsageOnOtherEventTypes(t *testing.T) {
+	p := New(http.DefaultClient)
+
+	event := []byte(`data: {"type":"content_block_delta","usage":{"output_tokens":5}}` + "\n")
+	if _, ok := p.ParseUsage(event); ok {
+		t.Error("usage on an event type other than message_start/message_delta must not be parsed")
 	}
 }

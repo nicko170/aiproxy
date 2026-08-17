@@ -77,7 +77,10 @@ func (m *Manager) ClearRateLimited(id string) {
 }
 
 // Select returns the best eligible account, honouring session affinity first.
-func (m *Manager) Select(req SelectRequest) (*Account, error) {
+// The returned Account is a value copy: it must never be a pointer into live
+// Manager state, since a caller reading it races EnsureFresh mutating the
+// account's Credential under the lock.
+func (m *Manager) Select(req SelectRequest) (Account, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -86,7 +89,7 @@ func (m *Manager) Select(req SelectRequest) (*Account, error) {
 	if m.opts.SessionAffinity && req.SessionID != "" {
 		if id, ok := m.affinity[req.SessionID]; ok {
 			if a := m.byID[id]; a != nil && m.eligibleLocked(a, req, nowMS) {
-				return a, nil
+				return copyAccount(a), nil
 			}
 		}
 	}
@@ -98,11 +101,19 @@ func (m *Manager) Select(req SelectRequest) (*Account, error) {
 		}
 	}
 	if len(candidates) == 0 {
-		return nil, ErrNoAccount
+		return Account{}, ErrNoAccount
 	}
 
 	sort.SliceStable(candidates, func(i, j int) bool {
 		ai, aj := candidates[i], candidates[j]
+		// A paused account stays eligible — a hinted throttle should queue
+		// requests on the same warm account rather than push the burst
+		// elsewhere — but must never outrank a healthy one. It is chosen only
+		// when nothing unpaused is left.
+		pi, pj := ai.PausedUntil > nowMS, aj.PausedUntil > nowMS
+		if pi != pj {
+			return !pi
+		}
 		if ai.Priority != aj.Priority {
 			return ai.Priority < aj.Priority
 		}
@@ -120,7 +131,7 @@ func (m *Manager) Select(req SelectRequest) (*Account, error) {
 		}
 		return ai.ID < aj.ID // deterministic
 	})
-	return candidates[0], nil
+	return copyAccount(candidates[0]), nil
 }
 
 func (m *Manager) eligibleLocked(a *Account, req SelectRequest, nowMS int64) bool {

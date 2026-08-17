@@ -3,8 +3,6 @@
 package account
 
 import (
-	"time"
-
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/provider"
 )
@@ -82,10 +80,17 @@ func fromConfig(c config.Account) *Account {
 	}
 }
 
-// millis converts a time to unix ms, treating the zero time as 0.
-func millis(t time.Time) int64 {
-	if t.IsZero() {
-		return 0
+// copyAccount returns a value copy of a, deep-copying Buckets so the copy
+// shares no mutable state with the live account. Every read path that hands an
+// account out of the Manager (Get, All, Select, Snapshot) must go through this,
+// rather than returning *Account: a caller holding a pointer can race a
+// concurrent EnsureFresh writing a.Credential, and a Credential is three plain
+// strings — a torn read produces a garbage token, not merely a stale one.
+func copyAccount(a *Account) Account {
+	out := *a
+	out.Buckets = make(map[string]provider.QuotaBucket, len(a.Buckets))
+	for k, v := range a.Buckets {
+		out.Buckets[k] = v
 	}
-	return t.UnixMilli()
+	return out
 }

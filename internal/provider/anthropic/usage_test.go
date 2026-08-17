@@ -71,10 +71,14 @@ func TestQuotaNormalizesBuckets(t *testing.T) {
 	if five.ResetsAt != 1786986000_000 {
 		t.Errorf("5h resetsAt = %d, want unix ms", five.ResetsAt)
 	}
+	// "2026-08-24T00:00:00Z" as unix ms, exactly: a seconds/millis slip in
+	// precisely the conversion the milliseconds constraint exists to protect
+	// must fail this, not just an "!= 0" presence check.
+	const wantSevenDayResetsAt = 1787529600_000
 	if seven, ok := byName["7d"]; !ok || seven.Utilization != 0.01 {
 		t.Errorf("7d bucket = %+v (ok=%v)", seven, ok)
-	} else if seven.ResetsAt == 0 {
-		t.Error("an RFC3339 resets_at should parse")
+	} else if seven.ResetsAt != wantSevenDayResetsAt {
+		t.Errorf("7d resetsAt = %d, want %d (RFC3339 parsed to exact unix ms)", seven.ResetsAt, wantSevenDayResetsAt)
 	}
 	fable, ok := byName["7d_fable"]
 	if !ok {
@@ -105,6 +109,29 @@ func TestQuotaReportsThrottling(t *testing.T) {
 	})
 	if !errors.Is(err, ErrQuotaThrottled) {
 		t.Fatalf("err = %v, want ErrQuotaThrottled", err)
+	}
+}
+
+// A display name with no identifiable model token must fail closed: it must
+// not produce a name carrying a "_" suffix, since BucketAppliesTo treats any
+// such suffix as a model scope. A spent bucket that ends up looking
+// model-scoped when it isn't would be silently ignored for every real model —
+// the opposite of safe. The conservative fallback is the plain "7d", which
+// merges into the general weekly bucket and binds every model.
+func TestModelBucketNameFailsClosedWhenNoTokenSurvives(t *testing.T) {
+	cases := []struct {
+		displayName string
+		want        string
+	}{
+		{"Claude 5", "7d"}, // only a version number, no name token
+		{"", "7d"},         // nothing at all
+		{"5", "7d"},        // bare version number
+		{"Claude Fable 5", "7d_fable"},
+	}
+	for _, c := range cases {
+		if got := modelBucketName(c.displayName); got != c.want {
+			t.Errorf("modelBucketName(%q) = %q, want %q", c.displayName, got, c.want)
+		}
 	}
 }
 

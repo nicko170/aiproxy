@@ -2,6 +2,7 @@ package account
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -65,35 +66,34 @@ func New(accts []config.Account, providers map[string]provider.Provider, opts Op
 	return m
 }
 
-func (m *Manager) Get(id string) *Account {
+// Get returns a value copy of one account, safe to read without the lock. ok
+// is false when no account has that id.
+func (m *Manager) Get(id string) (Account, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.byID[id]
+	a, ok := m.byID[id]
+	if !ok {
+		return Account{}, false
+	}
+	return copyAccount(a), true
 }
 
-// All returns the live account pointers. Callers must not mutate them.
-func (m *Manager) All() []*Account {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	out := make([]*Account, len(m.accounts))
-	copy(out, m.accounts)
-	return out
-}
-
-// Snapshot returns value copies safe to hand to a UI.
-func (m *Manager) Snapshot() []Account {
+// All returns value copies of every account, safe to read without the lock.
+func (m *Manager) All() []Account {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]Account, 0, len(m.accounts))
 	for _, a := range m.accounts {
-		copyAcct := *a
-		copyAcct.Buckets = make(map[string]provider.QuotaBucket, len(a.Buckets))
-		for k, v := range a.Buckets {
-			copyAcct.Buckets[k] = v
-		}
-		out = append(out, copyAcct)
+		out = append(out, copyAccount(a))
 	}
 	return out
+}
+
+// Snapshot returns value copies safe to hand to a UI. It is currently
+// identical to All; kept as a distinct name because the two serve different
+// callers and are free to diverge later.
+func (m *Manager) Snapshot() []Account {
+	return m.All()
 }
 
 // EnsureFresh renews an account's credential when it is expired or close to it,
@@ -119,6 +119,16 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 		m.mu.Unlock()
 		return nil
 	}
+	// A prior attempt already failed and the credential is still expired: a
+	// retry would just fail the same way. Without this, a burst of sequential
+	// callers against a dead refresh token each pays the full 3-attempt retry
+	// in RefreshToken. force bypasses this, so a caller can still ask for a
+	// fresh attempt deliberately.
+	if !force && a.Status == StatusErrored && m.isExpiredLocked(a) {
+		err := errors.New(a.LastError)
+		m.mu.Unlock()
+		return err
+	}
 	if call, ok := m.refreshing[id]; ok {
 		m.mu.Unlock()
 		select {
@@ -135,6 +145,18 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 	m.mu.Unlock()
 
 	var err error
+	// Cleanup runs on every exit path, including a panic unwinding through
+	// p.Refresh or Persist: without it, m.refreshing[id] is left poisoned and
+	// every later EnsureFresh for this account blocks until its context
+	// expires, since nothing ever closes call.done.
+	defer func() {
+		call.err = err
+		m.mu.Lock()
+		delete(m.refreshing, id)
+		m.mu.Unlock()
+		close(call.done)
+	}()
+
 	if p == nil {
 		err = fmt.Errorf("no provider %q for account %q", a.Provider, id)
 	} else {
@@ -157,13 +179,6 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 		a.LastError = err.Error()
 		m.mu.Unlock()
 	}
-
-	m.mu.Lock()
-	delete(m.refreshing, id)
-	m.mu.Unlock()
-
-	call.err = err
-	close(call.done)
 	return err
 }
 
@@ -173,6 +188,18 @@ func (m *Manager) needsRefreshLocked(a *Account) bool {
 	}
 	now := m.opts.Now()
 	return now.Add(refreshThreshold).UnixMilli() >= a.Credential.ExpiresAt
+}
+
+// isExpiredLocked reports whether the credential's expiry has actually
+// passed, as opposed to needsRefreshLocked's "within threshold" definition.
+// Used to decide whether a prior failure is still current: a credential that
+// is merely approaching expiry deserves a fresh attempt, but one that is
+// already expired and was already rejected will fail again identically.
+func (m *Manager) isExpiredLocked(a *Account) bool {
+	if a.Credential.ExpiresAt == 0 {
+		return false
+	}
+	return m.opts.Now().UnixMilli() >= a.Credential.ExpiresAt
 }
 
 // UpdateQuota records observed buckets for an account.

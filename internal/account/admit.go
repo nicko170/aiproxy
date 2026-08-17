@@ -122,8 +122,8 @@ func (m *Manager) Admit(ctx context.Context, id string, w Waiter) error {
 			continue
 		}
 
-		cap := m.rampCapLocked(a, nowMS)
-		if cap < 0 || a.InFlight < cap {
+		limit := m.rampCapLocked(a, nowMS)
+		if limit < 0 || a.InFlight < limit {
 			a.InFlight++
 			m.mu.Unlock()
 			return nil

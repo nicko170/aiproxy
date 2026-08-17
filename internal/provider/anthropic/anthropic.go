@@ -14,6 +14,11 @@ import (
 
 const DefaultBaseURL = "https://api.anthropic.com"
 
+// Compile-time assertion that *Anthropic satisfies provider.Provider, kept in
+// the package proper rather than a test so it can never silently regress to a
+// stub in a non-test build.
+var _ provider.Provider = (*Anthropic)(nil)
+
 // Anthropic is the provider implementation. It holds no per-request state.
 type Anthropic struct {
 	hc *http.Client
@@ -50,14 +55,21 @@ func (a *Anthropic) Refresh(ctx context.Context, c provider.Credential) (provide
 	return RefreshToken(ctx, a.hc, a.tokenEndpoint(), c.RefreshToken)
 }
 
-// Endpoint is the base URL for an account: its override when set, else the
-// provider default.
+// Endpoint is the base URL for an account: its override when set and
+// absolute, else the provider default.
+//
+// An override with no scheme (e.g. "api.example.com") parses successfully as
+// a relative URL rather than erroring, so url.Parse's error alone cannot
+// detect it; without the IsAbs check such a value would be accepted here and
+// only fail confusingly much later, when something tries to issue a request
+// against it.
 func (a *Anthropic) Endpoint(acct provider.Account) *url.URL {
-	raw := acct.Upstream
-	if raw == "" {
-		raw = a.baseURL()
+	if acct.Upstream != "" {
+		if u, err := url.Parse(acct.Upstream); err == nil && u.IsAbs() {
+			return u
+		}
 	}
-	u, err := url.Parse(raw)
+	u, err := url.Parse(a.baseURL())
 	if err != nil {
 		u, _ = url.Parse(DefaultBaseURL)
 	}
@@ -165,6 +177,11 @@ type usage struct {
 // writes are reported separately because under an agent workload cache reads
 // dominate plain input tokens, and folding them together makes any cost figure
 // derived from this wrong.
+//
+// Only message_start and message_delta are accepted. Without that gate, usage
+// would be taken from any event carrying a usage object, and a future event
+// that echoes the same usage payload (a retry, a replay, some other event type
+// we haven't seen yet) would silently double-count it.
 func (a *Anthropic) ParseUsage(event []byte) (*provider.UsageDelta, bool) {
 	for _, line := range strings.Split(string(event), "\n") {
 		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
@@ -173,6 +190,9 @@ func (a *Anthropic) ParseUsage(event []byte) (*provider.UsageDelta, bool) {
 		}
 		var ev sseUsage
 		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &ev); err != nil {
+			continue
+		}
+		if ev.Type != "message_start" && ev.Type != "message_delta" {
 			continue
 		}
 		u := ev.Usage

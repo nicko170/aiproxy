@@ -20,6 +20,7 @@ type stubProvider struct {
 	refreshes atomic.Int32
 	delay     time.Duration
 	err       error
+	panic     bool
 }
 
 func (s *stubProvider) Name() string { return "stub" }
@@ -28,6 +29,9 @@ func (s *stubProvider) Refresh(ctx context.Context, c provider.Credential) (prov
 	s.refreshes.Add(1)
 	if s.delay > 0 {
 		time.Sleep(s.delay)
+	}
+	if s.panic {
+		panic("stubProvider: Refresh panicked")
 	}
 	if s.err != nil {
 		return provider.Credential{}, s.err
@@ -89,7 +93,11 @@ func TestEnsureFreshRefreshesExpiredCredentialAndPersists(t *testing.T) {
 	if err := m.EnsureFresh(context.Background(), "a", false); err != nil {
 		t.Fatalf("EnsureFresh: %v", err)
 	}
-	if got := m.Get("a").Credential.AccessToken; got != "refreshed" {
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if got := acc.Credential.AccessToken; got != "refreshed" {
 		t.Errorf("AccessToken = %q, want refreshed", got)
 	}
 	if n := len(*persisted); n != 1 {
@@ -149,6 +157,19 @@ func TestEnsureFreshCoalescesConcurrentCallers(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			errs[i] = m.EnsureFresh(context.Background(), "a", false)
+			// Every caller — leader or follower — must itself observe the
+			// refreshed credential once its own call returns. A follower that
+			// merely returned nil because it happened to short-circuit on
+			// needsRefreshLocked would pass the error check below identically
+			// while never having actually seen the new token.
+			acc, ok := m.Get("a")
+			if !ok {
+				t.Errorf("caller %d: account vanished", i)
+				return
+			}
+			if acc.Credential.AccessToken != "refreshed" {
+				t.Errorf("caller %d: AccessToken = %q, want refreshed", i, acc.Credential.AccessToken)
+			}
 		}(i)
 	}
 	wg.Wait()
@@ -166,6 +187,35 @@ func TestEnsureFreshCoalescesConcurrentCallers(t *testing.T) {
 	}
 }
 
+// The same coalescing must hold on the error path: every follower observes the
+// leader's rejection rather than attempting its own retry.
+func TestEnsureFreshCoalescesConcurrentCallersOnError(t *testing.T) {
+	p := &stubProvider{delay: 50 * time.Millisecond, err: errors.New("invalid_grant")}
+	m, _ := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	var wg sync.WaitGroup
+	errs := make([]error, 10)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = m.EnsureFresh(context.Background(), "a", false)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			t.Errorf("caller %d: got nil error, want the leader's rejection", i)
+		}
+	}
+	if n := p.refreshes.Load(); n != 1 {
+		t.Errorf("refreshed %d times, want exactly 1 even on the error path", n)
+	}
+}
+
 func TestEnsureFreshMarksAccountErroredOnRejection(t *testing.T) {
 	p := &stubProvider{err: errors.New("invalid_grant")}
 	m, _ := newTestManager(t, p, config.Account{
@@ -175,8 +225,82 @@ func TestEnsureFreshMarksAccountErroredOnRejection(t *testing.T) {
 	if err := m.EnsureFresh(context.Background(), "a", false); err == nil {
 		t.Fatal("expected the refresh error to propagate")
 	}
-	if got := m.Get("a").Status; got != StatusErrored {
-		t.Errorf("Status = %v, want StatusErrored", got)
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusErrored {
+		t.Errorf("Status = %v, want StatusErrored", acc.Status)
+	}
+}
+
+// A dead refresh token must not be retried on every sequential call: once an
+// account is StatusErrored and its credential is still actually expired
+// (not merely inside the renew-soon threshold), EnsureFresh returns the
+// recorded error immediately instead of paying another 3-attempt retry.
+func TestEnsureFreshShortCircuitsAfterHardRejectionWithoutRetrying(t *testing.T) {
+	p := &stubProvider{err: errors.New("invalid_grant")}
+	m, _ := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	if err := m.EnsureFresh(context.Background(), "a", false); err == nil {
+		t.Fatal("expected the refresh error to propagate")
+	}
+	if n := p.refreshes.Load(); n != 1 {
+		t.Fatalf("refreshed %d times after the first failure, want 1", n)
+	}
+
+	if err := m.EnsureFresh(context.Background(), "a", false); err == nil {
+		t.Fatal("expected the recorded error to be returned again")
+	}
+	if n := p.refreshes.Load(); n != 1 {
+		t.Errorf("refreshed %d times, want still 1 — a dead refresh token was retried instead of short-circuited", n)
+	}
+
+	// force still gets a real attempt, and a successful one clears the error.
+	p.err = nil
+	if err := m.EnsureFresh(context.Background(), "a", true); err != nil {
+		t.Fatalf("forced EnsureFresh: %v", err)
+	}
+	if n := p.refreshes.Load(); n != 2 {
+		t.Errorf("refreshed %d times, want 2 — force must bypass the short-circuit", n)
+	}
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusActive {
+		t.Errorf("Status = %v, want StatusActive after a successful forced refresh", acc.Status)
+	}
+}
+
+// A panic inside Refresh or Persist must not leave the single-flight entry
+// poisoned: net/http recovers a panic per-connection, so the process survives,
+// but without deferred cleanup nothing ever closes call.done and every later
+// EnsureFresh on that account hangs until its context expires.
+func TestEnsureFreshCleansUpSingleFlightAfterProviderPanic(t *testing.T) {
+	p := &stubProvider{panic: true}
+	m, _ := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	func() {
+		defer func() { _ = recover() }()
+		_ = m.EnsureFresh(context.Background(), "a", false)
+	}()
+
+	p.panic = false
+	done := make(chan error, 1)
+	go func() { done <- m.EnsureFresh(context.Background(), "a", false) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureFresh after a prior panic: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureFresh hung — a prior panic left the single-flight entry poisoned")
 	}
 }
 
