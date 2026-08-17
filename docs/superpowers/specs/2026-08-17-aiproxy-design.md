@@ -43,8 +43,12 @@ no separate login command and no wrapper that launches the agent for you.
 These are the invariants the design exists to guarantee. Each has a test.
 
 1. **No silent stalls.** Time from receiving a client request to writing the
-   first response byte is bounded by a configured budget, regardless of upstream
-   behaviour. Exceeding it produces a prompt, honest error — never dead air.
+   first response byte is bounded by two clocks working together (§4.2):
+   `retry.budgetMs` bounds time the proxy itself adds, and `retry.headerTimeoutMs`
+   bounds each attempt's wait on upstream response headers. Together they cap the
+   worst case at `budgetMs + attempts × headerTimeoutMs` — loose, but always
+   finite and known in advance, regardless of upstream behaviour. Exceeding
+   either produces a prompt, honest error — never dead air.
 2. **Streaming is streaming.** A chunk received from upstream is flushed to the
    client before the next one is read. No response is buffered whole in order to
    be relayed.
@@ -163,11 +167,15 @@ times over three minutes with nothing wrong upstream.
 **Clock 2 — the header timeout (`retry.headerTimeoutMs`, default 60 000).** How
 long a *single* attempt may wait for response headers. It covers the real hazard
 the budget cannot express: an upstream that accepts a connection and then
-withholds headers indefinitely, which the transport's own 120 s
-`ResponseHeaderTimeout` bounds far too coarsely. 60 s is generous enough for a
-slow first token and still finite. An attempt abandoned here is a *failed
-attempt*: it rotates, and it is recorded as `server_error`, never as
-`no_account_ready` — an account was selected, admitted, and sent to.
+withholds headers indefinitely. The attempt loop enforces this itself, by
+cancelling the attempt's context — it does not rely on the transport's own
+`ResponseHeaderTimeout` to catch this case. That field is set from
+`headerTimeoutMs` plus a fixed safety margin purely as a backstop against a
+wedged connection, so it can never fire before the attempt loop's own timer and
+never substitute a generic transport error for the honest one below. 60 s is
+generous enough for a slow first token and still finite. An attempt abandoned
+here is a *failed attempt*: it rotates, and it is recorded as `server_error`,
+never as `no_account_ready` — an account was selected, admitted, and sent to.
 
 Together they give a worst case that is chosen rather than accidental:
 
@@ -250,6 +258,11 @@ transport's coarser `ResponseHeaderTimeout`. Three properties are load-bearing:
 3. It bounds one attempt, so the total is `attempts x headerTimeoutMs` and the
    attempt count is capped independently (§4.2). It is not a request-level bound
    and must not be read as one.
+4. The transport's own `ResponseHeaderTimeout` is derived from
+   `headerTimeoutMs` plus a fixed safety margin rather than left at a
+   hardcoded default. Raising `headerTimeoutMs` (§6.2) for a slower model
+   therefore never trips a coarser, unlabelled cutoff underneath it — the two
+   knobs cannot silently disagree.
 
 Everything after headers is the relay's problem, governed by `retry.bodyIdleMs`
 (§4.6). The two windows abut exactly: neither leaves a gap in which an upstream
