@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,14 +22,28 @@ type stubProvider struct {
 	delay     time.Duration
 	err       error
 	panic     bool
+	// started, when non-nil, receives one value as each Refresh begins.
+	started chan struct{}
 }
 
 func (s *stubProvider) Name() string { return "stub" }
 
 func (s *stubProvider) Refresh(ctx context.Context, c provider.Credential) (provider.Credential, error) {
 	s.refreshes.Add(1)
+	if s.started != nil {
+		select {
+		case s.started <- struct{}{}:
+		default:
+		}
+	}
+	// Honours ctx, as a real provider's HTTP call does: without that the refresh
+	// timeout would be untestable and, worse, unenforceable.
 	if s.delay > 0 {
-		time.Sleep(s.delay)
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return provider.Credential{}, ctx.Err()
+		}
 	}
 	if s.panic {
 		panic("stubProvider: Refresh panicked")
@@ -276,23 +291,41 @@ func TestEnsureFreshShortCircuitsAfterHardRejectionWithoutRetrying(t *testing.T)
 }
 
 // A panic inside Refresh or Persist must not leave the single-flight entry
-// poisoned: net/http recovers a panic per-connection, so the process survives,
-// but without deferred cleanup nothing ever closes call.done and every later
-// EnsureFresh on that account hangs until its context expires.
+// poisoned: without deferred cleanup nothing ever closes call.done and every
+// later EnsureFresh on that account hangs until its context expires.
+//
+// The refresh now runs on its own goroutine, so there is no http.Handler on that
+// stack for net/http to recover on and an unrecovered panic would take the whole
+// process down. It is therefore recovered at the refresh and converted to an
+// ordinary refresh failure, which also marks the account errored — the same
+// treatment any other failed refresh gets.
 func TestEnsureFreshCleansUpSingleFlightAfterProviderPanic(t *testing.T) {
 	p := &stubProvider{panic: true}
 	m, _ := newTestManager(t, p, config.Account{
 		ID: "a", Provider: "stub", Credential: expiredOAuth(),
 	})
 
-	func() {
-		defer func() { _ = recover() }()
-		_ = m.EnsureFresh(context.Background(), "a", false)
-	}()
+	err := m.EnsureFresh(context.Background(), "a", false)
+	if err == nil {
+		t.Fatal("a panicking refresh must surface as an error, not as success")
+	}
+	if !strings.Contains(err.Error(), "panic") {
+		t.Errorf("err = %v, want it to name the panic", err)
+	}
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusErrored {
+		t.Errorf("Status = %v, want StatusErrored after a panicking refresh", acc.Status)
+	}
 
+	// The point of the test: the single-flight entry was released, so a later
+	// refresh runs rather than hanging on a channel nothing will ever close.
+	// force bypasses the errored-account short-circuit so a real attempt happens.
 	p.panic = false
 	done := make(chan error, 1)
-	go func() { done <- m.EnsureFresh(context.Background(), "a", false) }()
+	go func() { done <- m.EnsureFresh(context.Background(), "a", true) }()
 
 	select {
 	case err := <-done:
@@ -301,6 +334,133 @@ func TestEnsureFreshCleansUpSingleFlightAfterProviderPanic(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("EnsureFresh hung — a prior panic left the single-flight entry poisoned")
+	}
+	if n := p.refreshes.Load(); n != 2 {
+		t.Errorf("refreshed %d times, want 2 — the retry after the panic never reached the provider", n)
+	}
+}
+
+// A caller that gives up must not cancel a refresh other callers are waiting on.
+// The refresh runs on its own context precisely so the work survives the caller,
+// and the next request finds the finished result rather than starting a second
+// refresh — which is what coalescing exists to prevent. The upstream rotates the
+// refresh token on every exchange, so a duplicate refresh strands one of them.
+func TestEnsureFreshSurvivesTheCancellationOfItsCaller(t *testing.T) {
+	p := &stubProvider{delay: 150 * time.Millisecond, started: make(chan struct{}, 1)}
+	m, persisted := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	// First caller abandons its wait almost immediately.
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { first <- m.EnsureFresh(ctx, "a", false) }()
+	<-p.started // the refresh is genuinely under way before we cancel
+	cancel()
+
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first caller err = %v, want context.Canceled", err)
+	}
+
+	// The refresh must still be running and must still complete. A second caller
+	// arriving after it lands sees the new credential.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		acc, _ := m.Get("a")
+		if acc.Credential.AccessToken == "refreshed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the refresh died with its caller; the credential was never rotated")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := m.EnsureFresh(context.Background(), "a", false); err != nil {
+		t.Fatalf("second caller: %v", err)
+	}
+	acc, _ := m.Get("a")
+	if acc.Credential.AccessToken != "refreshed" {
+		t.Errorf("AccessToken = %q, want the completed refresh's", acc.Credential.AccessToken)
+	}
+	if n := p.refreshes.Load(); n != 1 {
+		t.Errorf("refreshed %d times, want exactly 1 — the abandoned refresh was repeated", n)
+	}
+	if n := len(*persisted); n != 1 {
+		t.Errorf("persisted %d times, want 1", n)
+	}
+}
+
+// A caller's own context bounds only its own wait. This is what lets the proxy
+// cap a refresh by the request's remaining budget.
+func TestEnsureFreshReturnsWhenTheCallersContextExpiresFirst(t *testing.T) {
+	p := &stubProvider{delay: 2 * time.Second, started: make(chan struct{}, 1)}
+	m, _ := newTestManager(t, p, config.Account{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := m.EnsureFresh(ctx, "a", false)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > time.Second {
+		t.Errorf("waited %v for a 60ms context against a 2s refresh — the caller's "+
+			"bound is not being honoured", elapsed)
+	}
+}
+
+// A refresh that outruns RefreshTimeout must fail like any other refresh: the
+// account is marked errored, and crucially the single-flight entry is released so
+// a later EnsureFresh runs instead of hanging on it forever.
+func TestEnsureFreshTimesOutASlowRefreshAndStaysUsable(t *testing.T) {
+	p := &stubProvider{delay: 5 * time.Second}
+	var mu sync.Mutex
+	m := New([]config.Account{{
+		ID: "a", Provider: "stub", Credential: expiredOAuth(),
+	}}, map[string]provider.Provider{"stub": p}, Options{
+		SwitchThreshold: 0.98,
+		RefreshTimeout:  60 * time.Millisecond,
+		Persist: func(string, provider.Credential) error {
+			mu.Lock()
+			defer mu.Unlock()
+			return nil
+		},
+	})
+
+	start := time.Now()
+	err := m.EnsureFresh(context.Background(), "a", false)
+	if err == nil {
+		t.Fatal("a refresh past RefreshTimeout must fail rather than succeed")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v; RefreshTimeout did not bound the refresh", elapsed)
+	}
+	acc, ok := m.Get("a")
+	if !ok {
+		t.Fatal("Get: account not found")
+	}
+	if acc.Status != StatusErrored {
+		t.Errorf("Status = %v, want StatusErrored after a timed-out refresh", acc.Status)
+	}
+
+	// The single-flight entry must have been released. force bypasses the
+	// errored-account short-circuit so this is a real attempt.
+	p.delay = 0
+	done := make(chan error, 1)
+	go func() { done <- m.EnsureFresh(context.Background(), "a", true) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureFresh after a timed-out refresh: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("EnsureFresh hung — a timed-out refresh wedged the single-flight entry")
 	}
 }
 

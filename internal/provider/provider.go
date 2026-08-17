@@ -65,6 +65,16 @@ const (
 	OutcomeCredentialRefused
 	OutcomeClientError
 	OutcomeServerError
+	// OutcomeNoAccountReady is the proxy's own verdict rather than a classified
+	// upstream response: no account could be made ready, so nothing was sent.
+	//
+	// It exists because the zero value of this type is OutcomeOK, so a request
+	// answered 429 without a single attempt reported "ok" — a failure recorded as
+	// a success. Stage 2 writes this field into the metrics store, where that
+	// would quietly corrupt every outcome breakdown derived from it.
+	//
+	// Append new kinds here, never insert: these values are persisted.
+	OutcomeNoAccountReady
 )
 
 func (k OutcomeKind) String() string {
@@ -85,6 +95,8 @@ func (k OutcomeKind) String() string {
 		return "client_error"
 	case OutcomeServerError:
 		return "server_error"
+	case OutcomeNoAccountReady:
+		return "no_account_ready"
 	}
 	return "unknown"
 }

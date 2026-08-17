@@ -14,6 +14,13 @@ import (
 // refreshThreshold is how far ahead of expiry a credential is renewed.
 const refreshThreshold = 5 * time.Minute
 
+// defaultRefreshTimeout bounds one credential refresh end to end. The provider's
+// own retry and backoff sit inside this, so it caps the whole exchange rather
+// than a single HTTP attempt. Without it, a token endpoint that accepts a
+// connection and then never answers holds the refresh — and every request
+// waiting on it — for as long as it likes.
+const defaultRefreshTimeout = 30 * time.Second
+
 // Options configures a Manager. Persist is called after a successful refresh so
 // the rotated credential survives a restart; Now is injectable for tests.
 type Options struct {
@@ -22,6 +29,8 @@ type Options struct {
 	SwitchThreshold float64
 	SessionAffinity bool
 	Ramp            Ramp
+	// RefreshTimeout bounds one refresh. Zero takes defaultRefreshTimeout.
+	RefreshTimeout time.Duration
 }
 
 // refreshCall is one in-flight refresh other callers wait on.
@@ -48,6 +57,9 @@ func New(accts []config.Account, providers map[string]provider.Provider, opts Op
 	}
 	if opts.SwitchThreshold <= 0 {
 		opts.SwitchThreshold = 0.98
+	}
+	if opts.RefreshTimeout <= 0 {
+		opts.RefreshTimeout = defaultRefreshTimeout
 	}
 	opts.Ramp = opts.Ramp.withDefaults()
 
@@ -103,6 +115,19 @@ func (m *Manager) Snapshot() []Account {
 // Without that, a burst of requests produces a burst of refreshes; the upstream
 // rotates the refresh token on each one, so every attempt but one is left
 // holding a token that has already been superseded.
+//
+// A refresh's lifetime is deliberately separate from any one caller's wait. The
+// refresh itself runs on a background context bounded by Options.RefreshTimeout,
+// while each caller — leader and follower alike — waits only as long as its own
+// ctx allows. Two consequences, both wanted:
+//
+//   - A caller that gives up does not cancel a refresh other callers are waiting
+//     on, and does not destroy work the next request would otherwise repeat. The
+//     refresh runs to completion and the next caller finds the result already
+//     there, which is the entire point of coalescing.
+//   - A caller can bound its own wait. The proxy passes a context derived from
+//     the request's remaining budget, so a slow token endpoint can no longer
+//     spend more than that budget before the client hears something.
 func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error {
 	m.mu.Lock()
 	a := m.byID[id]
@@ -131,25 +156,57 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 	}
 	if call, ok := m.refreshing[id]; ok {
 		m.mu.Unlock()
-		select {
-		case <-call.done:
-			return call.err
-		case <-ctx.Done():
-			return ctx.Err()
-		}
+		return waitForRefresh(ctx, call)
 	}
 	call := &refreshCall{done: make(chan struct{})}
 	m.refreshing[id] = call
 	p := m.providers[a.Provider]
 	cred := a.Credential
+	timeout := m.opts.RefreshTimeout
 	m.mu.Unlock()
 
+	// Detached deliberately: see the note above. The leader waits on the result
+	// exactly as a follower does, so it can abandon its wait without abandoning
+	// the refresh.
+	go m.runRefresh(id, a, p, cred, timeout, call)
+
+	return waitForRefresh(ctx, call)
+}
+
+// waitForRefresh blocks until the in-flight refresh finishes or the caller's own
+// context expires, whichever comes first. On expiry the refresh is left running.
+func waitForRefresh(ctx context.Context, call *refreshCall) error {
+	select {
+	case <-call.done:
+		return call.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// runRefresh performs one refresh and publishes its result to every waiter.
+//
+// It runs on its own goroutine under a background context, so no caller's
+// cancellation can kill it. A panic is recovered and converted to an error
+// rather than propagated: there is no longer an http.Handler on this stack for
+// net/http to recover on, so an unrecovered panic here would take the whole
+// process down with every other in-flight request.
+func (m *Manager) runRefresh(id string, a *Account, p provider.Provider, cred provider.Credential, timeout time.Duration, call *refreshCall) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	var err error
-	// Cleanup runs on every exit path, including a panic unwinding through
-	// p.Refresh or Persist: without it, m.refreshing[id] is left poisoned and
-	// every later EnsureFresh for this account blocks until its context
-	// expires, since nothing ever closes call.done.
+	// Cleanup runs on every exit path, including a recovered panic: without it,
+	// m.refreshing[id] is left poisoned and every later EnsureFresh for this
+	// account blocks until its context expires, since nothing closes call.done.
 	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("refresh panicked for account %q: %v", id, r)
+			m.mu.Lock()
+			a.Status = StatusErrored
+			a.LastError = err.Error()
+			m.mu.Unlock()
+		}
 		call.err = err
 		m.mu.Lock()
 		delete(m.refreshing, id)
@@ -179,7 +236,6 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 		a.LastError = err.Error()
 		m.mu.Unlock()
 	}
-	return err
 }
 
 func (m *Manager) needsRefreshLocked(a *Account) bool {

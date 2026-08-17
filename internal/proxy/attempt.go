@@ -185,12 +185,18 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			continue
 		}
 
-		// A credential refresh is dead air like any other, so it is charged to
-		// the budget rather than being free. Charge, not Spend: Spend is
-		// all-or-nothing, so a refresh that outlasted the remaining budget used
-		// to be charged nothing at all and the cost grew with the account count.
+		// A credential refresh is dead air like any other, so it is both CAPPED by
+		// the remaining budget and CHARGED for what it used. Charging alone was not
+		// enough: the cost was only recognised after the fact, so one slow token
+		// endpoint could still spend far more than the whole allowance before the
+		// client heard anything. Capping alone would not be enough either — a
+		// refresh cut short still consumed real wall-clock.
+		//
+		// Cancelling this derived context ends only THIS wait. The refresh itself
+		// runs on the manager's own background context, so it completes and the
+		// next request finds the result instead of starting a second one.
 		refreshStart := time.Now()
-		refreshErr := a.mgr.EnsureFresh(ctx, acct.ID, false)
+		refreshErr := a.ensureFreshWithin(ctx, budget, acct.ID, false)
 		budget.Charge(time.Since(refreshStart))
 		if refreshErr != nil {
 			a.log.Warn("credential refresh failed", "account", acct.Label, "err", refreshErr)
@@ -301,7 +307,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			if !reauthed[acct.ID] {
 				reauthed[acct.ID] = true
 				forceStart := time.Now()
-				err := a.mgr.EnsureFresh(ctx, acct.ID, true)
+				err := a.ensureFreshWithin(ctx, budget, acct.ID, true)
 				budget.Charge(time.Since(forceStart))
 				if err == nil {
 					continue // same account, fresh credential
@@ -333,6 +339,22 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 		a.relay(ctx, w, upstreamRes, prov, &res)
 		return res
 	}
+}
+
+// ensureFreshWithin waits for a credential refresh for no longer than the budget
+// has left.
+//
+// The cap is on this caller's WAIT, not on the refresh: account.Manager runs the
+// refresh on its own background context precisely so a caller that gives up
+// neither kills it nor forces the next request to start again from scratch.
+func (a *Attempter) ensureFreshWithin(ctx context.Context, budget *Budget, id string, force bool) error {
+	remaining := budget.Remaining()
+	if remaining <= 0 {
+		return ErrBudgetExhausted
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	return a.mgr.EnsureFresh(refreshCtx, id, force)
 }
 
 // sendWithin performs one upstream attempt under the remaining budget, and
@@ -518,6 +540,12 @@ func (a *Attempter) writeExhausted(w http.ResponseWriter, res *Result, reason st
 	retry := a.retryAfterHint()
 	secs := strconv.Itoa(int(retry.Seconds()))
 	res.Status = http.StatusTooManyRequests
+	// Nothing upstream classified this request, so without an explicit verdict the
+	// zero value would report it as OutcomeOK — a 429 logged as a success. A real
+	// classification from an earlier attempt (a throttle, say) is left alone.
+	if res.Outcome == provider.OutcomeOK {
+		res.Outcome = provider.OutcomeNoAccountReady
+	}
 	a.log.Warn("answering 429", "reason", reason, "retryAfter", retry)
 	a.writeJSON(w, http.StatusTooManyRequests,
 		map[string]string{"Retry-After": secs}, "rate_limit_error",

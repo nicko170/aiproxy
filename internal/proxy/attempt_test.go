@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -42,6 +43,7 @@ func slowTokenEndpoint(t *testing.T, delay time.Duration) (string, func() int) {
 	t.Helper()
 	var mu sync.Mutex
 	calls := 0
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		calls++
@@ -51,12 +53,19 @@ func slowTokenEndpoint(t *testing.T, delay time.Duration) (string, func() int) {
 			case <-time.After(delay):
 			case <-r.Context().Done():
 				return
+			case <-release:
+				return
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"access_token":"at2","refresh_token":"rt2","expires_in":3600}`)
 	}))
+	// Cleanups run last-registered-first, so handlers are released before Close
+	// waits on them. r.Context() alone is not enough: a client that abandons a
+	// request does not reliably cancel the server side promptly, so a deliberately
+	// slow endpoint would otherwise stall teardown for its full delay.
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
 	return srv.URL, func() int {
 		mu.Lock()
 		defer mu.Unlock()
@@ -97,6 +106,9 @@ func newHarness(t *testing.T, nAccounts int, cfg RetryConfig, scripts ...testuti
 type harnessTweaks struct {
 	tokenEndpoint string
 	credExpiresIn time.Duration // 0 means an hour away, i.e. no refresh due
+	// refreshTimeout bounds the manager's own refresh. Kept short in tests so a
+	// deliberately slow token endpoint does not stall teardown.
+	refreshTimeout time.Duration
 }
 
 // newHarnessAgainst wires nAccounts at an arbitrary upstream URL. up may be nil
@@ -133,6 +145,7 @@ func newHarnessAgainst(t *testing.T, up *testutil.FakeUpstream, upstreamURL stri
 	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
 		Ramp:            account.Ramp{Enabled: false},
+		RefreshTimeout:  tw.refreshTimeout,
 		Persist:         func(string, provider.Credential) error { return nil },
 	})
 
@@ -337,6 +350,226 @@ func TestAttemptBoundsTotalWaitOnSlowCredentialRefreshes(t *testing.T) {
 	if elapsed > accounts*refreshDelay/2 {
 		t.Errorf("took %v with a %v budget and %v refreshes; the cost is scaling with the account count",
 			elapsed, budget, refreshDelay)
+	}
+}
+
+// LOAD-BEARING. A refresh must be BOUNDED by the budget, not merely charged to it
+// after the fact. Charging alone still let one slow token endpoint spend far more
+// than the whole allowance before the client heard anything — with the 60s client
+// timeout in buildHandler, up to a minute of dead air with no bytes sent, which is
+// exactly the failure class this proxy exists to remove.
+func TestAttemptBoundsTheWaitForACredentialRefresh(t *testing.T) {
+	const (
+		accounts     = 4
+		refreshDelay = 3 * time.Second        // far longer than the budget
+		budget       = 300 * time.Millisecond // what the client may be made to wait
+	)
+	tokenURL, tokenCalls := slowTokenEndpoint(t, refreshDelay)
+
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	h := newHarnessAgainst(t, up, up.URL(), accounts,
+		RetryConfig{Budget: budget, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second},
+		harnessTweaks{
+			tokenEndpoint: tokenURL,
+			credExpiresIn: time.Minute, // inside the refresh threshold: every account is due
+			// Deliberately far above both the budget and refreshDelay, so the ONLY
+			// thing that can bound this request is the caller's own cap. A short
+			// RefreshTimeout would bound it instead, and the test would then pass
+			// even with the caller cap removed.
+			refreshTimeout: 10 * time.Second,
+		})
+
+	res, elapsed := h.post()
+
+	// The assertion: bounded by the budget, not by the refresh. Before the fix
+	// this took a full refreshDelay; the ceiling sits well below that.
+	if elapsed > budget+700*time.Millisecond {
+		t.Fatalf("client waited %v with a %v budget against a %v refresh — the refresh "+
+			"is charged but not bounded", elapsed, budget, refreshDelay)
+	}
+	if res.StatusCode < 400 {
+		t.Errorf("status = %d, want a local error", res.StatusCode)
+	}
+	// Clock-independent half: the cost must not scale with the account count.
+	if got := tokenCalls(); got > 2 {
+		t.Errorf("refreshed %d times for %d accounts, want at most 2", got, accounts)
+	}
+	// Nothing was ever sent, so this must not be recorded as a success.
+	if got := h.last().Outcome; got != provider.OutcomeNoAccountReady {
+		t.Errorf("Outcome = %v, want no_account_ready", got)
+	}
+}
+
+// A refresh abandoned by its caller must still be running, so the next request
+// finds the finished credential rather than starting a second refresh. The
+// upstream rotates the refresh token on every exchange, so a duplicate refresh
+// strands one of them.
+func TestAttemptLeavesAnAbandonedRefreshRunningForTheNextRequest(t *testing.T) {
+	const refreshDelay = 250 * time.Millisecond
+	tokenURL, tokenCalls := slowTokenEndpoint(t, refreshDelay)
+
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	// One account, and a budget too small to see the refresh through.
+	h := newHarnessAgainst(t, up, up.URL(), 1,
+		RetryConfig{Budget: 60 * time.Millisecond, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second},
+		harnessTweaks{
+			tokenEndpoint:  tokenURL,
+			credExpiresIn:  time.Minute,
+			refreshTimeout: 5 * time.Second,
+		})
+
+	// First request gives up waiting on the refresh.
+	res, _ := h.post()
+	if res.StatusCode < 400 {
+		t.Errorf("first request: status = %d, want a local error", res.StatusCode)
+	}
+
+	// Give the abandoned refresh time to land, then confirm it did.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		acct, _ := h.mgr.Get("acct-0")
+		if acct.Credential.AccessToken == "at2" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the refresh died with the request that started it; " +
+				"the credential was never rotated")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := tokenCalls(); got != 1 {
+		t.Fatalf("token endpoint called %d times, want 1", got)
+	}
+
+	// A later request uses the completed credential and starts no second refresh.
+	res2, _ := h.post()
+	if res2.StatusCode != 200 {
+		t.Errorf("second request: status = %d, want 200", res2.StatusCode)
+	}
+	if got := tokenCalls(); got != 1 {
+		t.Errorf("token endpoint called %d times, want still 1 — the completed "+
+			"refresh was repeated instead of reused", got)
+	}
+	sent := up.Requests()
+	if len(sent) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(sent))
+	}
+	if got := sent[0].Header.Get("Authorization"); got != "Bearer at2" {
+		t.Errorf("Authorization = %q, want the credential the abandoned refresh produced", got)
+	}
+}
+
+// A non-budget failure out of Admit must reach the client as a 502. Returning
+// without writing lets net/http emit a clean, empty 200, which a client reads as
+// a successful but empty answer rather than an error worth retrying.
+//
+// Driven through a recorder rather than a live server: the trigger is the caller's
+// context expiring, and a real client would have disconnected before it could
+// observe the response.
+func TestAttemptWritesBadGatewayWhenAdmissionFailsLocally(t *testing.T) {
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	p := anthropic.New(http.DefaultClient)
+	p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	providers := map[string]provider.Provider{"anthropic": p}
+	mgr := account.New([]config.Account{{
+		ID: "acct-0", Provider: "anthropic", Label: "acct-0", Upstream: up.URL(),
+		Credential: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+		},
+	}}, providers, account.Options{
+		SwitchThreshold: 0.98,
+		Persist:         func(string, provider.Credential) error { return nil },
+	})
+
+	// Paused well past the test, so Admit waits rather than admitting. The budget
+	// is generous, so the wait ends in the caller's cancellation and not in
+	// ErrBudgetExhausted — the non-budget branch is the one under test.
+	mgr.PauseAccount("acct-0", 10*time.Second)
+
+	at := NewAttempter(mgr, providers, NewTransport(TransportOptions{}),
+		RetryConfig{Budget: 10 * time.Second, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second},
+		quietLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	rec := httptest.NewRecorder()
+	res := at.Do(ctx, rec, Request{
+		Method: "POST", Path: "/v1/messages", Header: http.Header{},
+		Body: []byte(`{"model":"claude-sonnet-5"}`), Model: "claude-sonnet-5",
+	})
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("wrote status %d, want 502; a local admission failure must not "+
+			"leave net/http to emit a clean empty 200", rec.Code)
+	}
+	if res.Status != http.StatusBadGateway {
+		t.Errorf("Result.Status = %d, want 502", res.Status)
+	}
+	if res.Outcome != provider.OutcomeServerError {
+		t.Errorf("Outcome = %v, want server_error", res.Outcome)
+	}
+	if body := rec.Body.String(); !strings.Contains(body, "proxy_error") {
+		t.Errorf("body = %q, want a proxy_error payload", body)
+	}
+	if n := len(up.Requests()); n != 0 {
+		t.Errorf("upstream saw %d requests; admission never succeeded", n)
+	}
+}
+
+// A request answered without a single upstream attempt must not report the zero
+// value of OutcomeKind, which reads as "ok" — a failure logged as a success, and
+// one stage 2 would persist into its outcome breakdown.
+func TestAttemptReportsNoAccountReadyRatherThanOK(t *testing.T) {
+	// Every account's refresh is rejected, so no send ever happens.
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":"invalid_grant"}`)
+	}))
+	defer tokenSrv.Close()
+
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	h := newHarnessAgainst(t, up, up.URL(), 2, defaultRetry(), harnessTweaks{
+		tokenEndpoint: tokenSrv.URL,
+		credExpiresIn: time.Minute, // refresh due, and it will fail
+	})
+
+	res, _ := h.post()
+
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", res.StatusCode)
+	}
+	got := h.last()
+	if got.Outcome != provider.OutcomeNoAccountReady {
+		t.Errorf("Outcome = %v (%d), want no_account_ready — a 429 with no attempt "+
+			"must not be recorded as ok", got.Outcome, got.Outcome)
+	}
+	if got.Attempts != 0 {
+		t.Errorf("Attempts = %d, want 0: no send happened", got.Attempts)
+	}
+	if n := len(up.Requests()); n != 0 {
+		t.Errorf("upstream saw %d requests, want 0", n)
+	}
+}
+
+// A genuine upstream classification must survive to the log line: the
+// no-account-ready default applies only when nothing classified the request.
+func TestAttemptKeepsTheUpstreamOutcomeWhenTheBudgetRunsOut(t *testing.T) {
+	cfg := RetryConfig{Budget: 700 * time.Millisecond, InlineAbsorbMax: 5 * time.Second, BodyIdle: 5 * time.Second}
+	h := newHarness(t, 3, cfg, testutil.Script{Status: 429}) // header-less, repeats
+
+	res, _ := h.post()
+	if res.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", res.StatusCode)
+	}
+	if got := h.last().Outcome; got != provider.OutcomeThrottledNoHint {
+		t.Errorf("Outcome = %v, want throttled_no_hint — the upstream's own verdict "+
+			"must not be overwritten by the no-account default", got)
 	}
 }
 
