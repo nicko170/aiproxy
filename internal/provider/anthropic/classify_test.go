@@ -47,8 +47,8 @@ func TestClassify(t *testing.T) {
 		res:      resp(429, map[string]string{"Retry-After": "soon"}),
 		wantKind: provider.OutcomeThrottledNoHint,
 	}, {
-		name: "negative retry-after is treated as no hint",
-		res:  resp(429, map[string]string{"Retry-After": "-5"}),
+		name:     "negative retry-after is treated as no hint",
+		res:      resp(429, map[string]string{"Retry-After": "-5"}),
 		wantKind: provider.OutcomeThrottledNoHint,
 	}, {
 		name: "5h rejected is quota rejection",
