@@ -97,6 +97,9 @@ func (stubProvider) Profile(context.Context, provider.Credential) (provider.Prof
 func (stubProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
 	return provider.Quota{}, provider.ErrUnsupported
 }
+func (stubProvider) Login(context.Context) (provider.LoginSession, error) {
+	return provider.LoginSession{}, provider.ErrUnsupported
+}
 func (stubProvider) Endpoint(provider.Account) *url.URL {
 	u, _ := url.Parse("https://upstream.invalid")
 	return u

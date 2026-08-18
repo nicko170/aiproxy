@@ -66,6 +66,10 @@ func (s *stubProvider) Refresh(ctx context.Context, c provider.Credential) (prov
 func (s *stubProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
 	return provider.Profile{}, provider.ErrUnsupported
 }
+func (s *stubProvider) Login(context.Context) (provider.LoginSession, error) {
+	return provider.LoginSession{}, provider.ErrUnsupported
+}
+
 func (s *stubProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
 	return provider.Quota{}, provider.ErrUnsupported
 }
