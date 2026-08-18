@@ -104,6 +104,16 @@ const (
 	// Appended here, after OutcomeAdmissionError: see the note above about why
 	// new kinds append rather than insert.
 	OutcomeClientDisconnected
+	// OutcomeBlocked is the proxy's own verdict when a request names a model on
+	// the configured blocklist: it is refused locally, before any account is
+	// selected and without contacting the upstream.
+	//
+	// It exists because that refusal used to be recorded as the zero value —
+	// "ok" — so a blocked request appeared in every outcome breakdown as a
+	// success. Spec §7.1 already names "blocked" in the outcome enum.
+	//
+	// Appended after OutcomeClientDisconnected; see the note above.
+	OutcomeBlocked
 )
 
 func (k OutcomeKind) String() string {
@@ -132,6 +142,8 @@ func (k OutcomeKind) String() string {
 		return "admission_error"
 	case OutcomeClientDisconnected:
 		return "client_disconnected"
+	case OutcomeBlocked:
+		return "blocked"
 	}
 	return "unknown"
 }

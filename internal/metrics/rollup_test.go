@@ -2,6 +2,8 @@ package metrics
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 )
@@ -138,4 +140,81 @@ WHERE granularity='minute' AND account_id='a' AND model='opus'`).Scan(&cost); er
 	if cost != 1500 {
 		t.Errorf("cost = %d, want 1500 — an unpriced row contributes nothing, it does not void the bucket", cost)
 	}
+}
+
+// The roller used to do nothing until its first tick, so a process that lived
+// less than one interval aggregated nothing at all.
+func TestRollerAggregatesBeforeItsFirstTick(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+
+	insertRaw(t, s, time.Now().Add(-time.Minute).UnixMilli(), "a", "opus", 42, 7, 0, 0, nil)
+
+	// An interval long enough that no tick can fire during this test: only the
+	// catch-up at Start can produce a bucket.
+	r := NewRoller(s, time.Hour, quietLogger())
+	r.Start()
+	r.Stop()
+
+	var reqs, in int64
+	err := s.DB().QueryRow(`
+SELECT sum(requests), sum(input_tokens) FROM usage_buckets WHERE granularity='minute'`).Scan(&reqs, &in)
+	if err != nil {
+		t.Fatalf("Start produced no rollup: %v", err)
+	}
+	if reqs != 1 || in != 42 {
+		t.Errorf("= %d reqs / %d in, want 1/42", reqs, in)
+	}
+}
+
+// A row older than the ticker's 2h lookback — written by a previous run — is
+// exactly the case the periodic rollup can never reach.
+func TestRollupCatchUpReachesRowsOlderThanTheTickerLookback(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-30 * 24 * time.Hour).UnixMilli()
+	insertRaw(t, s, old, "a", "opus", 5, 1, 0, 0, nil)
+
+	// The periodic path cannot see it.
+	if err := RollupOnce(context.Background(), s, now, 2*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	s.DB().QueryRow(`SELECT count(*) FROM usage_buckets`).Scan(&n)
+	if n != 0 {
+		t.Fatalf("precondition: the 2h lookback should not reach a 30-day-old row, got %d buckets", n)
+	}
+
+	if err := RollupCatchUp(context.Background(), s, now); err != nil {
+		t.Fatalf("RollupCatchUp: %v", err)
+	}
+	var reqs int64
+	if err := s.DB().QueryRow(`
+SELECT sum(requests) FROM usage_buckets WHERE granularity='minute'`).Scan(&reqs); err != nil {
+		t.Fatal(err)
+	}
+	if reqs != 1 {
+		t.Errorf("requests = %d, want 1", reqs)
+	}
+}
+
+// Catch-up over an empty store must not error or invent buckets.
+func TestRollupCatchUpOnAnEmptyStoreIsANoOp(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+
+	if err := RollupCatchUp(context.Background(), s, time.Now()); err != nil {
+		t.Fatalf("RollupCatchUp on an empty store: %v", err)
+	}
+	var n int
+	s.DB().QueryRow(`SELECT count(*) FROM usage_buckets`).Scan(&n)
+	if n != 0 {
+		t.Errorf("buckets = %d, want 0", n)
+	}
+}
+
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

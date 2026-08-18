@@ -138,6 +138,12 @@ ORDER BY 1, outcome`, span, span)
 }
 
 // Totals reads raw rows so it can also report how many were unpriced.
+//
+// EVERY aggregate is coalesced, including the unpriced count. sum() over zero
+// rows is NULL in SQLite, not 0, and scanning that into an int64 is an error —
+// so an uncoalesced column turns the most ordinary input there is (a fresh
+// install, an idle hour, a window scrubbed back to a quiet period) into a hard
+// failure of the whole call.
 func (s *Store) Totals(ctx context.Context, w Window) (Totals, error) {
 	var t Totals
 	err := s.db.QueryRowContext(ctx, `
@@ -145,7 +151,7 @@ SELECT count(*),
        coalesce(sum(input_tokens),0), coalesce(sum(output_tokens),0),
        coalesce(sum(cache_read_tokens),0), coalesce(sum(cache_write_tokens),0),
        coalesce(sum(cost_micros),0),
-       sum(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END)
+       coalesce(sum(CASE WHEN cost_micros IS NULL THEN 1 ELSE 0 END), 0)
 FROM requests
 WHERE started_at >= ? AND started_at < ?`, w.From, w.To).
 		Scan(&t.Requests, &t.InputTokens, &t.OutputTokens, &t.CacheReadTokens,

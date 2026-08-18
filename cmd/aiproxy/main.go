@@ -216,7 +216,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 				AccountID: res.AccountID, Provider: "anthropic",
 				Model: req.Model, SessionID: req.SessionID,
 				Endpoint: endpointOf(req.Path), Status: res.Status,
-				Outcome: res.Outcome.String(), Stream: res.Bytes > 0,
+				Outcome: res.Outcome.String(), Stream: res.Stream,
 				Attempts: res.Attempts, Rotated: res.Rotated,
 				InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,

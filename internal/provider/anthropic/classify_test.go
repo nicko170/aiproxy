@@ -260,3 +260,55 @@ func TestClassifyKeepsModelScopedWindow(t *testing.T) {
 		t.Errorf("Utilization = %v, want 1", out.Buckets[0].Utilization)
 	}
 }
+
+// isModelScoped decides whether a quota rejection holds the whole account or
+// only one model family. Getting it wrong in the "scoped" direction fails OPEN:
+// ScopedModel is set, the attempt loop skips MarkRateLimited, and a spent
+// account keeps being selected.
+func TestIsModelScopedOnlyRecognisesKnownModelScopes(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"5h", false},
+		{"7d", false},
+		{"7d_oi", true},
+		{"7d_opus", true},
+		{"7d_fable", true},
+		{"7d_sonnet", true},
+		{"7d_haiku", true},
+		// A future window that is merely qualified, not model-scoped. Shaped
+		// exactly like a scoped one, so only the known-suffix check separates
+		// them — and treating it as scoped would silently stop the account from
+		// ever being marked rate-limited.
+		{"24h_soft", false},
+		{"7d_hard", false},
+		{"5h_burst", false},
+		// Metadata that shares the header prefix and happens to contain "_".
+		{"overage_status", false},
+		{"representative_claim", false},
+		// A scope-shaped tail on something that is not a window at all.
+		{"_oi", false},
+		{"7d_", false},
+	}
+	for _, c := range cases {
+		if got := isModelScoped(c.name); got != c.want {
+			t.Errorf("isModelScoped(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// The end-to-end consequence: a rejected window whose suffix is not a known
+// model scope must be reported as a GENERAL rejection, so the caller holds the
+// account rather than treating it as one family's problem.
+func TestUnknownWindowSuffixIsAGeneralRejectionNotAModelScopedOne(t *testing.T) {
+	out := Classify(resp(429, map[string]string{
+		"anthropic-ratelimit-unified-24h_soft-status": "rejected",
+	}))
+	if out.Kind != provider.OutcomeQuotaRejected {
+		t.Fatalf("Kind = %v, want quota rejected", out.Kind)
+	}
+	if out.ScopedModel != "" {
+		t.Errorf("ScopedModel = %q, want empty — an unrecognised suffix must not make a general rejection model-scoped, which would skip MarkRateLimited", out.ScopedModel)
+	}
+}

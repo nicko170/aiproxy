@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"time"
@@ -32,15 +33,57 @@ func RollupOnce(ctx context.Context, s *Store, now time.Time, lookback time.Dura
 	if lookback <= 0 {
 		lookback = time.Hour
 	}
-	from := now.Add(-lookback).UnixMilli()
-	to := now.UnixMilli()
+	return rollupRange(ctx, s, now.Add(-lookback).UnixMilli(), now.UnixMilli())
+}
 
+// rollupRange recomputes every grain over an explicit [from, to) range. Split
+// out of RollupOnce so the catch-up and pre-prune paths can name a range
+// directly instead of expressing it as a lookback from "now".
+func rollupRange(ctx context.Context, s *Store, from, to int64) error {
 	for _, g := range []Granularity{GranularityMinute, GranularityHour} {
 		if err := rollupGrain(ctx, s, g, from, to); err != nil {
 			return fmt.Errorf("rollup %s: %w", g, err)
 		}
 	}
 	return nil
+}
+
+// RollupCatchUp aggregates every raw row the periodic rollup can no longer
+// reach, and is run once at Start before the first tick.
+//
+// The ticker only ever looks back 2h from now, so rows written by a previous
+// run — or by a run shorter than one tick — fall outside every subsequent
+// lookback and are never aggregated. UsageSeries (rollups) and Totals (raw)
+// then disagree permanently and silently, which is spec invariant 4 ("one
+// number, one source") not holding.
+//
+// The range is bounded by work actually outstanding rather than by a fixed
+// window: it starts at the newest minute bucket already rolled up (recomputed
+// in full, since a bucket may have been partial when it was written) or, if
+// nothing has ever been rolled up, at the oldest raw row. An empty requests
+// table is a no-op.
+func RollupCatchUp(ctx context.Context, s *Store, now time.Time) error {
+	var oldest sql.NullInt64
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT min(started_at) FROM requests`).Scan(&oldest); err != nil {
+		return fmt.Errorf("rollup catch-up: oldest raw row: %w", err)
+	}
+	if !oldest.Valid {
+		return nil
+	}
+
+	var latest sql.NullInt64
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT max(bucket_start) FROM usage_buckets WHERE granularity = ?`,
+		string(GranularityMinute)).Scan(&latest); err != nil {
+		return fmt.Errorf("rollup catch-up: newest bucket: %w", err)
+	}
+
+	from := oldest.Int64
+	if latest.Valid && latest.Int64 > from {
+		from = latest.Int64
+	}
+	return rollupRange(ctx, s, from, now.UnixMilli())
 }
 
 func rollupGrain(ctx context.Context, s *Store, g Granularity, from, to int64) error {
@@ -109,6 +152,12 @@ func NewRoller(s *Store, interval time.Duration, log *slog.Logger) *Roller {
 func (r *Roller) Start() {
 	go func() {
 		defer close(r.stopped)
+		// Catch up BEFORE the first tick. A process that lives less than one
+		// interval would otherwise aggregate nothing at all, and rows left behind
+		// by an earlier run sit outside every future 2h lookback forever.
+		if err := RollupCatchUp(context.Background(), r.store, time.Now()); err != nil {
+			r.log.Warn("initial rollup failed", "err", err)
+		}
 		t := time.NewTicker(r.interval)
 		defer t.Stop()
 		for {

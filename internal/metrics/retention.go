@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
 	"time"
@@ -15,15 +16,32 @@ import (
 // that was never the problem. Raw rows exist for drill-down, which has a much
 // shorter useful life.
 //
-// Ordering matters operationally: rollups run every minute and retention runs
-// daily, so by the time a row is old enough to prune it has long since been
-// aggregated. A retention window shorter than the rollup interval would lose
-// data, which is why retain is measured in days.
+// Ordering is enforced here, not assumed. Retention used to rely on the timing
+// argument alone — rollups run every minute, retention daily, so anything old
+// enough to prune must already be aggregated — but the roller only ever looks
+// back 2h from now, so a row written in a window no later run covers is never
+// aggregated and then gets deleted. Rolling the cutoff window up immediately
+// before deleting makes that unreachable regardless of how the two timers
+// interleave or how often the process restarts.
 func PruneOnce(ctx context.Context, s *Store, now time.Time, retain time.Duration) (int64, error) {
 	if retain <= 0 {
 		return 0, nil // retention disabled: keep everything
 	}
 	cutoff := now.Add(-retain).UnixMilli()
+
+	// Aggregate everything about to be deleted first. The bucket straddling the
+	// cutoff is recomputed in full while both sides of it still exist, so it
+	// records the true historical total rather than only the surviving rows.
+	var oldest sql.NullInt64
+	if err := s.DB().QueryRowContext(ctx,
+		`SELECT min(started_at) FROM requests WHERE started_at < ?`, cutoff).Scan(&oldest); err != nil {
+		return 0, fmt.Errorf("prune: oldest expiring row: %w", err)
+	}
+	if oldest.Valid {
+		if err := rollupRange(ctx, s, oldest.Int64, cutoff); err != nil {
+			return 0, fmt.Errorf("prune: rollup before delete: %w", err)
+		}
+	}
 
 	res, err := s.DB().ExecContext(ctx, `DELETE FROM requests WHERE started_at < ?`, cutoff)
 	if err != nil {

@@ -144,9 +144,17 @@ func bucketValue(b *usageBucketJSON) (float64, bool) {
 	if b == nil {
 		return 0, false
 	}
+	// Divided by 100 because the endpoint reports a PERCENTAGE, not a 0..1
+	// fraction. Verified against the live endpoint rather than inferred from the
+	// field names: a real response carried
+	//   five_hour: {"utilization":3,...}   seven_day: {"utilization":8,...}
+	// for an account nowhere near its cap, which is 3% and 8% — a 0..1 fraction
+	// would have meant 300% and 800%. Review flagged this as a possible
+	// double-scaling bug; it is not. Do not "fix" it without re-checking the
+	// live shape first.
 	for _, p := range []*float64{b.Utilization, b.UsedPercentage, b.Percent} {
 		if p != nil {
-			return *p / 100, true // reported as a percentage
+			return *p / 100, true
 		}
 	}
 	return 0, false

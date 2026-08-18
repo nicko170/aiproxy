@@ -174,8 +174,10 @@ cancelling the attempt's context — it does not rely on the transport's own
 wedged connection, so it can never fire before the attempt loop's own timer and
 never substitute a generic transport error for the honest one below. 60 s is
 generous enough for a slow first token and still finite. An attempt abandoned
-here is a *failed attempt*: it rotates, and it is recorded as `server_error`,
+here is a *failed attempt*: it rotates, and it is recorded as `upstream_error`,
 never as `no_account_ready` — an account was selected, admitted, and sent to.
+(§7.4 split the transport-level failures out of `server_error`, which now means
+only a genuine upstream 5xx that was actually received.)
 
 Together they give a worst case that is chosen rather than accidental:
 
@@ -670,7 +672,7 @@ Four tests are load-bearing and are written before the code they cover:
 3. **The header timeout bounds one attempt.** Fake upstream withholds headers
    indefinitely under a short `retry.headerTimeoutMs` and a long `retry.budgetMs`.
    Assert the attempt is abandoned on the header timeout, well inside the budget,
-   and that the outcome is `server_error` rather than `no_account_ready`.
+   and that the outcome is `upstream_error` rather than `no_account_ready`.
 4. **Streaming fidelity.** Fake upstream emits SSE chunks 100 ms apart. Assert
    the client observes them incrementally, with arrival times tracking the
    upstream's, proving no whole-response buffering.

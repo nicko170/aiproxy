@@ -113,11 +113,27 @@ func rejectedBucket(buckets []provider.QuotaBucket) (string, bool) {
 	return "", false
 }
 
-// A bucket name is model-scoped when it carries a suffix beyond the window,
-// e.g. "7d_oi" for the per-model weekly cap versus plain "7d".
-func isModelScoped(name string) bool {
-	return strings.Contains(name, "_")
-}
+// modelScope matches a window name carrying a KNOWN model scope, e.g. "7d_oi"
+// for the per-model weekly cap versus plain "7d".
+//
+// Recognised by shape plus a known suffix, not by "contains an underscore",
+// because the two ways of being wrong here are not symmetric:
+//
+//   - Calling a scoped bucket general holds the whole account when only one
+//     model family is spent. That costs availability, and it is recoverable.
+//   - Calling a GENERAL bucket scoped sets ScopedModel, which makes the attempt
+//     loop skip MarkRateLimited entirely — a spent account stays selectable and
+//     keeps being sent to. That fails OPEN, which is exactly the direction the
+//     overage fix and modelBucketName's own note exist to rule out.
+//
+// A future unscoped window is shaped identically to a scoped one ("24h_soft"
+// versus "7d_oi"), so shape alone cannot separate them and anything
+// unrecognised must land on the safe side. The cost is that a genuinely new
+// model scope binds the whole account until this list learns about it — the
+// conservative failure, taken deliberately.
+var modelScope = regexp.MustCompile(`^[0-9]+[a-z]+_(oi|opus|sonnet|haiku|fable)$`)
+
+func isModelScoped(name string) bool { return modelScope.MatchString(name) }
 
 // parseBuckets collects anthropic-ratelimit-unified-<window>-<field> headers
 // into one QuotaBucket per <window>.

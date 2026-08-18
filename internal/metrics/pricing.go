@@ -20,16 +20,28 @@ type TokenCounts struct {
 
 // prices is a small embedded table keyed by a model-family prefix, so a dated
 // variant (claude-sonnet-4-5-20250929) matches its family without needing an
-// entry per release. Verify these against current published pricing before
-// relying on the figures; they are an estimate, and the schema records NULL
-// rather than a guess when a model is absent.
+// entry per release.
+//
+// The input and output columns are ABSOLUTE published rates and are pinned by
+// TestPricesMatchPublishedRates — one assertion per family — because arithmetic
+// that is provably correct over a wrong rate card still bills the wrong number,
+// and a believable-looking 2x or 3x error in this table is invisible to every
+// other test in the package. Update the test in the same commit as the table.
+//
+// The cache columns are DERIVED from the input rate at Anthropic's published
+// relationships: cache read = 0.1x input, cache write = 1.25x input.
+//
+// Sonnet 5 currently carries introductory pricing ($2/$10 per MTok) through
+// 2026-08-31, after which it reverts to the standard $3/$15 recorded here.
+// Revisit this row on that date: until then the table overstates Sonnet 5, which
+// is the safe direction to be wrong, but it is still wrong.
 var prices = map[string]Price{
-	"claude-opus-5":    {InputPerMTok: 15, OutputPerMTok: 75, CacheReadPerMTok: 1.50, CacheWritePerMTok: 18.75},
-	"claude-opus-4":    {InputPerMTok: 15, OutputPerMTok: 75, CacheReadPerMTok: 1.50, CacheWritePerMTok: 18.75},
+	"claude-opus-5":    {InputPerMTok: 5, OutputPerMTok: 25, CacheReadPerMTok: 0.50, CacheWritePerMTok: 6.25},
+	"claude-opus-4":    {InputPerMTok: 5, OutputPerMTok: 25, CacheReadPerMTok: 0.50, CacheWritePerMTok: 6.25},
 	"claude-sonnet-5":  {InputPerMTok: 3, OutputPerMTok: 15, CacheReadPerMTok: 0.30, CacheWritePerMTok: 3.75},
 	"claude-sonnet-4":  {InputPerMTok: 3, OutputPerMTok: 15, CacheReadPerMTok: 0.30, CacheWritePerMTok: 3.75},
 	"claude-haiku-4-5": {InputPerMTok: 1, OutputPerMTok: 5, CacheReadPerMTok: 0.10, CacheWritePerMTok: 1.25},
-	"claude-fable-5":   {InputPerMTok: 5, OutputPerMTok: 25, CacheReadPerMTok: 0.50, CacheWritePerMTok: 6.25},
+	"claude-fable-5":   {InputPerMTok: 10, OutputPerMTok: 50, CacheReadPerMTok: 1.00, CacheWritePerMTok: 12.50},
 }
 
 // PriceFor resolves a model name to a rate card, matching the longest known

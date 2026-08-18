@@ -181,3 +181,77 @@ func TestAccountQuotaHistory(t *testing.T) {
 		t.Errorf("latest utilization = %v, want 0.35", got[1].Utilization)
 	}
 }
+
+// Every other query test seeds rows first, which is how a NULL-over-zero-rows
+// scan error survived to review. A fresh install, an idle hour and any filtered
+// window with no matches are all this shape, and stage 3's view.Source is built
+// on Totals.
+func TestQueriesOverAnEmptyWindowReturnZeroNotAnError(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+	// Deliberately no rows at all: not "no rows in the window", none anywhere.
+	w := Window{From: 1_700_000_000_000, To: 1_700_000_060_000}
+	ctx := context.Background()
+
+	t.Run("Totals", func(t *testing.T) {
+		got, err := s.Totals(ctx, w)
+		if err != nil {
+			t.Fatalf("Totals over an empty window: %v", err)
+		}
+		if got != (Totals{}) {
+			t.Errorf("totals = %+v, want the zero value", got)
+		}
+	})
+
+	t.Run("UsageSeries", func(t *testing.T) {
+		for _, by := range []GroupBy{GroupByAccount, GroupByModel, GroupByOutcome} {
+			got, err := s.UsageSeries(ctx, SeriesQuery{
+				Window: w, Granularity: GranularityMinute, GroupBy: by,
+			})
+			if err != nil {
+				t.Fatalf("UsageSeries by %s over an empty window: %v", by, err)
+			}
+			if len(got.Points) != 0 {
+				t.Errorf("by %s: got %d points, want 0", by, len(got.Points))
+			}
+		}
+	})
+
+	t.Run("LatencyPercentiles", func(t *testing.T) {
+		got, err := s.LatencyPercentiles(ctx, w)
+		if err != nil {
+			t.Fatalf("LatencyPercentiles over an empty window: %v", err)
+		}
+		if got != (Latency{}) {
+			t.Errorf("latency = %+v, want the zero value", got)
+		}
+	})
+
+	t.Run("AccountQuotaHistory", func(t *testing.T) {
+		got, err := s.AccountQuotaHistory(ctx, "acct-a", w)
+		if err != nil {
+			t.Fatalf("AccountQuotaHistory over an empty window: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("got %d points, want 0", len(got))
+		}
+	})
+}
+
+// The same query over a store that HAS data, just none inside the window: the
+// other half of the shape, and the one an operator hits every time they scrub
+// a chart back to a quiet hour.
+func TestTotalsOverAWindowWithNoMatchingRowsReturnsZero(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC).UnixMilli()
+	seedForQueries(t, s, base)
+
+	got, err := s.Totals(context.Background(), Window{From: base + 3_600_000, To: base + 7_200_000})
+	if err != nil {
+		t.Fatalf("Totals over a window with no matching rows: %v", err)
+	}
+	if got != (Totals{}) {
+		t.Errorf("totals = %+v, want the zero value", got)
+	}
+}

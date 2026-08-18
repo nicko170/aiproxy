@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
+	"github.com/nicko170/aiproxy/internal/provider"
 )
 
 // ReservedPrefix is the control-plane namespace. Nothing under it is ever
@@ -160,7 +162,20 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 				writeError(w, http.StatusBadRequest, "invalid_request_error",
 					"Model \""+req.Model+"\" is blocked by aiproxy (matched \""+pattern+"\").")
 				if o.OnResult != nil {
-					o.OnResult(req, Result{Status: http.StatusBadRequest, TTFBMS: 0})
+					// StartedAt must be stamped, TTFBMS must be -1, and the outcome
+					// must say "blocked". Left at their zero values this row landed
+					// at started_at=0: invisible to every window query, aggregated
+					// into bucket 0, deleted by the first prune, and contributing a
+					// spurious 0 ms to the TTFB percentile that spec §2.1 exists to
+					// make observable — while reporting a refusal as "ok".
+					// -1 is the package's established "no first byte was produced"
+					// sentinel, which the percentile queries already exclude.
+					o.OnResult(req, Result{
+						Status:    http.StatusBadRequest,
+						Outcome:   provider.OutcomeBlocked,
+						StartedAt: time.Now().UnixMilli(),
+						TTFBMS:    -1,
+					})
 				}
 				return
 			}

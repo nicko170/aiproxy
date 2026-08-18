@@ -125,6 +125,12 @@ type Result struct {
 	WaitMS     int64
 	TTFBMS     int64
 	Bytes      int64
+	// Stream reports whether the upstream answered with an event stream, taken
+	// from the response Content-Type in relay below. It is NOT "did a body
+	// arrive": deriving it from Bytes > 0 made the persisted stream column a
+	// duplicate of bytes > 0 and marked every non-streaming JSON response as
+	// streamed.
+	Stream bool
 
 	InputTokens      int64
 	OutputTokens     int64
@@ -579,6 +585,9 @@ func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRe
 
 	acc := NewUsageAccumulator()
 	streaming := strings.Contains(upstreamRes.Header.Get("Content-Type"), "text/event-stream")
+	// Carried onto the result so accounting records what the upstream actually
+	// did, rather than re-deriving it from the byte count downstream.
+	res.Stream = streaming
 	n, err := Relay(ctx, w, upstreamRes.Body, RelayOptions{
 		BodyIdle:   a.cfg.BodyIdle,
 		Streaming:  streaming,
