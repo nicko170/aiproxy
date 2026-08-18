@@ -1,10 +1,13 @@
 package prober
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -389,6 +392,33 @@ func TestStartTicksAtTheConfiguredIntervalAndStopEndsIt(t *testing.T) {
 // Stop immediately after Start, before any tick or ProbeNow ever ran, must
 // not hang — the disabled-interval loop and the ticking loop both have to
 // observe the stop signal on every path, not only mid-tick.
+// The prober is the one place a probe failure is logged at all (Status()
+// alone is invisible to a headless instance with no UI polling it), and a
+// log line is exactly the kind of place a credential leaks by accident. This
+// asserts the account's access token never appears in anything the prober
+// logs, even on a throttled/failing account.
+func TestProbeNowNeverLogsCredentialMaterial(t *testing.T) {
+	const secretToken = "sk-ant-super-secret-probe-token"
+	fp := &fakeProvider{results: []quotaResult{quotaThrottled()}}
+	acct := oauthAcct("a")
+	acct.Credential.AccessToken = secretToken
+	mgr := newMgr(t, fp, acct)
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour, WithLogger(log))
+
+	if err := p.ProbeNow(context.Background()); err == nil {
+		t.Fatal("want the throttled error surfaced")
+	}
+	if strings.Contains(buf.String(), secretToken) {
+		t.Errorf("prober logged credential material: %s", buf.String())
+	}
+	if buf.Len() == 0 {
+		t.Error("want the throttled probe to have logged something (a headless instance has no other visibility into it)")
+	}
+}
+
 func TestStopImmediatelyAfterStartDoesNotHang(t *testing.T) {
 	fp := &fakeProvider{}
 	mgr := newMgr(t, fp)

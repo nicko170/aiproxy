@@ -246,6 +246,14 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 				continue
 			}
 			p.recordError(a.ID, err, now)
+			// Logged in addition to being recorded in Status(): a headless
+			// instance (spec §1: runs `--headless` with logging to stderr) has
+			// no UI polling Status at all, so this is the only place a
+			// throttled or failing probe is visible for it. err is always
+			// either provider.ErrQuotaThrottled or a transport failure, never
+			// anything containing credential material (see anthropic's Quota
+			// and this package's doc comment on that guarantee).
+			p.log.Warn("quota probe failed", "account", a.Label, "id", a.ID, "err", err)
 			errs = append(errs, fmt.Errorf("probe account %s: %w", a.ID, err))
 			continue
 		}
