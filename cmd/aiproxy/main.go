@@ -406,6 +406,8 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			InlineAbsorbMax: time.Duration(cfg.Retry.InlineAbsorbMaxMS) * time.Millisecond,
 			BodyIdle:        time.Duration(cfg.Retry.BodyIdleMS) * time.Millisecond,
 			HeaderTimeout:   headerTimeout,
+			OverloadedBudget: time.Duration(cfg.Retry.OverloadedBudgetMS) *
+				time.Millisecond,
 		}, log)
 
 	pf, err := buildPrivacy(cfg, log)

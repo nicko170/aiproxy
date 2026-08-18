@@ -45,6 +45,11 @@ func isWindowName(name string) bool { return windowName.MatchString(name) }
 // ThrottledNoHint rather than acquiring a default duration: a fabricated wait,
 // absorbed inline across several accounts, is what turns a sub-second upstream
 // rejection into a multi-minute silent hold.
+// statusOverloaded is Anthropic's 529 overloaded_error: the API itself is out
+// of capacity. It is not registered with IANA and net/http has no constant for
+// it, so it is named here rather than left as a bare literal in the switch.
+const statusOverloaded = 529
+
 func Classify(r *http.Response) provider.Outcome {
 	out := provider.Outcome{Buckets: parseBuckets(r.Header)}
 
@@ -69,6 +74,14 @@ func Classify(r *http.Response) provider.Outcome {
 		out.Kind = provider.OutcomeCredentialStale
 	case r.StatusCode == http.StatusForbidden:
 		out.Kind = provider.OutcomeCredentialRefused
+	case r.StatusCode == statusOverloaded:
+		// Checked before the generic 5xx arm below, which would otherwise
+		// swallow it: 529 is the one 5xx that says retrying the SAME account
+		// after a wait is the correct response.
+		out.Kind = provider.OutcomeOverloaded
+		if d, ok := retryAfter(r.Header); ok {
+			out.RetryAfter = d
+		}
 	case r.StatusCode >= 500:
 		out.Kind = provider.OutcomeServerError
 	case r.StatusCode >= 400:

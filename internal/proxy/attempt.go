@@ -50,6 +50,20 @@ var noHintBackoff = []time.Duration{
 	minRetryWait, 500 * time.Millisecond, time.Second,
 }
 
+// overloadedBackoff is the schedule for a 529 that carried no Retry-After. It
+// climbs where noHintBackoff stays short, because the two are answers to
+// different questions. A headerless 429 is a claim upstream never made, so
+// guessing hard at a duration is unwarranted and rotating is cheap. A 529 is an
+// explicit statement that upstream has no capacity, which rotating cannot fix
+// and which typically clears in seconds — so waiting longer is the useful
+// response rather than a guess.
+//
+// The last entry repeats for as long as the overload budget allows, so the
+// schedule bounds the wait BETWEEN attempts and the budget bounds the total.
+var overloadedBackoff = []time.Duration{
+	time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second,
+}
+
 // maxSendsPerAccount bounds how many times one account may be sent to within a
 // single request. Two is the initial try plus one absorbed retry; a forced
 // refresh after a 401 earns one extra, which is itself bounded by the reauthed
@@ -91,6 +105,27 @@ const defaultQuotaHold = 5 * time.Minute
 // paths we control is the budget's job.
 const defaultHeaderTimeout = 60 * time.Second
 
+// defaultOverloadedBudget bounds the total wait spent absorbing 529s for one
+// request. It is a third clock alongside the budget and the header timeout, and
+// it is separate from the budget rather than folded into it because the two
+// bound different risks.
+//
+// The budget protects the paths that RECOVER a request: rotating to another
+// account, refreshing a credential, absorbing a hinted throttle. Every one of
+// those competes with the others, which is exactly why they share an allowance.
+// Waiting out an overload competes with none of them — there is nothing else to
+// try, because every account faces the same exhausted upstream. Charging it to
+// the same allowance would mean a single 529 wait consuming the budget that a
+// subsequent 401 or 429 needs to rotate, turning a transient overload into a
+// failed request for an unrelated reason.
+//
+// 30s is chosen to outlast a typical overload while staying inside the client
+// timeouts a coding agent is likely to impose. It extends the pre-first-byte
+// worst case, which is stated rather than left to be discovered:
+//
+//	pre-first-byte <= budgetMs + overloadedBudgetMs + (attempts x headerTimeoutMs)
+const defaultOverloadedBudget = 30 * time.Second
+
 type RetryConfig struct {
 	Budget          time.Duration
 	InlineAbsorbMax time.Duration
@@ -98,6 +133,10 @@ type RetryConfig struct {
 	// HeaderTimeout bounds one attempt's wait for response headers. It does NOT
 	// draw down the budget; see defaultHeaderTimeout.
 	HeaderTimeout time.Duration
+	// OverloadedBudget bounds the total time spent waiting out upstream
+	// overloads (529) for one request. It is a THIRD clock, separate from
+	// Budget on purpose; see defaultOverloadedBudget.
+	OverloadedBudget time.Duration
 }
 
 // Request is a client request ready to be attempted, body already buffered so it
@@ -178,6 +217,9 @@ func NewAttempter(m *account.Manager, providers map[string]provider.Provider, rt
 	if cfg.HeaderTimeout <= 0 {
 		cfg.HeaderTimeout = defaultHeaderTimeout
 	}
+	if cfg.OverloadedBudget <= 0 {
+		cfg.OverloadedBudget = defaultOverloadedBudget
+	}
 	return &Attempter{mgr: m, providers: providers, rt: rt, cfg: cfg, log: log}
 }
 
@@ -194,13 +236,21 @@ func NewAttempter(m *account.Manager, providers map[string]provider.Provider, rt
 // no matter how much dead air the request actually spent.
 func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) (res Result) {
 	budget := NewBudget(a.cfg.Budget)
+	// overload is the second allowance, spent only on 529s. Kept apart from
+	// budget so waiting out an upstream capacity problem cannot starve the
+	// rotation and refresh paths; see defaultOverloadedBudget.
+	overload := NewBudget(a.cfg.OverloadedBudget)
 	res = Result{TTFBMS: -1}
 
 	exclude := map[string]bool{}
 	refused := map[string]bool{}
 	reauthed := map[string]bool{}
 	sends := map[string]int{}
+	// overloadRetries counts 529 retries per account, which is what buys those
+	// retries an exemption from maxSendsPerAccount below.
+	overloadRetries := map[string]int{}
 	noHintWaits := 0
+	overloadWaits := 0
 	started := time.Now()
 	res.StartedAt = started.UnixMilli()
 	// lastSent is the account the previous attempt in THIS request went to, which
@@ -208,7 +258,8 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 	lastSent := ""
 
 	defer func() {
-		res.WaitMS = a.cfg.Budget.Milliseconds() - budget.Remaining().Milliseconds()
+		res.WaitMS = (a.cfg.Budget.Milliseconds() - budget.Remaining().Milliseconds()) +
+			(a.cfg.OverloadedBudget.Milliseconds() - overload.Remaining().Milliseconds())
 		res.DurationMS = time.Since(started).Milliseconds()
 		// Invoked from THIS defer, not by the caller after Do returns: a defer
 		// runs during panic unwinding, before the panic continues up the stack,
@@ -263,6 +314,13 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 		if reauthed[acct.ID] {
 			allowance++
 		}
+		// Each absorbed 529 earns one more send on this account. The cap exists to
+		// stop a spin, and an overload retry is not one: it is paced by
+		// overloadedBackoff and bounded in total by the overload budget, so the
+		// thing the cap protects against is already ruled out. Without this,
+		// maxSendsPerAccount would rotate after a single retry onto accounts
+		// facing the identical exhausted upstream.
+		allowance += overloadRetries[acct.ID]
 		if sends[acct.ID] >= allowance {
 			a.log.Info("account exhausted its attempts for this request, rotating",
 				"account", acct.Label, "sends", sends[acct.ID])
@@ -425,6 +483,41 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			}
 			exclude[acct.ID] = true
 			res.Rotated = true
+			continue
+
+		case provider.OutcomeOverloaded:
+			// Upstream has no capacity. Rotating cannot help — every account
+			// reaches the same exhausted upstream — so this waits in place and
+			// keeps the account's warm cache. Nothing is held, paused, or
+			// excluded: the account did nothing wrong.
+			//
+			// A zero or absent Retry-After both take the schedule. On the 429
+			// path the two are distinguished, because there a zero hint is a
+			// real statement worth honouring promptly. Here they are not, and
+			// deliberately so: retrying an out-of-capacity API immediately is
+			// what turns an overload into a stampede, so the one case where
+			// upstream asks for exactly that is the case to ignore.
+			wait := outcome.RetryAfter
+			if wait <= 0 {
+				wait = overloadedBackoff[min(overloadWaits, len(overloadedBackoff)-1)]
+			}
+			wait = max(wait, minRetryWait)
+			if wait > overload.Remaining() {
+				// No room to wait it out. Falling out of the switch relays
+				// upstream's own 529 and body, which is more use to the client
+				// than a proxy-invented error: the agent already knows what a
+				// 529 means and retries on its own.
+				break
+			}
+			drainWithin(overload, upstreamRes)
+			overloadWaits++
+			overloadRetries[acct.ID]++
+			a.log.Info("upstream overloaded, waiting on the same account",
+				"account", acct.Label, "wait", wait, "attempt", overloadWaits)
+			if err := overload.Wait(ctx, wait); err != nil {
+				a.writeExhausted(w, &res, "upstream overloaded")
+				return res
+			}
 			continue
 
 		case provider.OutcomeCredentialRefused:

@@ -92,6 +92,18 @@ func TestClassify(t *testing.T) {
 		name:     "503 is a server error",
 		res:      resp(503, nil),
 		wantKind: provider.OutcomeServerError,
+	}, {
+		// 529 is Anthropic's own overload signal, not a generic 5xx: it is
+		// transient by definition and worth waiting out, where a 500 or 503
+		// says nothing about whether retrying helps.
+		name:     "529 is overloaded, not a generic server error",
+		res:      resp(529, nil),
+		wantKind: provider.OutcomeOverloaded,
+	}, {
+		name:      "529 with retry-after carries the hint",
+		res:       resp(529, map[string]string{"Retry-After": "3"}),
+		wantKind:  provider.OutcomeOverloaded,
+		wantRetry: 3 * time.Second,
 	}}
 
 	for _, tc := range cases {
