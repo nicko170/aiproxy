@@ -55,9 +55,10 @@ type addedToken struct {
 
 // tokenizerFile is the subset of tokenizer.json this needs.
 type tokenizerFile struct {
-	Normalizer   json.RawMessage `json:"normalizer"`
-	PreTokenizer json.RawMessage `json:"pre_tokenizer"`
-	AddedTokens  []struct {
+	Normalizer    json.RawMessage `json:"normalizer"`
+	PreTokenizer  json.RawMessage `json:"pre_tokenizer"`
+	PostProcessor json.RawMessage `json:"post_processor"`
+	AddedTokens   []struct {
 		ID         int    `json:"id"`
 		Content    string `json:"content"`
 		SingleWord bool   `json:"single_word"`
@@ -89,8 +90,8 @@ func Load(path string) (*Tokenizer, error) {
 	// longer be positions in the caller's own string. Refusing is the only safe
 	// answer: the whole point of this package is that a span means exactly what
 	// it says.
-	if s := strings.TrimSpace(string(f.Normalizer)); s != "" && s != "null" {
-		return nil, fmt.Errorf("tokenizer: file has a normalizer, which would invalidate byte offsets: %s", trimForError(s))
+	if !isNullJSON(f.Normalizer) {
+		return nil, fmt.Errorf("tokenizer: file has a normalizer, which rewrites the input and would invalidate byte offsets: %s", trimForError(string(f.Normalizer)))
 	}
 
 	t := &Tokenizer{vocab: f.Model.Vocab, ranks: make(map[[2]string]int, len(f.Model.Merges))}
@@ -138,7 +139,10 @@ func Load(path string) (*Tokenizer, error) {
 		t.added = append(t.added, addedToken{id: a.ID, content: a.Content})
 	}
 
-	pattern, err := splitPattern(f.PreTokenizer)
+	if err := checkPostProcessor(f.PostProcessor); err != nil {
+		return nil, err
+	}
+	pattern, err := parsePreTokenizer(f.PreTokenizer)
 	if err != nil {
 		return nil, err
 	}
@@ -152,70 +156,156 @@ func Load(path string) (*Tokenizer, error) {
 	return t, nil
 }
 
-// splitPattern extracts the pretokenizer's regex. Sequence pretokenizers are
-// walked for the first Split stage, which is where the pattern lives in every
-// o200k-family file; anything else is an error rather than a guess.
+// preTokNode is one pre_tokenizer stage, with every field this implementation's
+// correctness depends on. Bool fields are pointers so an absent field is
+// distinguishable from an explicit false.
+type preTokNode struct {
+	Type    string `json:"type"`
+	Pattern struct {
+		Regex string
+	} `json:"pattern"`
+	Behavior       string            `json:"behavior"`
+	Invert         *bool             `json:"invert"`
+	AddPrefixSpace *bool             `json:"add_prefix_space"`
+	UseRegex       *bool             `json:"use_regex"`
+	PreTokenizers  []json.RawMessage `json:"pretokenizers"`
+}
+
+// parsePreTokenizer extracts the Split stage's regex and asserts every other
+// setting that the offset arithmetic depends on.
 //
-// A ByteLevel stage is checked rather than skipped: add_prefix_space inserts a
-// space that is not in the caller's string, which would shift every offset by
-// one byte.
-func splitPattern(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 || strings.TrimSpace(string(raw)) == "null" {
+// The assertions are the point. This package was verified byte-for-byte against
+// one specific tokenizer.json, and a later model file could change any of these
+// fields and still load: the ids and offsets would simply be quietly wrong,
+// which is the exact failure the gate exists to prevent and the exact failure no
+// fixture can catch, because it is a property of a file that does not exist yet.
+// So anything not verified is refused by name, loudly, at load time.
+func parsePreTokenizer(raw json.RawMessage) (string, error) {
+	if isNullJSON(raw) {
 		return "", fmt.Errorf("tokenizer: no pre_tokenizer in the file")
 	}
-	var node struct {
-		Type    string `json:"type"`
-		Pattern struct {
-			Regex string
-		} `json:"pattern"`
-		PreTokenizers []json.RawMessage `json:"pretokenizers"`
-	}
+	var node preTokNode
 	if err := json.Unmarshal(raw, &node); err != nil {
 		return "", fmt.Errorf("tokenizer: parse pre_tokenizer: %w", err)
 	}
 	switch node.Type {
 	case "Split":
-		if node.Pattern.Regex == "" {
-			return "", fmt.Errorf("tokenizer: Split pretokenizer has no regex")
-		}
-		return node.Pattern.Regex, nil
+		return splitPattern(node)
 	case "Sequence":
-		var found string
-		for _, sub := range node.PreTokenizers {
-			if err := checkByteLevel(sub); err != nil {
-				return "", err
+		var pattern string
+		for i, rawSub := range node.PreTokenizers {
+			var sub preTokNode
+			if err := json.Unmarshal(rawSub, &sub); err != nil {
+				return "", fmt.Errorf("tokenizer: parse pre_tokenizer stage %d: %w", i, err)
 			}
-			if found != "" {
-				continue
-			}
-			if p, err := splitPattern(sub); err == nil {
-				found = p
+			switch sub.Type {
+			case "Split":
+				if pattern != "" {
+					return "", fmt.Errorf("tokenizer: pre_tokenizer has more than one Split stage; only one was verified")
+				}
+				p, err := splitPattern(sub)
+				if err != nil {
+					return "", err
+				}
+				pattern = p
+			case "ByteLevel":
+				// A ByteLevel stage before the Split would change what the Split
+				// sees, so the order is asserted rather than assumed.
+				if pattern == "" {
+					return "", fmt.Errorf("tokenizer: pre_tokenizer stage %d is ByteLevel before any Split stage, which this implementation was not verified against", i)
+				}
+				if err := checkByteLevelPreTokenizer(sub); err != nil {
+					return "", err
+				}
+			default:
+				return "", fmt.Errorf("tokenizer: pre_tokenizer stage %d has type %q, which is not supported", i, sub.Type)
 			}
 		}
-		if found == "" {
+		if pattern == "" {
 			return "", fmt.Errorf("tokenizer: no Split stage in the pretokenizer sequence")
 		}
-		return found, nil
+		return pattern, nil
 	default:
 		return "", fmt.Errorf("tokenizer: pretokenizer type %q is not supported", node.Type)
 	}
 }
 
-// checkByteLevel rejects a ByteLevel stage that would prepend a space, because
-// that byte is not in the caller's input and every offset after it would be
-// wrong by one.
-func checkByteLevel(raw json.RawMessage) error {
-	var node struct {
-		Type           string `json:"type"`
-		AddPrefixSpace *bool  `json:"add_prefix_space"`
+// splitPattern returns a Split stage's regex, having checked that the stage
+// splits the way Encode assumes.
+func splitPattern(node preTokNode) (string, error) {
+	if node.Pattern.Regex == "" {
+		return "", fmt.Errorf("tokenizer: Split pretokenizer has no regex")
 	}
-	if err := json.Unmarshal(raw, &node); err != nil {
-		return fmt.Errorf("tokenizer: parse pre_tokenizer stage: %w", err)
+	// Encode treats the pattern's matches as the pieces, in order, with any gap
+	// between them as a piece of its own. That is "Isolated" behaviour; "Removed"
+	// would drop the delimiters and "MergedWith*" would attach them to a
+	// neighbour, either of which changes both the ids and the spans.
+	if node.Behavior != "Isolated" {
+		return "", fmt.Errorf("tokenizer: Split pretokenizer has behavior %q; only %q was verified, and the others change which bytes each token covers", node.Behavior, "Isolated")
 	}
-	if node.Type == "ByteLevel" && node.AddPrefixSpace != nil && *node.AddPrefixSpace {
-		return fmt.Errorf("tokenizer: ByteLevel pretokenizer has add_prefix_space, which would shift every byte offset")
+	if node.Invert != nil && *node.Invert {
+		return "", fmt.Errorf("tokenizer: Split pretokenizer has invert=true, which inverts the matches and was not verified")
+	}
+	return node.Pattern.Regex, nil
+}
+
+// checkByteLevelPreTokenizer asserts the two ByteLevel settings that change what
+// Encode should produce.
+//
+// trim_offsets is deliberately not checked here: in the pre_tokenizer position it
+// is inert, and the file this was verified against sets it to true while the
+// reference still reports untrimmed offsets. It is the post_processor's copy of
+// that field which governs the offsets, and checkPostProcessor asserts it.
+func checkByteLevelPreTokenizer(node preTokNode) error {
+	if node.AddPrefixSpace != nil && *node.AddPrefixSpace {
+		return fmt.Errorf("tokenizer: ByteLevel pre_tokenizer has add_prefix_space=true, which prepends a byte that is not in the caller's input and would shift every offset by one")
+	}
+	// use_regex=true makes ByteLevel apply its own GPT-2 pattern on top of the
+	// Split stage, so the pieces — and therefore the ids — would differ from what
+	// Encode produces.
+	if node.UseRegex != nil && *node.UseRegex {
+		return fmt.Errorf("tokenizer: ByteLevel pre_tokenizer has use_regex=true, which splits again on its own pattern and would change the token ids")
 	}
 	return nil
+}
+
+// checkPostProcessor asserts that nothing in the post-processing stage rewrites
+// the offsets Encode reports.
+//
+// The reference runs the post-processor even for encode(add_special_tokens=False),
+// and ByteLevel's trim_offsets there strips leading whitespace out of every
+// reported span. This implementation was verified against trim_offsets=false, so
+// the tokens for " main" cover the space too. With trim_offsets=true the
+// reference's spans would no longer cover the input and every span after a run of
+// whitespace would disagree with this package — silently, since a redactor cannot
+// tell a trimmed span from an untrimmed one.
+func checkPostProcessor(raw json.RawMessage) error {
+	if isNullJSON(raw) {
+		return nil
+	}
+	var node struct {
+		Type        string `json:"type"`
+		TrimOffsets *bool  `json:"trim_offsets"`
+	}
+	if err := json.Unmarshal(raw, &node); err != nil {
+		return fmt.Errorf("tokenizer: parse post_processor: %w", err)
+	}
+	if node.Type != "ByteLevel" {
+		return fmt.Errorf("tokenizer: post_processor has type %q; only ByteLevel was verified, and another processor may rewrite the offsets", node.Type)
+	}
+	if node.TrimOffsets == nil {
+		return fmt.Errorf("tokenizer: post_processor has no trim_offsets field, so the offsets it reports are unknown; re-run the tokenizer gate against this file")
+	}
+	if *node.TrimOffsets {
+		return fmt.Errorf("tokenizer: post_processor has trim_offsets=true, which trims whitespace out of the reported spans; this implementation was verified against trim_offsets=false and would report spans that disagree with the reference")
+	}
+	return nil
+}
+
+// isNullJSON reports whether raw is absent or the JSON null.
+func isNullJSON(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s == "" || s == "null"
 }
 
 // buildByteEncoder is the GPT-2 byte-to-unicode map every byte-level BPE

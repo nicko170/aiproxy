@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -185,4 +186,132 @@ func trunc(s string) string {
 		return s[:40] + "..."
 	}
 	return s
+}
+
+// Load must refuse a tokenizer.json whose settings differ from the ones this
+// package was verified against, because every one of them changes the offsets or
+// the ids without changing anything a fixture can see. The doctored files are the
+// real file with exactly one field patched, so the test proves the assertion
+// fires rather than proving a hand-built stub is rejected.
+func TestLoadRejectsSettingsThatWouldShiftOffsets(t *testing.T) {
+	path := modelPath(t)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sanity check: the real file loads. Otherwise a rejection below might be for
+	// the wrong reason.
+	if _, err := Load(path); err != nil {
+		t.Fatalf("the real file must load: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		find    string
+		replace string
+		wantErr string
+	}{{
+		name:    "post_processor trim_offsets",
+		find:    `"trim_offsets": false`,
+		replace: `"trim_offsets": true`,
+		wantErr: "trim_offsets=true",
+	}, {
+		name:    "pre_tokenizer add_prefix_space",
+		find:    `"add_prefix_space": false`,
+		replace: `"add_prefix_space": true`,
+		wantErr: "add_prefix_space=true",
+	}, {
+		name:    "pre_tokenizer use_regex",
+		find:    `"use_regex": false`,
+		replace: `"use_regex": true`,
+		wantErr: "use_regex=true",
+	}, {
+		name:    "Split behavior",
+		find:    `"behavior": "Isolated"`,
+		replace: `"behavior": "Removed"`,
+		wantErr: `behavior "Removed"`,
+	}, {
+		name:    "Split invert",
+		find:    `"invert": false`,
+		replace: `"invert": true`,
+		wantErr: "invert=true",
+	}, {
+		name:    "normalizer",
+		find:    `"normalizer": null`,
+		replace: `"normalizer": {"type": "NFKC"}`,
+		wantErr: "normalizer",
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Exactly one occurrence, so the patch is unambiguous. If the file's
+			// formatting ever changes this fails loudly instead of silently
+			// patching nothing and reporting a pass.
+			if n := strings.Count(string(raw), tc.find); n != 1 {
+				t.Fatalf("found %q %d times in the real file, want exactly 1", tc.find, n)
+			}
+			doctored := strings.Replace(string(raw), tc.find, tc.replace, 1)
+			p := filepath.Join(t.TempDir(), "tokenizer.json")
+			if err := os.WriteFile(p, []byte(doctored), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if err == nil {
+				t.Fatalf("Load accepted a file with %s patched to %s; it must refuse settings it was not verified against", tc.find, tc.replace)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error does not name the offending field: got %q, want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// Malformed UTF-8 has no reference to compare against: the tokenizers library
+// takes a Python str, which cannot hold invalid bytes, and a JSON fixture cannot
+// carry them either. It still reaches this code, because the proxy forwards
+// whatever bytes an agent sends. So it is property-tested instead: Encode must
+// not fail, must cover every byte, and must treat each invalid byte as a
+// character of its own — which is what Go's own string iteration does, and what
+// the offset arithmetic in encodePiece relies on.
+func TestEncodeHandlesMalformedUTF8(t *testing.T) {
+	tok, err := Load(modelPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{
+		"\x80",                      // lone continuation byte
+		"ok \x80 then",              // lone continuation byte in context
+		"\xe6\x97",                  // truncated three-byte sequence
+		"日本\xe6\x97",                // truncated sequence after a valid one
+		"\xc0\x80",                  // overlong encoding of NUL
+		"\xf0\x9f\x98",              // truncated emoji
+		"a\xffb",                    // byte that can never appear in UTF-8
+		"{\"k\":\"v\xed\xa0\x80\"}", // surrogate half inside JSON
+	} {
+		got, err := tok.Encode(text)
+		if err != nil {
+			t.Errorf("Encode(%q): %v", text, err)
+			continue
+		}
+		covered, prevStart := 0, 0
+		for j, tk := range got {
+			if tk.Start < prevStart {
+				t.Errorf("%q token %d starts at %d, before the previous token's %d", text, j, tk.Start, prevStart)
+			}
+			if tk.Start > covered {
+				t.Errorf("%q token %d starts at %d, leaving bytes [%d,%d) uncovered", text, j, tk.Start, covered, tk.Start)
+			}
+			if tk.End <= tk.Start || tk.End > len(text) {
+				t.Errorf("%q token %d span [%d,%d) is out of range for %d bytes", text, j, tk.Start, tk.End, len(text))
+			}
+			if !charAligned(text, tk.Start) || !charAligned(text, tk.End) {
+				t.Errorf("%q token %d span [%d,%d) does not align to a character boundary", text, j, tk.Start, tk.End)
+			}
+			prevStart = tk.Start
+			if tk.End > covered {
+				covered = tk.End
+			}
+		}
+		if covered != len(text) {
+			t.Errorf("%q: spans cover %d bytes, want %d", text, covered, len(text))
+		}
+	}
 }

@@ -67,6 +67,60 @@ def extra_cases() -> list[str]:
         cases.append(s)
     cases += words + ["", " ", "\n", "\r\n\r\n", "a" * 5000, "😀" * 200,
                       "     x", "\u0301" * 10, "ﬁ", "Ⅷ", "ｸﾞ"]
+    # Input shapes this tool actually sees, added after a review pointed out the
+    # corpus had none of them. They go at the end so the seeded cases above stay
+    # byte-identical when the file is regenerated.
+    #
+    # Malformed UTF-8 is deliberately absent: a Python str cannot hold invalid
+    # bytes and a JSON fixture cannot carry them, so there is no reference to
+    # compare against. It is covered by TestEncodeHandlesMalformedUTF8 instead.
+    cases += [
+        # Unified diff hunks, which is most of what a coding agent sends.
+        "@@ -1,4 +1,6 @@\n context line\n-removed = 1\n+added = 2\n+added_two = 3\n unchanged\n",
+        "diff --git a/internal/privacy/filter.go b/internal/privacy/filter.go\n"
+        "index 1a2b3c4..5d6e7f8 100644\n--- a/internal/privacy/filter.go\n"
+        "+++ b/internal/privacy/filter.go\n@@ -12,7 +12,7 @@ func (f *Filter) Apply(s string) string {\n"
+        "-\treturn f.rules.Redact(s)\n+\treturn f.rules.RedactWithNER(s)\n",
+        "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-# aiproxy\n+# aiproxy \u2014 a local privacy filter\n",
+        # ANSI / terminal control sequences, which is the other half.
+        "\x1b[31mFAIL\x1b[0m internal/privacy 0.12s",
+        "\x1b[1;32m\u2713\x1b[0m 42 passed \x1b[2m(3.1s)\x1b[0m",
+        "\x1b[2K\r\x1b[38;5;208mbuilding\x1b[0m \u2588\u2588\u2588\u2591\u2591 60%\r",
+        "\x1b[?25l\x1b[10;20Hcursor moved\x1b[?25h",
+        # PEM, base64 and JWT: long high-entropy runs, where BPE behaves least
+        # like it does on prose.
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "MIIEogIBAAKCAQEAvR2kQ8Vv7bTn1mKcXpLzYqA3sJdWfHgNrEuBtCiOxZaPlMnQ\n"
+        "dKjFhGyUsVoWbXnZtQrElAiPmCdNhJkTgYzXwLbOvUeRcFaSpDqMnIyHtGkVxZuB\n"
+        "wQIDAQABAoIBAB2mLfPq7sXnKdYvTgEaJcRhWuBzZiOlNxFqMsVtCpDgYkHrXeAu\n"
+        "-----END RSA PRIVATE KEY-----\n",
+        "-----BEGIN CERTIFICATE-----\nMIIB9TCCAV6gAwIBAgIJAK3xY9\n-----END CERTIFICATE-----",
+        "SGVsbG8sIHRoaXMgaXMgYSBmYWlybHkgbG9uZyBiYXNlNjQgcnVuIHRoYXQgc2hvdWxkIGV4ZXJjaXNlIG1lcmdlcyBhdCBzY2FsZS4=",
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==",
+        "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFkYSBMb3ZlbGFjZSIsImlhdCI6MTUxNjIzOTAyMn0."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+        # Source in the two languages this repo is built from.
+        "func (t *Tokenizer) Encode(s string) ([]Token, error) {\n"
+        "\tif s == \"\" {\n\t\treturn nil, nil\n\t}\n"
+        "\tvar out []Token\n\tfor i := range s {\n\t\t_ = i\n\t}\n"
+        "\treturn out, nil\n}\n",
+        "def main() -> None:\n"
+        "    tok = Tokenizer.from_file(sys.argv[1])\n"
+        "    for text in CASES:\n"
+        "        enc = tok.encode(text, add_special_tokens=False)\n"
+        "        print(f\"{len(enc.ids)} tokens\")\n",
+        # Config fragments, where keys and secrets tend to live.
+        "privacy:\n  enabled: true\n  model_path: ~/.aiproxy/models/privacy-filter\n"
+        "  categories:\n    - PERSON\n    - EMAIL\n  api_key: sk-ant-api03-REDACTME\n",
+        "{\n  \"providers\": {\n    \"anthropic\": {\n"
+        "      \"base_url\": \"https://api.anthropic.com\",\n"
+        "      \"api_key\": \"sk-ant-api03-abcdefghijklmnopqrstuvwxyz\",\n"
+        "      \"timeout_ms\": 30000\n    }\n  }\n}",
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n"
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+        "DATABASE_URL=postgres://ada:hunter2@db.internal:5432/aiproxy?sslmode=require\n",
+    ]
     return cases
 
 
