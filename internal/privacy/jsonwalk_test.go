@@ -2,6 +2,7 @@ package privacy
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -185,4 +186,43 @@ func FuzzWalkStrings(f *testing.F) {
 			}
 		}
 	})
+}
+
+// nested builds a document of n containers wrapped around one string, e.g.
+// [[["x"]]] for n=3.
+func nested(n int) []byte {
+	return []byte(strings.Repeat("[", n) + `"x"` + strings.Repeat("]", n))
+}
+
+// value/object/array are mutually recursive, so nesting depth IS Go stack
+// depth, and a Go stack past its limit is a fatal runtime error that no recover
+// can catch — the whole proxy dies. Both directions feed this walker remote
+// input: a request body from an agent that read a hostile page, and, through
+// Restorer.Body, a response body from the provider. So a pathological document
+// has to come back as an error rather than as a crash.
+func TestWalkStringsRefusesPathologicallyNestedDocuments(t *testing.T) {
+	_, err := WalkStrings(nested(maxWalkDepth * 8))
+	if err == nil {
+		t.Fatal("WalkStrings accepted a document nested far past the limit")
+	}
+	if !errors.Is(err, ErrTooDeep) {
+		t.Errorf("err = %v, want it to wrap ErrTooDeep so callers can tell it from malformed JSON", err)
+	}
+	// Not ErrNotJSON: that sentinel routes a body UPSTREAM UNFILTERED, which is
+	// the one thing a document engineered to defeat the walker must not get.
+	if errors.Is(err, ErrNotJSON) {
+		t.Error("a too-deep document reported ErrNotJSON, which is the pass-through path")
+	}
+}
+
+// The bound has to be generous enough that no real payload can trip it; a
+// document at the limit still walks normally.
+func TestWalkStringsAcceptsNestingUpToTheLimit(t *testing.T) {
+	spans, err := WalkStrings(nested(maxWalkDepth))
+	if err != nil {
+		t.Fatalf("WalkStrings(%d levels) = %v, want it accepted", maxWalkDepth, err)
+	}
+	if len(spans) != 1 || spans[0].Value != "x" {
+		t.Errorf("spans = %+v, want the one string at the bottom", spans)
+	}
 }

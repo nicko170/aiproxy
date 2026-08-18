@@ -9,8 +9,35 @@ package privacy
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
+
+// maxWalkDepth bounds how deeply nested a document the walker will descend
+// into. Past it the walk errors instead of recursing further.
+//
+// value/object/array are mutually recursive, so nesting depth is Go stack
+// depth, and a Go stack that outgrows its limit is a FATAL runtime error: no
+// panic, no recover, the whole proxy dies. That is remote input on both sides —
+// a request from an agent that ingested a hostile web page, and, through
+// Restorer.Body, a response from the provider — so "no real payload nests that
+// deep" is not on its own a defence.
+//
+// 1024 is chosen to be uninteresting from either end. The deepest real
+// Anthropic body is a tool schema nested a dozen or two levels, so this is two
+// orders of magnitude of headroom and no legitimate request can reach it; and
+// 1024 frames of a small walker is a few hundred KB of stack, nowhere near the
+// runtime's 1 GB ceiling, so the limit fires long before the crash it exists to
+// prevent. encoding/json's own decoder caps at 10000 for the same reason.
+const maxWalkDepth = 1024
+
+// ErrTooDeep reports a document nested past maxWalkDepth.
+//
+// A distinct sentinel because the caller must not treat it as "this body is not
+// JSON": that shape is passed upstream UNFILTERED (see Filter.Redact), and a
+// document engineered to be unwalkable is exactly the request that must not
+// take the pass-through path. It is a scan failure, and obeys onScanFailure.
+var ErrTooDeep = errors.New("privacy: JSON nested too deeply to scan")
 
 // StringSpan is one JSON string VALUE found in a document.
 //
@@ -45,7 +72,7 @@ func WalkStrings(doc []byte) ([]StringSpan, error) {
 	if err := w.skipSpace(); err != nil {
 		return nil, err
 	}
-	if err := w.value("", ""); err != nil {
+	if err := w.value("", "", 0); err != nil {
 		return nil, err
 	}
 	if err := w.skipSpace(); err == nil && w.i < len(w.doc) {
@@ -79,16 +106,17 @@ func (w *walker) skipSpace() error {
 }
 
 // value dispatches on the next non-space byte. key is the object key this
-// value sits under and parent the key one level above it.
-func (w *walker) value(key, parent string) error {
+// value sits under and parent the key one level above it. depth is how many
+// containers enclose this value; it is checked where the recursion happens.
+func (w *walker) value(key, parent string, depth int) error {
 	if err := w.skipSpace(); err != nil {
 		return err
 	}
 	switch c := w.doc[w.i]; {
 	case c == '{':
-		return w.object(key)
+		return w.object(key, depth)
 	case c == '[':
-		return w.array(key, parent)
+		return w.array(key, parent, depth)
 	case c == '"':
 		start, decoded, err := w.stringLiteral()
 		if err != nil {
@@ -106,7 +134,11 @@ func (w *walker) value(key, parent string) error {
 	}
 }
 
-func (w *walker) object(parent string) error {
+func (w *walker) object(parent string, depth int) error {
+	if depth >= maxWalkDepth {
+		return fmt.Errorf("%w: more than %d levels at offset %d", ErrTooDeep, maxWalkDepth, w.i)
+	}
+	depth++
 	w.i++ // '{'
 	if err := w.skipSpace(); err != nil {
 		return err
@@ -133,7 +165,7 @@ func (w *walker) object(parent string) error {
 			return w.errAt("expected ':' after an object key")
 		}
 		w.i++
-		if err := w.value(key, parent); err != nil {
+		if err := w.value(key, parent, depth); err != nil {
 			return err
 		}
 		if err := w.skipSpace(); err != nil {
@@ -151,7 +183,11 @@ func (w *walker) object(parent string) error {
 	}
 }
 
-func (w *walker) array(key, parent string) error {
+func (w *walker) array(key, parent string, depth int) error {
+	if depth >= maxWalkDepth {
+		return fmt.Errorf("%w: more than %d levels at offset %d", ErrTooDeep, maxWalkDepth, w.i)
+	}
+	depth++
 	w.i++ // '['
 	if err := w.skipSpace(); err != nil {
 		return err
@@ -163,7 +199,7 @@ func (w *walker) array(key, parent string) error {
 	for {
 		// Elements inherit the array's own key, so a rule or denylist entry
 		// keyed on that name still reaches them.
-		if err := w.value(key, parent); err != nil {
+		if err := w.value(key, parent, depth); err != nil {
 			return err
 		}
 		if err := w.skipSpace(); err != nil {

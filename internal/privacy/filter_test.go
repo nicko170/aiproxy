@@ -219,3 +219,40 @@ func (blockingDetector) Scan(ctx context.Context, _ string) ([]Finding, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
+
+// A document too deep to walk is a SCAN FAILURE, not a "not JSON" body.
+//
+// The two are one line apart in Redactor.Redact and worlds apart in effect:
+// ErrNotJSON is passed upstream unfiltered and merely counted, which would hand
+// anyone who can nest an array a way to bypass the filter entirely. Fail-closed
+// has to refuse it.
+func TestFilterTreatsATooDeepBodyAsAScanFailure(t *testing.T) {
+	body := []byte(strings.Repeat("[", 8192) + `"x"` + strings.Repeat("]", 8192))
+
+	f := newTestFilter(t)
+	out, table, err := f.Redact(context.Background(), body)
+	if err == nil {
+		t.Fatal("Redact accepted a pathologically nested body")
+	}
+	if !errors.Is(err, ErrTooDeep) {
+		t.Errorf("err = %v, want ErrTooDeep", err)
+	}
+	if out != nil || table != nil {
+		t.Error("a failed scan returned a body and a table; the caller must get nothing to send")
+	}
+	if snap := f.Snapshot(); snap.SentUnfiltered != 0 {
+		t.Errorf("SentUnfiltered = %d under fail-closed; nothing was sent", snap.SentUnfiltered)
+	} else if snap.LastError == "" {
+		t.Error("LastError is empty; a scan failure must leave a trace")
+	}
+
+	// Under fail-open the same body still counts as unfiltered rather than
+	// slipping through as an ordinary pass-through shape.
+	open := New(Options{Key: testKey, Unresolved: Passthrough, OnScanFailure: Open})
+	if _, _, err := open.Redact(context.Background(), body); err == nil {
+		t.Fatal("Redact accepted a pathologically nested body under fail-open")
+	}
+	if n := open.Snapshot().SentUnfiltered; n != 1 {
+		t.Errorf("SentUnfiltered = %d, want 1", n)
+	}
+}

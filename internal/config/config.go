@@ -130,8 +130,13 @@ type PrivacyNER struct {
 // Enabled defaults to FALSE. The filter rewrites request bodies, and that is not
 // a behaviour to acquire silently on upgrade — but once it is on, the
 // deterministic rules come with it.
-// ScanTimeoutMS bounds the WHOLE request's scan, which is the only ceiling on
-// the latency the filter adds. Redaction runs synchronously in proxyHandler,
+// ScanTimeoutMS bounds the DETECTION work in a request's scan — every string
+// in the body, aggregated — which is the only ceiling on the latency the filter
+// adds once the model is up. It does NOT bound the model's one-time load: that
+// happens inside the first Scan that needs it, under a sync.Once, and takes no
+// context, so the first request after startup (and any request queued behind it)
+// pays an ~850 MB load that this deadline cannot interrupt. Every scan after
+// that is bounded. Redaction runs synchronously in proxyHandler,
 // before the attempt loop, so it sits OUTSIDE retry.budgetMS — the budget that
 // exists precisely to bound the time the proxy adds. maxScanBytes bounds one
 // string (~520 ms at the 4 KB default), not a request: a fresh conversation

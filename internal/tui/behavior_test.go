@@ -526,13 +526,40 @@ func TestHeaderWarnsOnRequestsSentUnfiltered(t *testing.T) {
 		Enabled: true, ModelState: "ready",
 		Redactions:     map[string]int64{"SECRET": 9},
 		SentUnfiltered: 3,
-		Unresolved:     2,
 	}
 	got := m.viewHeader()
 	if !strings.Contains(got, "3 unfiltered") {
 		t.Errorf("header = %q, want the unfiltered count surfaced", got)
 	}
 	if strings.Contains(got, "redacted") || strings.Contains(got, "unresolved") {
+		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
+	}
+}
+
+// LastError and SentUnfiltered are both sticky for the process lifetime — the
+// error string is never cleared, and the unfiltered count only rises — so with
+// the old ranking a single non-JSON POST, or one transient scan error that has
+// since recovered, pinned "filter error" / "N unfiltered" in the header
+// permanently and the operator never saw an unresolved placeholder again. An
+// unresolved placeholder means the agent has already received something wrong
+// and acted on it, which outranks a request that went out unfiltered and
+// outranks a stale description of a fault that is over. All three set at once
+// is the only arrangement that pins the order.
+func TestHeaderUnresolvedOutranksStickyFilterFaults(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions:     map[string]int64{"SECRET": 9},
+		Unresolved:     2,
+		SentUnfiltered: 3,
+		LastError:      "privacy: detector ner: model unavailable",
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want the unresolved warning to win over the sticky ones", got)
+	}
+	if strings.Contains(got, "filter error") || strings.Contains(got, "unfiltered") ||
+		strings.Contains(got, "redacted") {
 		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
 	}
 }

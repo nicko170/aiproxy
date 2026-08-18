@@ -698,18 +698,25 @@ outer:
 //
 // Four states, most urgent first, because only one segment fits:
 //
-//  1. A scan error. The filter is not doing its job at all, and under
+//  1. An unresolved placeholder — the agent has ALREADY received something
+//     wrong and has already acted on it: written the file, run the command,
+//     told the operator the answer. Nothing else here describes damage that
+//     has landed.
+//  2. A scan error. The filter is not doing its job, and under
 //     onScanFailure:open that is completely silent everywhere else.
-//  2. Requests sent unfiltered. Same condition seen from the other side, and it
+//  3. Requests sent unfiltered. Same condition seen from the other side, and it
 //     persists after the error that caused it has stopped recurring.
-//  3. An unresolved placeholder — the agent received something wrong.
 //  4. The redaction count, which merely means the filter is working.
 //
-// The first two outrank the third because "protecting nothing" is a failure of
-// the feature's purpose, whereas an unresolved placeholder is a visible,
-// self-correcting wrongness in one value (see the restore table's per-request
-// note). All three outrank the count for the reason the count exists: a count
-// is reassurance, and reassurance must never be shown in place of a fault.
+// Unresolved leads because the other two are STICKY for the process lifetime:
+// LastError is never cleared (by design — see Snapshot.LastError), and
+// SentUnfiltered only ever rises. One non-JSON POST or one transient error that
+// has since recovered would otherwise pin "filter error" or "N unfiltered"
+// forever, and every unresolved placeholder after that — the live, ongoing
+// wrongness — would have no surface at all. A stale description of a fault that
+// is over must not outrank a fault that is happening. Both still outrank the
+// count for the reason the count exists: a count is reassurance, and
+// reassurance must never be shown in place of a fault.
 func (m Model) privacySegments() []string {
 	th := m.th
 	p := m.status.Privacy
@@ -719,6 +726,12 @@ func (m Model) privacySegments() []string {
 	glyph := "⊘ "
 	if th.mode == modeNone {
 		glyph = "[!] "
+	}
+	if p.Unresolved > 0 {
+		return []string{
+			th.bad(fmt.Sprintf("%s%d unresolved", glyph, p.Unresolved)),
+			th.bad(fmt.Sprintf("%d unresolved", p.Unresolved)),
+		}
 	}
 	if p.LastError != "" {
 		return []string{
@@ -730,12 +743,6 @@ func (m Model) privacySegments() []string {
 		return []string{
 			th.bad(fmt.Sprintf("%s%d unfiltered", glyph, p.SentUnfiltered)),
 			th.bad(fmt.Sprintf("%d unfiltered", p.SentUnfiltered)),
-		}
-	}
-	if p.Unresolved > 0 {
-		return []string{
-			th.bad(fmt.Sprintf("%s%d unresolved", glyph, p.Unresolved)),
-			th.bad(fmt.Sprintf("%d unresolved", p.Unresolved)),
 		}
 	}
 	var total int64

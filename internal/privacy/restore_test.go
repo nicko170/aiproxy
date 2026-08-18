@@ -341,3 +341,23 @@ func TestStreamingAndNonStreamingAgreeOnTheSameToolCall(t *testing.T) {
 		t.Errorf("content_block_start restored %d of 2 fields: %s", strings.Count(string(out), "acme-prod.internal"), out)
 	}
 }
+
+// The response path takes the same walker over bytes the PROVIDER chose, so a
+// compromised or simply buggy upstream must not be able to kill the proxy with
+// nesting. An unparseable body is already relayed untouched — the depth refusal
+// has to take that same path rather than sever the stream, because the client
+// may well handle the response perfectly well.
+func TestRestorerBodyRelaysAPathologicallyNestedBodyUntouched(t *testing.T) {
+	r := NewRestorer(NewTable(testKey), Passthrough, nil)
+	// Deep enough to be the real thing rather than a proxy for it: without the
+	// walker's depth bound this exact document takes the process down with
+	// "fatal error: stack overflow" — not a failing test, a dead proxy.
+	body := nested(5_000_000)
+	out, err := r.Body(body)
+	if err != nil {
+		t.Fatalf("Body() = %v, want a deeply nested response relayed, not refused", err)
+	}
+	if string(out) != string(body) {
+		t.Errorf("body was altered:\n got %s\nwant %s", out, body)
+	}
+}

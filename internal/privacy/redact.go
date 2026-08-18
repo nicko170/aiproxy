@@ -107,6 +107,14 @@ func (r *Redactor) Redact(ctx context.Context, doc []byte, table *Table) ([]byte
 	}
 	spans, err := WalkStrings(doc)
 	if err != nil {
+		// A document too deeply nested to walk is NOT reported as "not JSON".
+		// That shape is passed upstream unfiltered, and a body engineered to
+		// defeat the walker is the last one that should take the pass-through
+		// path; it is returned as-is so it stays a scan failure and obeys
+		// onScanFailure.
+		if errors.Is(err, ErrTooDeep) {
+			return doc, err
+		}
 		return doc, fmt.Errorf("%w: %v", ErrNotJSON, err)
 	}
 

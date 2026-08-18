@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -153,9 +154,24 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			return
 		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		// maxBodyBytes+1, so an over-limit body is DETECTABLE rather than
+		// silently truncated. This used to read exactly maxBodyBytes and forward
+		// whatever fitted: the client's request was quietly mutilated and sent
+		// anyway, which was always wrong and became a leak the day the privacy
+		// filter learned to pass non-JSON through. A truncated JSON body is
+		// malformed, malformed parses as "not JSON", and "not JSON" is passed
+		// upstream UNFILTERED — so padding a request past the cap was a way to
+		// push the first 64 MiB, secrets included, straight to the provider even
+		// under onScanFailure:closed. Refusing is correct whether or not the
+		// filter is on: nothing good comes of forwarding half a request.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "Could not read request body")
+			return
+		}
+		if len(body) > maxBodyBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("Request body exceeds aiproxy's %d MiB limit.", maxBodyBytes>>20))
 			return
 		}
 
