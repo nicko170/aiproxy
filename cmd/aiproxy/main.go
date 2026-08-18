@@ -178,7 +178,9 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,
 				"outcome", res.Outcome.String(), "attempts", res.Attempts,
-				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes)
+				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
+				"in", res.InputTokens, "out", res.OutputTokens,
+				"cacheRead", res.CacheReadTokens, "cacheWrite", res.CacheWriteTokens)
 		},
 	}), nil
 }

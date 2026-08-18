@@ -18,6 +18,11 @@ var ErrBodyIdle = errors.New("upstream stream idle")
 // sseTerminator separates events in a Server-Sent Events stream.
 var sseTerminator = []byte("\n\n")
 
+// maxUsageCapture bounds how much of a non-streaming body is retained to read
+// its usage envelope. Usage sits near the end of a message response, but a
+// pathological body must not be held in memory without limit.
+const maxUsageCapture = 1 << 20 // 1 MiB
+
 // RelayOptions configures one relay.
 type RelayOptions struct {
 	// BodyIdle bounds silence BETWEEN chunks, not total duration, so a long but
@@ -27,6 +32,10 @@ type RelayOptions struct {
 	Streaming  bool
 	ParseUsage func(event []byte) (*provider.UsageDelta, bool)
 	OnUsage    func(*provider.UsageDelta)
+	// ParseBody extracts usage from a complete non-streaming body. When set and
+	// Streaming is false, Relay retains up to maxUsageCapture bytes and parses
+	// once the body ends.
+	ParseBody func(body []byte) (*provider.UsageDelta, bool)
 }
 
 type readChunk struct {
@@ -81,7 +90,8 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 	}()
 
 	var written int64
-	var pending []byte // incomplete trailing SSE event
+	var pending []byte  // incomplete trailing SSE event
+	var captured []byte // non-streaming body retained for usage parsing
 	idle := time.NewTimer(opts.BodyIdle)
 	defer idle.Stop()
 
@@ -100,6 +110,7 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 			if c.err != nil {
 				if errors.Is(c.err, io.EOF) {
 					flushRemainingUsage(pending, opts)
+					flushCapturedBody(captured, opts)
 					return written, nil
 				}
 				return written, c.err
@@ -116,6 +127,14 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 
 			if opts.Streaming && opts.ParseUsage != nil {
 				pending = teeUsage(append(pending, c.buf...), opts)
+			}
+
+			if !opts.Streaming && opts.ParseBody != nil && len(captured) < maxUsageCapture {
+				room := maxUsageCapture - len(captured)
+				if room > len(c.buf) {
+					room = len(c.buf)
+				}
+				captured = append(captured, c.buf[:room]...)
 			}
 
 			// Reset the watchdog only on real progress.
@@ -151,6 +170,17 @@ func flushRemainingUsage(pending []byte, opts RelayOptions) {
 		return
 	}
 	if d, ok := opts.ParseUsage(pending); ok && opts.OnUsage != nil {
+		opts.OnUsage(d)
+	}
+}
+
+// flushCapturedBody parses a complete non-streaming body for usage once it has
+// finished arriving.
+func flushCapturedBody(captured []byte, opts RelayOptions) {
+	if opts.Streaming || opts.ParseBody == nil || len(captured) == 0 {
+		return
+	}
+	if d, ok := opts.ParseBody(captured); ok && opts.OnUsage != nil {
 		opts.OnUsage(d)
 	}
 }

@@ -129,6 +129,11 @@ type UsageDelta struct {
 	OutputTokens     int64
 	CacheReadTokens  int64
 	CacheWriteTokens int64
+	// StartsMessage is true for the event that opens a message. The accumulator
+	// needs it because output_tokens is a running total scoped to one message:
+	// without a boundary it cannot tell a new message's counter from a
+	// continuation of the previous one.
+	StartsMessage bool
 }
 
 // Account is the subset of account state a provider needs. Defined here rather

@@ -120,6 +120,11 @@ type Result struct {
 	WaitMS    int64
 	TTFBMS    int64
 	Bytes     int64
+
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
 }
 
 type Attempter struct {
@@ -543,14 +548,26 @@ func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRe
 	}
 	w.WriteHeader(upstreamRes.StatusCode)
 
+	acc := NewUsageAccumulator()
 	streaming := strings.Contains(upstreamRes.Header.Get("Content-Type"), "text/event-stream")
 	n, err := Relay(ctx, w, upstreamRes.Body, RelayOptions{
 		BodyIdle:   a.cfg.BodyIdle,
 		Streaming:  streaming,
 		ParseUsage: prov.ParseUsage,
-		OnUsage:    func(*provider.UsageDelta) {}, // wired to metrics in stage 2
+		ParseBody:  prov.ParseUsageBody,
+		OnUsage: func(d *provider.UsageDelta) {
+			if d != nil && d.StartsMessage {
+				acc.StartMessage()
+			}
+			acc.Observe(d)
+		},
 	})
 	res.Bytes = n
+	totals := acc.Totals()
+	res.InputTokens = totals.InputTokens
+	res.OutputTokens = totals.OutputTokens
+	res.CacheReadTokens = totals.CacheReadTokens
+	res.CacheWriteTokens = totals.CacheWriteTokens
 	if err != nil && !errors.Is(err, context.Canceled) {
 		a.log.Warn("relay ended early", "err", err, "bytes", n)
 		// Abort instead of returning normally. A normal return lets net/http

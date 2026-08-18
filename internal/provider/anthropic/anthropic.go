@@ -207,6 +207,7 @@ func (a *Anthropic) ParseUsage(event []byte) (*provider.UsageDelta, bool) {
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadInputTokens,
 			CacheWriteTokens: u.CacheCreationInputTokens,
+			StartsMessage:    ev.Type == "message_start",
 		}, true
 	}
 	return nil, false
@@ -232,5 +233,6 @@ func (a *Anthropic) ParseUsageBody(body []byte) (*provider.UsageDelta, bool) {
 		OutputTokens:     u.OutputTokens,
 		CacheReadTokens:  u.CacheReadInputTokens,
 		CacheWriteTokens: u.CacheCreationInputTokens,
+		StartsMessage:    true,
 	}, true
 }
