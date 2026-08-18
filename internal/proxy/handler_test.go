@@ -538,3 +538,38 @@ func TestRouterDoesNotEndATruncatedStreamCleanly(t *testing.T) {
 		t.Fatalf("read ended with %v; the router turned a truncated stream into a clean finish", readErr)
 	}
 }
+
+// TestBetaHeaderAndModelReachUpstreamUnaltered pins a contract that is
+// invisible until it breaks. Claude Code opts into a 1M-token context by
+// sending anthropic-beta: ...,context-1m-2025-08-07,... alongside the model
+// name; the window it actually gets is decided upstream from that header. A
+// proxy that reorders the list, drops an unrecognized member, or rewrites the
+// model silently costs the operator 800K tokens of context with no error
+// anywhere. So this asserts the whole header arrives byte-identical, not
+// merely that the one beta survives.
+func TestBetaHeaderAndModelReachUpstreamUnaltered(t *testing.T) {
+	h := newHarness(t, 1, defaultRetry(), testutil.Script{Status: 200, Body: `{}`})
+
+	const betas = "claude-code-20250219,oauth-2025-04-20,context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+"/v1/messages?beta=true",
+		strings.NewReader(`{"model":"claude-opus-5","max_tokens":32000,"messages":[]}`))
+	req.Header.Set("anthropic-beta", betas)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("content-type", "application/json")
+
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+
+	got := h.upstream.Requests()[0]
+	if got.Header.Get("anthropic-beta") != betas {
+		t.Errorf("anthropic-beta was altered on the way upstream:\n want %q\n  got %q",
+			betas, got.Header.Get("anthropic-beta"))
+	}
+	if !strings.Contains(string(got.Body), `"claude-opus-5"`) {
+		t.Errorf("model was rewritten: %s", got.Body)
+	}
+}
