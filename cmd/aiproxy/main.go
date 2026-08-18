@@ -233,28 +233,11 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	})
 
 	// OnLoginSuccess is the only place a PKCE login's exchanged credential
-	// exists after the exchange (provider.LoginResult never carries one; see
-	// its doc comment) — set here, after mgr and store both exist, so a
-	// successful login persists a brand-new account through the config store
-	// and adds it to the live Manager without a restart (spec §6.1), the
-	// same "persist, then apply" order every other mutation uses.
-	anthropicProvider.OnLoginSuccess = func(_ context.Context, cred provider.Credential, profile provider.Profile) error {
-		acc := config.Account{
-			ID: config.NewID(), Provider: "anthropic", Label: loginLabel(profile),
-			Credential: cred,
-			Identity: config.Identity{
-				AccountUUID: profile.AccountUUID, OrgUUID: profile.OrgUUID,
-				OrgName: profile.OrgName, Plan: profile.Plan,
-			},
-		}
-		if _, err := store.Update(func(c *config.Config) error {
-			c.Accounts = append(c.Accounts, acc)
-			return nil
-		}); err != nil {
-			return err
-		}
-		return mgr.Add(acc)
-	}
+	// exists after the exchange — set here, after mgr and store both exist,
+	// so a successful login persists and goes live without a restart (spec
+	// §6.1). See accounts.go's onLoginSuccess for the full "persist, then
+	// apply" + re-login-dedupe story.
+	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr)
 
 	// The quota prober (spec §6.2): interval 0 disables only its background
 	// loop (see prober.New's doc comment), never ProbeNow. Constructed here,
