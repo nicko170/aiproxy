@@ -425,8 +425,13 @@ that read those values are built once at startup.
   `bodyIdleMs` governs the stream after the first byte.
 - **`quotaProbe.intervalSeconds`** defaults to 300 because the zero-spend usage
   endpoint is itself rate limited — polling it aggressively gets the probe
-  throttled and leaves selection deciding on stale numbers. Set it to `0` to
-  disable the background loop; `p` in the TUI still works.
+  throttled and leaves selection deciding on stale numbers. One probe runs at
+  startup and then every interval, because quota is not persisted across
+  restarts and selection cannot apply `switchThreshold` to an account whose
+  utilization it does not yet know. Each probe renews the account's credential
+  first, so a token that expired while the proxy was idle does not freeze the
+  numbers until traffic resumes. Set it to `0` to disable the background loop
+  entirely; `p` in the TUI still works.
 - **`update.checkEnabled`** turns the daily release check on or off and takes
   effect immediately; **`checkIntervalHours`** takes effect on restart, because
   the checker's ticker is built once at startup. See [Updating](#updating).
