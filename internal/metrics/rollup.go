@@ -149,6 +149,18 @@ func NewRoller(s *Store, interval time.Duration, log *slog.Logger) *Roller {
 	}
 }
 
+// Start begins the background rollup loop. Must be called exactly once,
+// followed by exactly one Stop.
+//
+// Unlike prober.Prober's Start/Stop (which guard themselves with sync.Once,
+// making a duplicate call a silent no-op), Roller relies on its caller
+// honouring that contract rather than enforcing it: a second Start would
+// spawn a second loop racing the first one's ticks against the same store,
+// and a second Stop would panic closing an already-closed channel. This
+// package documents the contract instead of guarding it because Roller has
+// exactly one caller (main), constructed and started once at startup — the
+// failure mode a sync.Once guards against (some other, unrelated caller
+// double-starting or double-stopping it) does not arise here.
 func (r *Roller) Start() {
 	go func() {
 		defer close(r.stopped)
@@ -176,6 +188,9 @@ func (r *Roller) Start() {
 	}()
 }
 
+// Stop ends the background loop and waits for it to exit. Must be paired
+// with exactly one prior Start; see Start's doc comment on why a duplicate
+// Stop is not guarded against here the way prober.Prober's is.
 func (r *Roller) Stop() {
 	close(r.stop)
 	<-r.stopped
