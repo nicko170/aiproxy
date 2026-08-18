@@ -106,3 +106,33 @@ func TestOpenMemoryWorksForTests(t *testing.T) {
 		t.Errorf("insert into in-memory store: %v", err)
 	}
 }
+
+// Two OpenMemory stores held open at once must not alias the same database.
+// "file::memory:?cache=shared" without a unique name does exactly that, and it
+// only went unnoticed because every prior test closed its store before the
+// next one opened.
+func TestOpenMemoryStoresAreIsolatedFromEachOther(t *testing.T) {
+	s1, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory s1: %v", err)
+	}
+	defer s1.Close()
+	s2, err := OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory s2: %v", err)
+	}
+	defer s2.Close()
+
+	if _, err := s1.DB().Exec(
+		`INSERT INTO requests(started_at, account_id, provider) VALUES (1, 'a', 'p')`); err != nil {
+		t.Fatalf("insert into s1: %v", err)
+	}
+
+	var n int
+	if err := s2.DB().QueryRow(`SELECT count(*) FROM requests`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("s2 sees %d rows written to s1, want 0 — the two stores are aliasing the same database", n)
+	}
+}

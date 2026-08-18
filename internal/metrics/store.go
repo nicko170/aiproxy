@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 )
@@ -43,9 +44,20 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// OpenMemory returns an in-memory store for tests.
+// memCounter gives each OpenMemory call its own named in-memory database.
+// "file::memory:?cache=shared" (without a name) aliases every in-process
+// caller onto the SAME database, so two stores open at once — or two tests
+// running in parallel — would silently share rows. A unique name per call
+// keeps cache=shared's benefit (multiple connections to withstand
+// db.SetMaxOpenConns(1) plus migration's own connection) without that
+// cross-test contamination.
+var memCounter atomic.Int64
+
+// OpenMemory returns an in-memory store for tests, isolated from every other
+// OpenMemory store in the process.
 func OpenMemory() (*Store, error) {
-	return open("file::memory:?cache=shared&_pragma=busy_timeout(5000)")
+	n := memCounter.Add(1)
+	return open(fmt.Sprintf("file:memdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", n))
 }
 
 func open(dsn string) (*Store, error) {

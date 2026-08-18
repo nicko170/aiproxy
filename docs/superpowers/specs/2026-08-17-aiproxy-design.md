@@ -482,15 +482,28 @@ Three requirements that stage 1 surfaced and this section was previously silent
 on. Each is a way to produce numbers that look plausible and are wrong, which is
 worse than having none.
 
-**Output tokens are cumulative, not incremental.** A streamed message reports
-usage twice: `message_start` carries the one-shot input, cache-read and
-cache-creation counts, and each `message_delta` carries `output_tokens` as a
-running total **for that message**, not a delta since the last event. Summing
-`UsageDelta.OutputTokens` across events therefore inflates output badly on long
-completions — the longer the answer, the worse the error. The accumulator takes
-the **last** value seen for output within a message and **sums** the one-shot
-input and cache figures across messages. A test asserts a multi-`message_delta`
-stream reports the final count, not the sum of the running totals.
+**Every usage field in a stream is cumulative, not incremental.** Anthropic's
+streaming documentation states that the token counts in a `message_delta`
+event's `usage` field are cumulative — **all** of them, not only
+`output_tokens`. A `message_delta` routinely repeats `input_tokens`,
+`cache_read_input_tokens` and `cache_creation_input_tokens` alongside the
+running output count.
+
+So the accumulator treats **all four** counters as a high-water mark **within**
+a message, and sums those marks **across** messages. Summing observations
+instead double-counts input and cache on every stream that reports usage more
+than once, and multiplies further with each additional delta. Because cache
+reads dominate an agent workload by an order of magnitude (the same fact that
+justifies splitting the columns in §7.1), a summing accumulator produces cost
+figures roughly twice as high as reality while looking entirely believable.
+
+An earlier revision of this section asserted that `message_start` carried the
+one-shot input and cache counts and that deltas carried only output. That was
+wrong, it was implemented, and the tests written from it encoded the same wrong
+premise so they could not fail on it. Two tests are therefore required, not one:
+a multi-delta stream must report the final output count rather than the sum of
+the running totals, **and** a delta that repeats `input_tokens` and
+`cache_read_input_tokens` must not double them.
 
 **Non-streaming responses count too.** The relay tees usage only when the
 response is `text/event-stream`, so a JSON response's `usage` object is never
