@@ -45,6 +45,10 @@ type Tokenizer struct {
 	// added holds the added tokens, which are matched literally in the input
 	// before the pretokenizer ever sees it.
 	added []addedToken
+	// ignoreMerges mirrors the file's model.ignore_merges: a whole pretokenized
+	// piece that is already a vocabulary entry is emitted as one token instead of
+	// having the merge list replayed over it. See checkIgnoreMerges.
+	ignoreMerges bool
 }
 
 // addedToken is one entry from the file's added_tokens.
@@ -67,9 +71,10 @@ type tokenizerFile struct {
 		Normalized bool   `json:"normalized"`
 	} `json:"added_tokens"`
 	Model struct {
-		Type   string         `json:"type"`
-		Vocab  map[string]int `json:"vocab"`
-		Merges []any          `json:"merges"`
+		Type         string         `json:"type"`
+		Vocab        map[string]int `json:"vocab"`
+		Merges       []any          `json:"merges"`
+		IgnoreMerges *bool          `json:"ignore_merges"`
 	} `json:"model"`
 }
 
@@ -86,6 +91,9 @@ func Load(path string) (*Tokenizer, error) {
 	if f.Model.Type != "BPE" {
 		return nil, fmt.Errorf("tokenizer: model type %q is not supported; only byte-level BPE is", f.Model.Type)
 	}
+	if err := checkIgnoreMerges(f.Model.IgnoreMerges); err != nil {
+		return nil, err
+	}
 	// A normalizer rewrites the input before tokenization, so offsets would no
 	// longer be positions in the caller's own string. Refusing is the only safe
 	// answer: the whole point of this package is that a span means exactly what
@@ -94,7 +102,11 @@ func Load(path string) (*Tokenizer, error) {
 		return nil, fmt.Errorf("tokenizer: file has a normalizer, which rewrites the input and would invalidate byte offsets: %s", trimForError(string(f.Normalizer)))
 	}
 
-	t := &Tokenizer{vocab: f.Model.Vocab, ranks: make(map[[2]string]int, len(f.Model.Merges))}
+	t := &Tokenizer{
+		vocab:        f.Model.Vocab,
+		ranks:        make(map[[2]string]int, len(f.Model.Merges)),
+		ignoreMerges: *f.Model.IgnoreMerges,
+	}
 	buildByteEncoder(&t.byteEncoder)
 
 	// merges is either ["a b", ...] or [["a","b"], ...] depending on the version
@@ -302,6 +314,43 @@ func checkPostProcessor(raw json.RawMessage) error {
 	return nil
 }
 
+// checkIgnoreMerges asserts model.ignore_merges is the value this implementation
+// was verified against.
+//
+// The flag tells the reference to short-circuit: if a whole pretokenized piece,
+// byte-level encoded, is already a vocabulary entry, it is emitted as that single
+// token and the merge list is never replayed over it. The two can disagree,
+// because a vocabulary can contain an entry that the merge list does not build —
+// so with the flag on, such a piece is one token, and with it off it is several.
+//
+// encodePiece implements the shortcut, so this package follows the flag rather
+// than relying on it not mattering. It is asserted anyway because the shortcut is
+// only correct when the file asks for it: a file with ignore_merges=false needs
+// pure merge replay, and taking the shortcut there would produce ids the model
+// was never given.
+//
+// Measured, not assumed: with the reference regenerated with ignore_merges
+// flipped to false and the whole 350-case corpus plus whole-word and
+// common-token probes re-encoded, there were 0 mismatches. So for this
+// vocabulary and merge-rank pair the flag is inert today, in the same spirit as
+// the pre_tokenizer trim_offsets exemption documented above. That measurement is
+// about one specific file, which is exactly why the value is pinned instead of
+// being treated as a detail that never matters.
+//
+// A missing field is refused rather than defaulted. The reference's own default
+// is false, so guessing would silently pick the opposite of what this file says,
+// and more importantly an absent value is not a verified value — the same reason
+// an absent trim_offsets is refused.
+func checkIgnoreMerges(v *bool) error {
+	if v == nil {
+		return fmt.Errorf("tokenizer: model has no ignore_merges field, so whether a whole-piece vocabulary hit short-circuits merge replay is unknown; re-run the tokenizer gate against this file")
+	}
+	if !*v {
+		return fmt.Errorf("tokenizer: model has ignore_merges=false; this implementation was verified against ignore_merges=true and short-circuits a whole piece that is already a vocabulary entry, which would produce different ids under false")
+	}
+	return nil
+}
+
 // isNullJSON reports whether raw is absent or the JSON null.
 func isNullJSON(raw json.RawMessage) bool {
 	s := strings.TrimSpace(string(raw))
@@ -428,6 +477,17 @@ func (t *Tokenizer) encodeSegment(seg string, base int, out *[]Token) error {
 // encodePiece BPEs one pretokenized piece, whose first byte is at offset base in
 // the original input, and appends its tokens with character-aligned spans.
 func (t *Tokenizer) encodePiece(piece string, base int, out *[]Token) error {
+	// model.ignore_merges: a piece that is already a vocabulary entry is that one
+	// token, with no merge replay. Doing this rather than assuming it is
+	// unreachable means the flag is implemented, not just measured as inert.
+	// A piece always begins and ends on a character boundary, so the span needs
+	// no widening.
+	if t.ignoreMerges {
+		if id, ok := t.vocab[t.encodeBytes(piece)]; ok {
+			*out = append(*out, Token{ID: id, Start: base, End: base + len(piece)})
+			return nil
+		}
+	}
 	// bounds holds the byte offset of every character start in the piece, plus
 	// its length, so a part's byte range can be widened to the characters it
 	// touches. Invalid UTF-8 bytes count as one character each, matching how Go

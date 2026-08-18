@@ -236,6 +236,18 @@ func TestLoadRejectsSettingsThatWouldShiftOffsets(t *testing.T) {
 		replace: `"invert": true`,
 		wantErr: "invert=true",
 	}, {
+		name:    "model ignore_merges flipped",
+		find:    `"ignore_merges": true`,
+		replace: `"ignore_merges": false`,
+		wantErr: "ignore_merges=false",
+	}, {
+		// An absent value is not a verified value, so it must be refused rather
+		// than defaulted to the reference's own default of false.
+		name:    "model ignore_merges absent",
+		find:    "\n    \"ignore_merges\": true,",
+		replace: "",
+		wantErr: "no ignore_merges field",
+	}, {
 		name:    "normalizer",
 		find:    `"normalizer": null`,
 		replace: `"normalizer": {"type": "NFKC"}`,
