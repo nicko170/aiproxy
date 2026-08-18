@@ -81,35 +81,26 @@ func TestResolveOnNothing(t *testing.T) {
 	}
 }
 
-// TestResolveStabilityWithinSameGroup verifies that when two findings in the same
-// detector group have identical span (Start/End) but different Rule/Label, the
-// order is stable and deterministic. Without sort stability, identical spans from
-// the same detector could reorder between runs, causing the prompt cache hit rate
-// to collapse. This test requires SliceStable; sort.Slice would produce
-// unpredictable output on large multi-element groups.
-func TestResolveStabilityWithinSameGroup(t *testing.T) {
-	// Create a large set of findings in the same group with identical spans to trigger
-	// introsort's quicksort path, making unstable sorts more likely to reorder.
-	labels := []Label{LabelSecret, LabelEmail, LabelPhone, LabelAddress, LabelPerson, LabelURL, LabelDate, LabelAccount, LabelID}
-	sameGroup := make([]Finding, 100)
-	for i := 0; i < 100; i++ {
-		sameGroup[i] = Finding{
-			Start: 5,
-			End:   15,
-			Label: labels[i%len(labels)],
-			Rule:  string(rune('a' + rune(i%10))),
-		}
+// TestResolveDeterminismViaRuleTiebreak verifies that when two findings in the
+// same detector group have identical span (Start/End) but different Rule, the
+// comparator's Rule tiebreak produces a deterministic result independent of input
+// order. One detector CAN report the same span twice — e.g., openai-key and
+// anthropic-key both match "sk-ant-..." — and the kept finding must be
+// deterministic by rule name, not by input position.
+func TestResolveDeterminismViaRuleTiebreak(t *testing.T) {
+	// Two findings with identical span, supplied in reverse alphabetical order.
+	// The comparator must pick by Rule, not by input order.
+	sameGroup := []Finding{
+		{Start: 5, End: 15, Label: LabelSecret, Rule: "b-rule"},
+		{Start: 5, End: 15, Label: LabelSecret, Rule: "a-rule"},
 	}
 
-	// Run multiple times to catch any nondeterminism.
-	for iter := 0; iter < 10; iter++ {
-		got := Resolve([][]Finding{sameGroup})
-		if len(got) != 1 {
-			t.Fatalf("iteration %d: expected 1 finding, got %d", iter, len(got))
-		}
-		// With stable sort, the first finding should always win.
-		if got[0].Rule != "a" {
-			t.Errorf("iteration %d: expected Rule 'a' (stable sort), got %q", iter, got[0].Rule)
-		}
+	got := Resolve([][]Finding{sameGroup})
+	if len(got) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(got))
+	}
+	// The comparator's Rule tiebreak orders by rule name, so "a-rule" < "b-rule".
+	if got[0].Rule != "a-rule" {
+		t.Errorf("expected Rule 'a-rule' (deterministic tiebreak), got %q", got[0].Rule)
 	}
 }

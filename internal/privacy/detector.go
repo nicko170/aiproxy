@@ -67,7 +67,15 @@ func Resolve(perDetector [][]Finding) []Finding {
 		if a.f.End != b.f.End {
 			return a.f.End > b.f.End // longer first
 		}
-		return a.idx < b.idx
+		if a.idx != b.idx {
+			return a.idx < b.idx
+		}
+		// Rule is the final tiebreak, so no two findings are ever "equal" to the
+		// comparator and the result cannot depend on the sort's stability. One
+		// detector CAN report the same span twice — openai-key and anthropic-key
+		// both match an sk-ant-... value — and without this the kept finding is
+		// whichever the sort happened to leave first.
+		return a.f.Rule < b.f.Rule
 	})
 
 	out := make([]Finding, 0, len(all))
