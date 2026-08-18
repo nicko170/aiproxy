@@ -91,6 +91,46 @@ func TestRulesDetectCredentialsInAURL(t *testing.T) {
 	}
 }
 
+// A colon-separated id:secret pair must still fire even though a
+// digest-shaped allowlist entry also uses a colon. An NTLM LM:NT hash pair is
+// directly usable for pass-the-hash, and a Twilio-style
+// ACCOUNT_SID:AUTH_TOKEN is the exact shape Twilio's own docs use for Basic
+// Auth (`curl -u SID:TOKEN`) — neither is a digest, and the allowlist's
+// algorithm-name enumeration must not match either.
+func TestRulesDetectColonSeparatedCredentials(t *testing.T) {
+	cases := []struct{ name, text string }{
+		{"ntlm hash pair", `password: aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := scan(t, c.text)
+			if len(got) == 0 {
+				t.Errorf("no finding for %q; a real credential must fire even though it contains a colon", c.text)
+			}
+		})
+	}
+}
+
+// TestAllowedRejectsColonSeparatedCredentialShapes guards the allowlist half
+// of the fix directly: Allowed must not itself call a colon-separated
+// id:secret pair benign, independent of whether any current rule's keyword
+// list happens to capture it end to end. See the fix-round-2 report for why
+// the Twilio fixture below is not also asserted through Scan: as written
+// (two runs of a single repeated character) it measures ~1.29 bits/byte,
+// under the frozen 3.0 MinEntropy floor, and no keyword in the
+// assigned-credential rule contains "auth" — neither of which this task
+// authorized changing.
+func TestAllowedRejectsColonSeparatedCredentialShapes(t *testing.T) {
+	for _, s := range []string{
+		"aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+		"ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	} {
+		if Allowed(s) {
+			t.Errorf("Allowed(%q) = true; a colon-separated credential pair must not be allowlisted", s)
+		}
+	}
+}
+
 // False positives are the failure mode that makes the filter unusable: a
 // redacted commit SHA breaks the agent's reasoning about history for no gain.
 func TestRulesDoNotFireOnBenignHighEntropyStrings(t *testing.T) {

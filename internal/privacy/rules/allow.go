@@ -30,9 +30,16 @@ var allowRes = []*regexp.Regexp{
 	// value class (anything 12+ chars with no comma/quote/space/semicolon) does
 	// not exclude the colon, so this shape is otherwise indistinguishable from a
 	// real assignment. Redacting it destroys real context for no privacy gain,
-	// since a digest is not a secret. Anchored at both ends so this cannot
+	// since a digest is not a secret.
+	//
+	// The prefix MUST be an enumerated set of algorithm names, never an open
+	// character class: hex digits are a subset of [a-z0-9_-], so an open class
+	// would also allowlist any hex:hex or word:hex pair of the right lengths —
+	// which is exactly the shape of an NTLM LM:NT hash pair (directly usable for
+	// pass-the-hash) and of several vendors' id:secret Basic-Auth tokens (e.g.
+	// Twilio's ACCOUNT_SID:AUTH_TOKEN). Anchored at both ends so this cannot
 	// swallow anything else.
-	regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]*:[0-9a-f]{32,128}$`),
+	regexp.MustCompile(`(?i)^(?:md5|sha1|sha224|sha256|sha384|sha512|sha3-256|sha3-512|blake2b|blake2s|blake3|crc32|xxh64):[0-9a-f]{32,128}$`),
 	// semver, with optional prerelease and build metadata
 	regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`),
 	// RFC 2606 / RFC 6761 reserved names, and RFC 5737 documentation addresses
