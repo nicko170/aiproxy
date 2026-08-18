@@ -119,6 +119,32 @@ func truncate(s string, width int) string {
 	return string(r[:width-1]) + "…"
 }
 
+// wrapURL hard-wraps s into lines of at most width runes each. Unlike
+// truncate, nothing is ever cut: concatenating the returned lines
+// reconstructs s exactly. This is for content like a URL that has no spaces
+// to word-wrap on and must stay fully present and selectable on screen
+// rather than end in an ellipsis. width below 1 is treated as 1; an empty s
+// yields a single empty line, never zero lines.
+func wrapURL(s string, width int) []string {
+	if width < 1 {
+		width = 1
+	}
+	r := []rune(s)
+	if len(r) == 0 {
+		return []string{""}
+	}
+	lines := make([]string, 0, (len(r)+width-1)/width)
+	for len(r) > 0 {
+		n := width
+		if n > len(r) {
+			n = len(r)
+		}
+		lines = append(lines, string(r[:n]))
+		r = r[n:]
+	}
+	return lines
+}
+
 // padRight pads (or truncates) s to exactly width cells.
 func padRight(s string, width int) string {
 	s = truncate(s, width)

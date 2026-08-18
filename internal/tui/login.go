@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -44,10 +43,22 @@ func (m Model) startLogin() (tea.Model, tea.Cmd) {
 	ti.Focus()
 	m.login = loginState{active: true, code: ti}
 	src := m.src
-	parent := m.ctx
+	// The flow's context lifetime is the session, not this call: src.Login
+	// returns as soon as its loopback listener is bound, long before the
+	// user has even looked at the URL, let alone opened a browser. Wrapping
+	// it in fetchTimeout (meant for quick read/write queries) used to cancel
+	// the flow's context the instant this command returned — and since the
+	// flow now correctly treats a cancelled parent as a real termination
+	// (see loginFlow.awaitTimeout), that surfaced as an immediate "context
+	// cancelled" in the pane instead of a working login. m.ctx — the app's
+	// root context, live for the pane's whole lifetime — is what the flow
+	// needs; it already enforces its own two-minute timeout internally, so
+	// no outer one is needed here. esc (loginKey) and updateLogin's
+	// loginStartedMsg branch still cancel the session explicitly on their
+	// own paths; this only changes how long the context backing Login
+	// itself survives.
+	ctx := m.ctx
 	return m, func() tea.Msg {
-		ctx, cancel := context.WithTimeout(parent, fetchTimeout)
-		defer cancel()
 		sess, err := src.Login(ctx, "anthropic")
 		return loginStartedMsg{sess: sess, err: err}
 	}
@@ -157,8 +168,16 @@ func (m Model) viewLogin(h int) string {
 	if l.sess.URL == "" && l.err == "" {
 		b.WriteString(th.dim("starting the login flow…") + "\n")
 	} else if l.sess.URL != "" {
-		b.WriteString(th.dim("1.") + " open this url " + th.dim("(ctrl+o opens it for you)") + "\n")
-		b.WriteString("   " + th.accent(truncate(l.sess.URL, max(20, m.width-16))) + "\n\n")
+		b.WriteString(th.dim("1.") + " open this url " + th.dim("(ctrl+o opens it — or select and copy the text below)") + "\n")
+		// Hard-wrap, never truncate: a URL has no spaces to word-wrap on,
+		// and a truncated authorize URL can be neither clicked nor pasted.
+		// Each line also carries its own OSC 8 hyperlink (degraded away by
+		// theme.hyperlink when the terminal cannot use it), since most
+		// terminals' own URL detection breaks at a line boundary.
+		for _, line := range wrapURL(l.sess.URL, max(20, m.width-16)) {
+			b.WriteString("   " + th.accent(th.hyperlink(l.sess.URL, line)) + "\n")
+		}
+		b.WriteString("\n")
 		b.WriteString(th.dim("2.") + " approve access in the browser\n\n")
 		b.WriteString(th.dim("3.") + " if the browser cannot reach this machine, paste the code:\n")
 		b.WriteString("   " + l.code.View() + "\n\n")

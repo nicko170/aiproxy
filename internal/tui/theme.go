@@ -5,6 +5,8 @@ import (
 	"hash/fnv"
 	"os"
 	"strings"
+
+	"github.com/charmbracelet/x/term"
 )
 
 // colorMode is how much colour the terminal gets. The theme degrades
@@ -42,6 +44,28 @@ func detectColorMode() colorMode {
 		return mode256
 	}
 	return mode16
+}
+
+// isTerminal reports whether stdout is a real TTY. It is a var, not a
+// direct call, so tests can force both branches without a real terminal
+// attached to the test binary (which under `go test` there never is).
+var isTerminal = func() bool { return term.IsTerminal(os.Stdout.Fd()) }
+
+// detectHyperlinkSupport reports whether stdout can be trusted with an OSC 8
+// hyperlink escape. It reuses detectColorMode's two environment checks
+// (NO_COLOR, TERM=dumb) — the same signals mean the same thing here: the
+// user or the environment has asked for no escape sequences — and adds the
+// one thing colour degradation does not need: a real TTY, since OSC 8
+// written into a pipe, a log file, or a redirected file is either inert or
+// actively wrong.
+func detectHyperlinkSupport() bool {
+	if os.Getenv("NO_COLOR") != "" {
+		return false
+	}
+	if os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	return isTerminal()
 }
 
 // color is one palette entry with an explicit value per colour mode. c16 is
@@ -95,10 +119,11 @@ const (
 // singleton, so tests construct one per mode and golden frames are
 // deterministic.
 type theme struct {
-	mode colorMode
+	mode       colorMode
+	hyperlinks bool
 }
 
-func newTheme() theme { return theme{mode: detectColorMode()} }
+func newTheme() theme { return theme{mode: detectColorMode(), hyperlinks: detectHyperlinkSupport()} }
 
 // sgr wraps s in one SGR sequence. modeNone returns s untouched — under
 // NO_COLOR the output carries no escape at all, not an empty one.
@@ -126,6 +151,20 @@ func (t theme) fgCode(c color) string {
 }
 
 func (t theme) fg(c color, s string) string { return t.sgr(s, t.fgCode(c)) }
+
+// hyperlink wraps text in an OSC 8 sequence pointing at url, for terminals
+// that turn it into a genuinely clickable link (iTerm2, WezTerm, Kitty,
+// Ghostty…), when t.hyperlinks says the terminal can be trusted with one;
+// otherwise text passes through completely unchanged. The visible text this
+// produces is identical either way — the escape only adds clickability, it
+// never changes what is rendered — so a caller may wrap the result in sgr
+// styling exactly as it would the plain text.
+func (t theme) hyperlink(url, text string) string {
+	if !t.hyperlinks || url == "" || text == "" {
+		return text
+	}
+	return "\x1b]8;;" + url + "\x1b\\" + text + "\x1b]8;;\x1b\\"
+}
 
 func (t theme) ok(s string) string     { return t.fg(colOK, s) }
 func (t theme) warn(s string) string   { return t.fg(colWarn, s) }

@@ -15,6 +15,13 @@ import (
 
 var update = flag.Bool("update", false, "rewrite golden frames")
 
+// fixtureLoginURL is a realistically long OAuth authorize URL (the real
+// thing carries a client_id, redirect_uri, scope list, PKCE challenge, and
+// state, and easily runs past any terminal's width) — long enough that the
+// login frame at every golden width actually exercises wrapping rather than
+// happening to fit on one line.
+const fixtureLoginURL = "https://claude.ai/oauth/authorize?client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&redirect_uri=http%3A%2F%2F127.0.0.1%2F54231%2Fcallback&response_type=code&scope=org%3Acreate_api_key%20user%3Aprofile%20user%3Ainference&state=abcdefghijklmnopqrstuvwxyzABCDEF12345678"
+
 // fixtureNow is the fixed instant every frame renders at.
 var fixtureNow = time.Date(2026, 8, 17, 14, 30, 0, 0, time.UTC)
 
@@ -195,7 +202,7 @@ func frameCases() map[string]func(w, h int) Model {
 		"login": func(w, h int) Model {
 			m := fixtureModel(w, h)
 			m, _ = mustModel(m.startLogin())
-			m.login.sess = view.LoginSession{URL: "https://claude.ai/oauth/authorize?code_challenge=…"}
+			m.login.sess = view.LoginSession{URL: fixtureLoginURL}
 			return m
 		},
 	}

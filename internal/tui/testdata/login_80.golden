@@ -2,26 +2,26 @@
   1 overview   2 activity   3 usage   4 accounts   5 settings                   
 ────────────────────────────────────────────────────────────────────────────────
                                                                                 
-                                                                                
-                                                                                
-                                                                                
-      ╭──────────────────────────────────────────────────────────────────╮      
-      │                                                                  │      
-      │   log in with Anthropic                                          │      
-      │                                                                  │      
-      │   1. open this url (ctrl+o opens it for you)                     │      
-      │      https://claude.ai/oauth/authorize?code_challenge=…          │      
-      │                                                                  │      
-      │   2. approve access in the browser                               │      
-      │                                                                  │      
-      │   3. if the browser cannot reach this machine, paste the code:   │      
-      │      paste the code here                                         │      
-      │                                                                  │      
-      │   waiting for the browser or a pasted code…                      │      
-      │                                                                  │      
-      ╰──────────────────────────────────────────────────────────────────╯      
-                                                                                
-                                                                                
+ ╭────────────────────────────────────────────────────────────────────────────╮ 
+ │                                                                            │ 
+ │   log in with Anthropic                                                    │ 
+ │                                                                            │ 
+ │   1. open this url (ctrl+o opens it — or select and copy the text below)   │ 
+ │      https://claude.ai/oauth/authorize?client_id=9d1c250a-e61b-44d9-8      │ 
+ │      8ed-5944d1962f5e&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URW      │ 
+ │      buGJSstw-cM&code_challenge_method=S256&redirect_uri=http%3A%2F%2      │ 
+ │      F127.0.0.1%2F54231%2Fcallback&response_type=code&scope=org%3Acre      │ 
+ │      ate_api_key%20user%3Aprofile%20user%3Ainference&state=abcdefghij      │ 
+ │      klmnopqrstuvwxyzABCDEF12345678                                        │ 
+ │                                                                            │ 
+ │   2. approve access in the browser                                         │ 
+ │                                                                            │ 
+ │   3. if the browser cannot reach this machine, paste the code:             │ 
+ │      paste the code here                                                   │ 
+ │                                                                            │ 
+ │   waiting for the browser or a pasted code…                                │ 
+ │                                                                            │ 
+ ╰────────────────────────────────────────────────────────────────────────────╯ 
                                                                                 
                                                                                 
 
