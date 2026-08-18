@@ -135,3 +135,128 @@ func TestClassifyParsesQuotaBuckets(t *testing.T) {
 		t.Errorf("Status = %q", b.Status)
 	}
 }
+
+// liveUnifiedHeaders is the exact anthropic-ratelimit-unified-* header set
+// captured from a healthy production account on a successful request. Most of
+// it is metadata, not quota windows: only "5h" and "7d" describe an allowance.
+//
+// Treating the rest as windows caused an outage. "overage-status: rejected"
+// says overage billing is disabled for the organisation — as the sibling
+// "overage-disabled-reason: org_level_disabled" states outright, and as is the
+// default for most orgs — yet it arrived at account selection as a rejected,
+// unscoped bucket and made the account permanently ineligible after its first
+// successful response.
+func liveUnifiedHeaders() map[string]string {
+	return map[string]string{
+		"anthropic-ratelimit-unified-5h-status":               "allowed",
+		"anthropic-ratelimit-unified-5h-utilization":          "0.0",
+		"anthropic-ratelimit-unified-5h-reset":                "1787025600",
+		"anthropic-ratelimit-unified-7d-status":               "allowed",
+		"anthropic-ratelimit-unified-7d-utilization":          "0.07",
+		"anthropic-ratelimit-unified-7d-reset":                "1787446800",
+		"anthropic-ratelimit-unified-fallback-percentage":     "0.5",
+		"anthropic-ratelimit-unified-overage-status":          "rejected",
+		"anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+		"anthropic-ratelimit-unified-representative-claim":    "five_hour",
+		"anthropic-ratelimit-unified-reset":                   "1787025600",
+		"anthropic-ratelimit-unified-status":                  "allowed",
+	}
+}
+
+func TestClassifyKeepsOnlyRealWindowsFromLiveHeaders(t *testing.T) {
+	out := Classify(resp(200, liveUnifiedHeaders()))
+
+	if out.Kind != provider.OutcomeOK {
+		t.Errorf("Kind = %v, want OutcomeOK", out.Kind)
+	}
+
+	got := map[string]provider.QuotaBucket{}
+	for _, b := range out.Buckets {
+		if _, dup := got[b.Name]; dup {
+			t.Errorf("bucket %q emitted twice", b.Name)
+		}
+		got[b.Name] = b
+	}
+
+	// Metadata sharing the header prefix must never become a bucket: an
+	// unscoped bucket binds every model, and "overage" carried "rejected".
+	for _, name := range []string{"overage", "overage-disabled", "representative", "fallback"} {
+		if b, ok := got[name]; ok {
+			t.Errorf("bucket %q is metadata, not a quota window (parsed as %+v)", name, b)
+		}
+	}
+
+	want := map[string]provider.QuotaBucket{
+		"5h": {Name: "5h", Status: "allowed", Utilization: 0, ResetsAt: 1787025600_000},
+		"7d": {Name: "7d", Status: "allowed", Utilization: 0.07 / 100, ResetsAt: 1787446800_000},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsed %d buckets %v, want exactly %d (5h and 7d)", len(got), out.Buckets, len(want))
+	}
+	for name, w := range want {
+		g, ok := got[name]
+		if !ok {
+			t.Fatalf("bucket %q missing; parsed %+v", name, out.Buckets)
+		}
+		if g.Name != w.Name || g.Status != w.Status || g.ResetsAt != w.ResetsAt {
+			t.Errorf("bucket %q = %+v, want %+v", name, g, w)
+		}
+		if diff := g.Utilization - w.Utilization; diff > 1e-12 || diff < -1e-12 {
+			t.Errorf("bucket %q Utilization = %v, want %v", name, g.Utilization, w.Utilization)
+		}
+	}
+}
+
+func TestParseBucketsIgnoresNonWindowNames(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+		want   bool // want a bucket emitted
+	}{
+		{"plain window", "anthropic-ratelimit-unified-5h-status", true},
+		{"multi digit window", "anthropic-ratelimit-unified-30d-status", true},
+		{"model scoped window", "anthropic-ratelimit-unified-7d_oi-status", true},
+		{"overage metadata", "anthropic-ratelimit-unified-overage-status", false},
+		{"hyphenated metadata", "anthropic-ratelimit-unified-overage-disabled-reason", false},
+		{"representative claim", "anthropic-ratelimit-unified-representative-claim", false},
+		{"fallback percentage", "anthropic-ratelimit-unified-fallback-percentage", false},
+		// The overall unified values carry no window name at all. Dropping
+		// them is deliberate: eligibility is decided per window.
+		{"overall status", "anthropic-ratelimit-unified-status", false},
+		{"overall reset", "anthropic-ratelimit-unified-reset", false},
+		// A field we cannot read must not mint a phantom window either.
+		{"unknown field on a window", "anthropic-ratelimit-unified-5h-flavour", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseBuckets(resp(200, map[string]string{tc.header: "rejected"}).Header)
+			if (len(got) > 0) != tc.want {
+				t.Errorf("parseBuckets(%s) = %+v, want emitted=%v", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
+// A model-scoped window is a real window and must survive the metadata filter,
+// carrying its scope so Classify reports it as scoped rather than general.
+func TestClassifyKeepsModelScopedWindow(t *testing.T) {
+	out := Classify(resp(429, map[string]string{
+		"anthropic-ratelimit-unified-7d_oi-status":         "rejected",
+		"anthropic-ratelimit-unified-7d_oi-utilization":    "100",
+		"anthropic-ratelimit-unified-overage-status":       "rejected",
+		"anthropic-ratelimit-unified-representative-claim": "seven_day",
+	}))
+
+	if out.Kind != provider.OutcomeQuotaRejected {
+		t.Errorf("Kind = %v, want OutcomeQuotaRejected", out.Kind)
+	}
+	if out.ScopedModel != "7d_oi" {
+		t.Errorf("ScopedModel = %q, want %q — a metadata bucket must not turn a scoped rejection into a general one", out.ScopedModel, "7d_oi")
+	}
+	if len(out.Buckets) != 1 || out.Buckets[0].Name != "7d_oi" {
+		t.Fatalf("Buckets = %+v, want exactly 7d_oi", out.Buckets)
+	}
+	if out.Buckets[0].Utilization != 1 {
+		t.Errorf("Utilization = %v, want 1", out.Buckets[0].Utilization)
+	}
+}

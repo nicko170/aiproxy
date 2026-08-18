@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -10,6 +11,30 @@ import (
 )
 
 const bucketPrefix = "anthropic-ratelimit-unified-"
+
+// windowName matches the name of a genuine quota window: a duration — one or
+// more digits then a unit — optionally carrying a model scope ("5h", "7d",
+// "7d_oi").
+//
+// The upstream publishes more than windows under the shared
+// "anthropic-ratelimit-unified-" prefix. A live response also carries
+// "overage-status", "overage-disabled-reason", "representative-claim" and
+// "fallback-percentage", none of which describe an allowance. Admitting them
+// as buckets caused a production outage: "overage-status: rejected" reports
+// that overage *billing* is disabled for the organisation — the default for
+// most orgs, restated by the sibling "overage-disabled-reason" — but it
+// reached account selection as a rejected, unscoped bucket and made every
+// account permanently ineligible after its first successful response.
+//
+// Windows are therefore recognised by shape, not by blacklisting the metadata
+// names seen today, so a metadata header added upstream tomorrow cannot
+// resurrect this. The leading digit is the discriminator; the unit is allowed
+// more than one letter so a future "30min" or "1mo" window still parses.
+var windowName = regexp.MustCompile(`^[0-9]+[a-z]+(_[a-z0-9]+)*$`)
+
+// isWindowName reports whether a parsed bucket name is a quota window rather
+// than metadata that merely shares the header prefix.
+func isWindowName(name string) bool { return windowName.MatchString(name) }
 
 // Classify maps an upstream response to an Outcome. It is pure: no network, no
 // clock, no state, so every rate-limit shape is a table test.
@@ -94,10 +119,19 @@ func isModelScoped(name string) bool {
 	return strings.Contains(name, "_")
 }
 
-// parseBuckets collects anthropic-ratelimit-unified-<name>-<field> headers into
-// one QuotaBucket per <name>.
+// parseBuckets collects anthropic-ratelimit-unified-<window>-<field> headers
+// into one QuotaBucket per <window>.
+//
+// Only genuine quota windows become buckets, and only when at least one field
+// carried a usable value: everything else in this header namespace is metadata
+// that must never be presented to account selection as an allowance.
 func parseBuckets(h http.Header) []provider.QuotaBucket {
 	byName := map[string]*provider.QuotaBucket{}
+	// usable records that a window contributed at least one field we could
+	// read. Without it a stray "anthropic-ratelimit-unified-5h-anything"
+	// header would mint a phantom window with no status, no utilization and
+	// no reset, which selection would then have to reason about.
+	usable := map[string]bool{}
 	order := []string{}
 
 	for key := range h {
@@ -108,32 +142,51 @@ func parseBuckets(h http.Header) []provider.QuotaBucket {
 		rest := lower[len(bucketPrefix):]
 		idx := strings.LastIndex(rest, "-")
 		if idx <= 0 {
+			// No window name, just a field: "anthropic-ratelimit-unified-status"
+			// and "-reset" are the overall unified values for the account as a
+			// whole. Dropping them is deliberate. Eligibility is decided per
+			// window, and a nameless bucket carries no window to decide about —
+			// it would bind every model while duplicating whichever real window
+			// the upstream currently considers representative.
 			continue
 		}
 		name, field := rest[:idx], rest[idx+1:]
+		if !isWindowName(name) {
+			continue
+		}
 
+		value := strings.TrimSpace(h.Get(key))
 		b, ok := byName[name]
 		if !ok {
 			b = &provider.QuotaBucket{Name: name}
 			byName[name] = b
 			order = append(order, name)
 		}
-		value := strings.TrimSpace(h.Get(key))
 		switch field {
 		case "status":
-			b.Status = value
+			if value != "" {
+				b.Status = value
+				usable[name] = true
+			}
 		case "utilization":
 			// Reported as a percentage; stored as a 0..1 fraction.
 			if f, err := strconv.ParseFloat(value, 64); err == nil {
 				b.Utilization = f / 100
+				usable[name] = true
 			}
 		case "reset":
-			b.ResetsAt = toUnixMillis(value)
+			if ms := toUnixMillis(value); ms != 0 {
+				b.ResetsAt = ms
+				usable[name] = true
+			}
 		}
 	}
 
 	out := make([]provider.QuotaBucket, 0, len(order))
 	for _, name := range order {
+		if !usable[name] {
+			continue
+		}
 		out = append(out, *byName[name])
 	}
 	return out
