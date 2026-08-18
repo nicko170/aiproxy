@@ -45,10 +45,15 @@ type RelayOptions struct {
 	// once the body ends.
 	ParseBody func(body []byte) (*provider.UsageDelta, bool)
 	// Restore rewrites the response stream, substituting plaintext back for the
-	// placeholders the request carried. Nil — the default, and the only value
-	// when the privacy filter is disabled — leaves the write path below exactly
-	// as it was: chunks go straight to the client with no accumulation, which is
-	// what keeps the filter free when it is off.
+	// placeholders the request carried. Nil leaves the write path below exactly
+	// as it was: chunks go straight to the client with no accumulation.
+	//
+	// Nil is the value not only when the filter is disabled but whenever the
+	// request redacted nothing — see attempt.relay, which arms this only for a
+	// non-empty restore table. That distinction is property 3: an armed restorer
+	// buffers to the next event terminator, so arming one that provably cannot
+	// resolve anything would turn a token stream into a batch for the majority
+	// of requests.
 	Restore *privacy.Restorer
 }
 

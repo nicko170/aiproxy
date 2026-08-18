@@ -127,7 +127,11 @@ func New(o Options) (*Detector, error) {
 	}
 	// Whether the assets are actually on disk is the difference between "run
 	// aiproxy privacy install" and "ready, not yet used", and that distinction is
-	// surfaced in view.Status.Privacy.ModelState and rendered in the TUI. It can
+	// surfaced in view.Status.Privacy.ModelState, which the control API serves
+	// and "aiproxy privacy status" answers from disk. The TUI does NOT render
+	// the state string — it renders the consequence instead: a filter that
+	// cannot load its model fails its scans, and that shows up in the header as
+	// a filter error or an unfiltered count. It can
 	// only be answered by verifying digests, which costs a full read of ~850MB —
 	// measured at 350-640ms on an SSD, since SHA256 is hardware-accelerated.
 	// Paid synchronously and once, on a path that only runs when an operator has

@@ -18,6 +18,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/dlclark/regexp2"
@@ -164,6 +165,15 @@ func Load(path string) (*Tokenizer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tokenizer: compile pretokenizer: %w", err)
 	}
+	// regexp2 is a BACKTRACKING engine — that is why it is here, since the o200k
+	// pattern needs lookahead that RE2 cannot express — and it runs on request
+	// content. The shipped pattern is not known to backtrack pathologically, but
+	// "not known to" is not a bound, and the input is attacker-influenced by
+	// construction. Both call sites already handle a match error, so this turns a
+	// hypothetical wedged goroutine into an ordinary scan failure that
+	// onScanFailure governs. Generous enough never to fire on real text: the
+	// model tier's own per-string budget is ~520ms at the 4 KB default.
+	re.MatchTimeout = 5 * time.Second
 	t.split = re
 	return t, nil
 }

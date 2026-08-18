@@ -57,10 +57,10 @@ type Options struct {
 	// are microseconds, the model is not.
 	ScanTimeout time.Duration
 	// ModelState reports the NER model's readiness, e.g. "loading" or "ready".
-	// Nil until a model is wired in (Task 18), in which case Filter.ModelState
-	// reports "off" — a filter running deterministic rules only is fully
-	// functional, and reporting "absent" would imply something is missing
-	// that is not.
+	// Nil when no NER label is enabled — the common case, since every label is
+	// opt-in — in which case Filter.ModelState reports "off": a filter running
+	// deterministic rules only is fully functional, and reporting "absent" would
+	// imply something is missing that is not.
 	ModelState func() string
 }
 

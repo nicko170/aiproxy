@@ -67,6 +67,13 @@ func (c *Cache) key(text string) string {
 // Get returns the cached findings for text. A cached EMPTY result is a hit, not a
 // miss — most strings contain nothing sensitive, so caching "clean" is where most
 // of the saving comes from.
+//
+// The returned slice is a COPY. No caller mutates it today, but this cache is
+// shared by every in-flight request and lives for the process: a future caller
+// appending to a short-capacity slice would write through into the cached entry
+// and corrupt findings for every later request that hits the same string, with
+// no symptom until the wrong bytes get spliced. The copy is nil for the empty
+// case, which is almost every entry, so this costs nothing where it matters.
 func (c *Cache) Get(text string) ([]Finding, bool) {
 	k := c.key(text)
 	c.mu.Lock()
@@ -76,7 +83,11 @@ func (c *Cache) Get(text string) ([]Finding, bool) {
 		return nil, false
 	}
 	c.lru.MoveToFront(el)
-	return el.Value.(*cacheEntry).findings, true
+	stored := el.Value.(*cacheEntry).findings
+	if len(stored) == 0 {
+		return nil, true
+	}
+	return append([]Finding(nil), stored...), true
 }
 
 // Put records findings for text, evicting the least recently used entry if the

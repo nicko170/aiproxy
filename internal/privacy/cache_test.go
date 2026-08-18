@@ -143,3 +143,24 @@ func TestNewCacheClampsANonPositiveBound(t *testing.T) {
 		t.Error("a zero bound disabled the cache entirely; it should clamp to a usable default")
 	}
 }
+
+// The cache is shared by every in-flight request and lives for the process, so a
+// caller that appends to what Get returned must not be able to write through
+// into the stored entry.
+func TestCacheGetReturnsACopy(t *testing.T) {
+	c := NewCache(8, "salt")
+	c.Put("text", []Finding{{Start: 0, End: 4, Label: LabelSecret, Rule: "r"}})
+
+	got, ok := c.Get("text")
+	if !ok || len(got) != 1 {
+		t.Fatalf("Get = %v, %v", got, ok)
+	}
+	got[0].Label = LabelEmail
+	grown := append(got, Finding{Start: 9, End: 12})
+	grown[0].Start = 99
+
+	again, _ := c.Get("text")
+	if len(again) != 1 || again[0].Label != LabelSecret {
+		t.Errorf("the cached entry was mutated through Get's return value: %v", again)
+	}
+}

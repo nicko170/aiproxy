@@ -41,12 +41,16 @@ type Status struct {
 // PrivacyStatus is the privacy filter's state and counters.
 type PrivacyStatus struct {
 	Enabled bool `json:"enabled"`
-	// ModelState is off, absent, downloading, installed, loading, ready, or
-	// error. The distinctions carry different messages: "absent" means fetch the
-	// assets, "installed" means they are present and verified but no scan has
-	// needed the session yet (loading is lazy, so this is the steady state of a
-	// correctly installed model on an idle proxy), and "error" means the install
-	// is broken.
+	// ModelState is off, absent, installed, loading, ready, or error. The
+	// distinctions carry different messages: "absent" means fetch the assets,
+	// "installed" means they are present and verified but no scan has needed the
+	// session yet (loading is lazy, so this is the steady state of a correctly
+	// installed model on an idle proxy), and "error" means the install is
+	// broken.
+	//
+	// There is no "downloading": the assets are fetched by "aiproxy privacy
+	// install", which is a CLI path with its own progress output, and never by
+	// the running server, so no writer here could ever report one.
 	//
 	// There is no download-progress field. The design sketched one, but the
 	// model is fetched by "aiproxy privacy install" — a CLI path with its own

@@ -11,8 +11,11 @@ import (
 type Finding struct {
 	Start, End int
 	Label      Label
-	// Rule names what fired, for the Activity feed and the logs. It is
-	// diagnostic, never load-bearing.
+	// Rule names what fired. Diagnostic only, and narrower than it looks: it is
+	// the final tiebreak in Resolve, it appears in the error a bad span
+	// produces, and that is all. No UI surface reports it — the Activity feed
+	// renders metrics rows, which carry no per-finding detail — so do not treat
+	// it as a display string.
 	Rule string
 	// Confidence is 1.0 for deterministic rules and the model's score for NER
 	// findings. Nothing filters on it today; it exists so a future threshold is

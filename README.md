@@ -102,24 +102,25 @@ they leave your machine, replacing each match with a stable placeholder and
 restoring the original value in the response so the agent never sees the
 substitution. **It is off by default.**
 
-**All four of `privacy.enabled`, `onScanFailure`, `onUnresolvedPlaceholder`,
-and `denylist` take effect on restart, not immediately** — the detector set,
-the cache's salt, and (when the model is configured) its session are all
-built once at startup, the same way `update.checkIntervalHours` is. Flipping
-`enabled` on does **not** turn on protection for the request you send next;
-it schedules protection for after you restart aiproxy. `enabled` and
-`denylist` are editable from the Settings screen, and it marks each one
-`saved · restart to apply` the moment you change it, so you're not left
-guessing there. `onScanFailure` and `onUnresolvedPlaceholder` have no
-Settings-screen row yet — edit them in `config.json` or through
-`POST /_aiproxy/api/v1/settings` — and nothing in the TUI will tell you a
-restart is pending for those two. Either way: restart before you trust it.
+**Every key under `privacy` takes effect on restart, not immediately** — the
+detector set, the allowlist and denylist, the failure modes, the cache's salt,
+and (when the model is configured) its session are all built once at startup,
+the same way `update.checkIntervalHours` is. Flipping `enabled` on does **not**
+turn on protection for the request you send next; it schedules protection for
+after you restart aiproxy. `enabled` and `denylist` are editable from the
+Settings screen, and it marks each one `saved · restart to apply` the moment you
+change it, so you're not left guessing there. `onScanFailure`,
+`onUnresolvedPlaceholder` and `scanTimeoutMS` have no Settings-screen row yet —
+edit them in `config.json` or through `POST /_aiproxy/api/v1/settings` — and
+nothing in the TUI will tell you a restart is pending for those three. Either
+way: restart before you trust it.
 
 ```json
 "privacy": {
   "enabled": false,
   "onScanFailure": "closed",
   "onUnresolvedPlaceholder": "passthrough",
+  "scanTimeoutMS": 10000,
   "rules": { "builtinSecrets": true, "entropy": true },
   "denylist": [],
   "allowlistExtra": [],
@@ -188,11 +189,26 @@ still caught.
 ### Failure modes
 
 `onScanFailure` (default `closed`) governs the request side: if the filter
-can't scan a request — the model isn't installed, a detector errors, times
-out — `closed` refuses the request rather than sending it upstream
-unfiltered, because a privacy filter that silently degrades is worse than no
-filter: you'd believe you were protected exactly when you weren't. Setting it
-to `open` sends the request unfiltered and records that it happened.
+can't scan a request — the model isn't installed, a detector errors, the scan
+runs past `scanTimeoutMS` — `closed` refuses the request rather than sending it
+upstream unfiltered, because a privacy filter that silently degrades is worse
+than no filter: you'd believe you were protected exactly when you weren't.
+Setting it to `open` sends the request unfiltered and records that it happened.
+
+Either way it is recorded, and that recording is the point: the header shows
+`⊘ filter error` while a scan is failing, and `⊘ 3 unfiltered` for as long as
+the session has sent anything upstream unscanned. Both outrank the redaction
+count in the header, because a count is reassurance and you should never be
+shown reassurance in place of a fault.
+
+`scanTimeoutMS` (default 10000) bounds the whole request's scan. It is the only
+ceiling on the latency the filter adds — scanning happens before the retry loop,
+so `retry.budgetMS` doesn't cover it, and `ner.maxScanBytes` bounds one string
+rather than one request. With the model tier off (the default) the rules are
+microseconds and this never fires. With it on, 10 s is roughly nineteen
+freshly-seen 4 KB strings; past that the scan expires and `onScanFailure`
+decides what happens. Raise it if you'd rather wait than refuse. There's no
+"unbounded" value: a 0 is read as unset and replaced by the default.
 
 `onUnresolvedPlaceholder` (default `passthrough`) governs the response side:
 if a response contains a placeholder that isn't in this request's restore
@@ -202,14 +218,35 @@ into your files. Setting it to `error` severs the stream instead.
 
 ### What is and isn't protected
 
-Deterministic rules catch credentials and other pattern-matched or
-high-entropy secrets and identifiers, anywhere in a request, regardless of
-size. The NER model, where enabled, catches prose PII like names and contact
+Deterministic rules catch credentials and internal identifiers, anywhere in a
+request, regardless of size: recognised vendor token formats, PEM blocks, JWTs,
+connection strings, credential-shaped assignments, and your own `denylist`
+entries. Entropy is a *qualifier* on those rules, not a detector of its own —
+a bare high-entropy string with no keyword, assignment or vendor prefix around
+it is not flagged, because in real source code that shape is far more often a
+checksum, a UUID, or a minified asset than a secret, and replacing one with a
+placeholder derails the agent. The NER model, where enabled, catches prose PII like names and contact
 details. Neither protects **the source code itself** — the agent needs to
 read and write your code to do its job, and no redaction scheme can change
 that. This filter is about what leaves your machine as an incidental,
 extractable secret or personal detail, not about hiding your codebase from
 the model you're paying to work on it.
+
+Two shapes of request are **never filtered**, by design, and both are worth
+knowing about:
+
+- **The passthrough paths** — `/api/oauth/file_upload`, `/api/oauth/files/`,
+  `/v1/code/`, and `/v1/oauth/token`. These carry your own paired credential
+  rather than a rotated account's, and they're relayed byte-for-byte: redacting
+  a credential the far end has to verify just breaks authentication. **File
+  uploads go through `/api/oauth/file_upload`, so a file you attach is not
+  scanned.** The filter covers what your agent *sends as model context*, not
+  what you hand the provider directly.
+- **Any request body that isn't JSON.** The filter works by walking JSON string
+  values, so a multipart or form-encoded body has nothing it can read. Those
+  pass through unfiltered rather than being refused — refusing would break
+  uploads outright under the default failure mode — and each one increments the
+  same `unfiltered` counter the header shows.
 
 There is one intentional, residual disclosure even when everything works:
 each placeholder is a keyed hash of the original value, so the same secret
@@ -275,7 +312,10 @@ priority, `x` removes, and `enter` opens detail.
 
 Config lives at `~/.config/aiproxy/config.json` (honouring `XDG_CONFIG_HOME`),
 with the accounting database beside it at `metrics.db`. Both are written for
-you on first run; the Settings screen edits most of it live.
+you on first run. The Settings screen edits a subset of it: `switchThreshold`,
+`sessionAffinity` and `update.checkEnabled` apply immediately, everything else
+is written to disk and marked `saved · restart to apply`, because the objects
+that read those values are built once at startup.
 
 ```json
 {
@@ -285,7 +325,8 @@ you on first run; the Settings screen edits most of it live.
   "quotaProbe": { "intervalSeconds": 300 },
   "metrics": { "retentionDays": 90 },
   "mitm": { "enabled": true },
-  "update": { "checkEnabled": true, "checkIntervalHours": 24 }
+  "update": { "checkEnabled": true, "checkIntervalHours": 24 },
+  "privacy": { "enabled": false }
 }
 ```
 
@@ -298,7 +339,9 @@ you on first run; the Settings screen edits most of it live.
   byte — backoff, waiting on a paused account, absorbing a rate limit,
   refreshing a credential. **`headerTimeoutMs`** bounds one attempt's wait for
   upstream headers, which is the model's own thinking time. They are two
-  separate clocks on purpose; conflating them cancels healthy requests.
+  separate clocks on purpose; conflating them cancels healthy requests. Note
+  that the privacy scan is a *third*: it runs before the retry loop, so
+  `budgetMs` does not cover it and `privacy.scanTimeoutMS` bounds it instead.
 - **`quotaProbe.intervalSeconds`** defaults to 300 because the zero-spend usage
   endpoint is itself rate limited — polling it aggressively gets the probe
   throttled and leaves selection deciding on stale numbers. Set it to `0` to
@@ -306,6 +349,8 @@ you on first run; the Settings screen edits most of it live.
 - **`update.checkEnabled`** turns the daily release check on or off and takes
   effect immediately; **`checkIntervalHours`** takes effect on restart, because
   the checker's ticker is built once at startup. See [Updating](#updating).
+- **`privacy`** is shown collapsed above; every key in it, and the fact that all
+  of them are restart-gated, is in [Privacy filter](#privacy-filter).
 
 ## Flags
 
