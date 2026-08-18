@@ -10,6 +10,26 @@ import (
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
+// Regression guard for the path that was already right: the JSON usage
+// endpoint reports a PERCENTAGE (0..100), unlike the response headers, which
+// report a 0..1 fraction (see scale.go). The value here — utilization=56 —
+// is the real figure captured live from the same account and the same
+// minute as the header evidence in TestParseBucketsHeaderIsAlreadyAFraction
+// (5h-utilization: 0.55), both describing ~55-56% used.
+func TestBucketValueAcceptsJSONPercentage(t *testing.T) {
+	b := &usageBucketJSON{Utilization: floatPtr(56)}
+
+	got, reading := bucketValue(b)
+	if reading != quotaValid {
+		t.Fatalf("reading = %v, want quotaValid", reading)
+	}
+	if got != 0.56 {
+		t.Errorf("bucketValue = %v, want 0.56 (percent normalized to a fraction)", got)
+	}
+}
+
+func floatPtr(f float64) *float64 { return &f }
+
 func TestProfileParsesAccountAndOrganization(t *testing.T) {
 	up := testutil.NewFakeUpstream(t, testutil.Script{
 		Status: 200,

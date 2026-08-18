@@ -3,12 +3,14 @@ package account
 import (
 	"context"
 	"errors"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/provider"
+	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 )
 
 func oauthCred() provider.Credential {
@@ -86,6 +88,32 @@ func TestSelectSkipsAccountOverSwitchThreshold(t *testing.T) {
 	got, _ := m.Select(SelectRequest{Model: "claude-sonnet"})
 	if got.ID != "b" {
 		t.Errorf("selected %q, want b — a is over the switch threshold", got.ID)
+	}
+}
+
+// The consequence of the header-scale bug, end to end through the real parse
+// path rather than a hand-set struct field: an account whose header reports
+// utilization above the switch threshold must be skipped by Select for that
+// model. 0.99 is a realistic in-range fraction for the
+// anthropic-ratelimit-unified-*-utilization header (see
+// internal/provider/anthropic/scale.go) — if parseBuckets ever again divides
+// this by 100, it reads back as 0.0099, stays under the 0.98 threshold, and
+// this test fails by selecting "a" instead of "b".
+func TestSelectSkipsAccountAtRealHeaderUtilizationAboveThreshold(t *testing.T) {
+	m := mgr(t, acct("a", 0), acct("b", 1))
+
+	h := http.Header{}
+	h.Set("anthropic-ratelimit-unified-5h-status", "allowed")
+	h.Set("anthropic-ratelimit-unified-5h-utilization", "0.99")
+	out := anthropic.Classify(&http.Response{StatusCode: http.StatusOK, Header: h})
+	m.UpdateQuota("a", out.Buckets)
+
+	got, err := m.Select(SelectRequest{Model: "claude-sonnet-5"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "b" {
+		t.Errorf("selected %q, want b — a's real header utilization (0.99) is over the switch threshold", got.ID)
 	}
 }
 

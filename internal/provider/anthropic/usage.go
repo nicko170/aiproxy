@@ -144,13 +144,26 @@ func modelBucketName(displayName string) string {
 	return "7d"
 }
 
-func bucketValue(b *usageBucketJSON) (float64, bool) {
+// quotaReading distinguishes "this window was absent from the body" from
+// "this window was present but its value made no sense", so a caller can
+// treat them differently: a missing window contributes no bucket, while an
+// out-of-range one still must — see bucketValue and Quota below.
+type quotaReading int
+
+const (
+	quotaMissing quotaReading = iota
+	quotaValid
+	quotaOutOfRange
+)
+
+func bucketValue(b *usageBucketJSON) (float64, quotaReading) {
 	if b == nil {
-		return 0, false
+		return 0, quotaMissing
 	}
-	// Divided by 100 because the endpoint reports a PERCENTAGE, not a 0..1
-	// fraction. Verified against the live endpoint rather than inferred from the
-	// field names: a real response carried
+	// Divided by 100 because THIS endpoint reports a PERCENTAGE, not a 0..1
+	// fraction — see scale.go for the full contrast with the header path,
+	// which is the opposite scale. Verified against the live endpoint rather
+	// than inferred from the field names: a real response carried
 	//   five_hour: {"utilization":3,...}   seven_day: {"utilization":8,...}
 	// for an account nowhere near its cap, which is 3% and 8% — a 0..1 fraction
 	// would have meant 300% and 800%. Review flagged this as a possible
@@ -158,10 +171,13 @@ func bucketValue(b *usageBucketJSON) (float64, bool) {
 	// live shape first.
 	for _, p := range []*float64{b.Utilization, b.UsedPercentage, b.Percent} {
 		if p != nil {
-			return *p / 100, true
+			if frac, ok := normalizeUtilization(*p, percentScale); ok {
+				return frac, quotaValid
+			}
+			return 0, quotaOutOfRange
 		}
 	}
-	return 0, false
+	return 0, quotaMissing
 }
 
 func resetMillis(v any) int64 {
@@ -198,25 +214,35 @@ func (a *Anthropic) Quota(ctx context.Context, c provider.Credential) (provider.
 	}
 
 	out := provider.Quota{ObservedAt: time.Now().UnixMilli()}
-	if v, ok := bucketValue(ur.FiveHour); ok {
-		out.Buckets = append(out.Buckets, provider.QuotaBucket{
-			Name: "5h", Utilization: v, ResetsAt: resetMillis(ur.FiveHour.ResetsAt),
-		})
+	if v, reading := bucketValue(ur.FiveHour); reading != quotaMissing {
+		out.Buckets = append(out.Buckets, quotaBucket("5h", v, reading, resetMillis(ur.FiveHour.ResetsAt)))
 	}
-	if v, ok := bucketValue(ur.SevenDay); ok {
-		out.Buckets = append(out.Buckets, provider.QuotaBucket{
-			Name: "7d", Utilization: v, ResetsAt: resetMillis(ur.SevenDay.ResetsAt),
-		})
+	if v, reading := bucketValue(ur.SevenDay); reading != quotaMissing {
+		out.Buckets = append(out.Buckets, quotaBucket("7d", v, reading, resetMillis(ur.SevenDay.ResetsAt)))
 	}
 	for _, l := range ur.Limits {
 		if l.Group != "weekly" || l.Scope == nil || l.Scope.Model == nil || l.Percent == nil {
 			continue
 		}
-		out.Buckets = append(out.Buckets, provider.QuotaBucket{
-			Name:        modelBucketName(l.Scope.Model.DisplayName),
-			Utilization: *l.Percent / 100,
-			ResetsAt:    resetMillis(l.ResetsAt),
-		})
+		frac, ok := normalizeUtilization(*l.Percent, percentScale)
+		reading := quotaValid
+		if !ok {
+			reading = quotaOutOfRange
+		}
+		out.Buckets = append(out.Buckets, quotaBucket(
+			modelBucketName(l.Scope.Model.DisplayName), frac, reading, resetMillis(l.ResetsAt)))
 	}
 	return out, nil
+}
+
+// quotaBucket builds one QuotaBucket, marking it "rejected" on an
+// out-of-range reading instead of trusting a fabricated utilization — the
+// same fail-closed treatment parseBuckets (classify.go) gives a header
+// outside 0..1. See scale.go.
+func quotaBucket(name string, utilization float64, reading quotaReading, resetsAt int64) provider.QuotaBucket {
+	b := provider.QuotaBucket{Name: name, Utilization: utilization, ResetsAt: resetsAt}
+	if reading == quotaOutOfRange {
+		b.Status = "rejected"
+	}
+	return b
 }

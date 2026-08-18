@@ -113,7 +113,7 @@ func TestClassify(t *testing.T) {
 func TestClassifyParsesQuotaBuckets(t *testing.T) {
 	res := resp(200, map[string]string{
 		"anthropic-ratelimit-unified-5h-status":      "allowed",
-		"anthropic-ratelimit-unified-5h-utilization": "42",
+		"anthropic-ratelimit-unified-5h-utilization": "0.42",
 		"anthropic-ratelimit-unified-5h-reset":       "1786986000",
 	})
 
@@ -125,8 +125,10 @@ func TestClassifyParsesQuotaBuckets(t *testing.T) {
 	if b.Name != "5h" {
 		t.Errorf("Name = %q, want %q", b.Name, "5h")
 	}
+	// The header is already a 0..1 fraction — not a percentage, unlike the
+	// JSON usage endpoint (bucketValue, usage.go). See scale.go.
 	if b.Utilization != 0.42 {
-		t.Errorf("Utilization = %v, want 0.42 (percent normalized to a fraction)", b.Utilization)
+		t.Errorf("Utilization = %v, want 0.42 (header fraction stored as-is)", b.Utilization)
 	}
 	if b.ResetsAt != 1786986000_000 {
 		t.Errorf("ResetsAt = %d, want unix ms 1786986000000", b.ResetsAt)
@@ -187,8 +189,10 @@ func TestClassifyKeepsOnlyRealWindowsFromLiveHeaders(t *testing.T) {
 	}
 
 	want := map[string]provider.QuotaBucket{
+		// Headers are 0..1 fractions, not percentages: "0.07" is 7% used,
+		// stored as-is. See scale.go.
 		"5h": {Name: "5h", Status: "allowed", Utilization: 0, ResetsAt: 1787025600_000},
-		"7d": {Name: "7d", Status: "allowed", Utilization: 0.07 / 100, ResetsAt: 1787446800_000},
+		"7d": {Name: "7d", Status: "allowed", Utilization: 0.07, ResetsAt: 1787446800_000},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("parsed %d buckets %v, want exactly %d (5h and 7d)", len(got), out.Buckets, len(want))
@@ -242,7 +246,7 @@ func TestParseBucketsIgnoresNonWindowNames(t *testing.T) {
 func TestClassifyKeepsModelScopedWindow(t *testing.T) {
 	out := Classify(resp(429, map[string]string{
 		"anthropic-ratelimit-unified-7d_oi-status":         "rejected",
-		"anthropic-ratelimit-unified-7d_oi-utilization":    "100",
+		"anthropic-ratelimit-unified-7d_oi-utilization":    "1", // fully used; header is a 0..1 fraction, not a percentage
 		"anthropic-ratelimit-unified-overage-status":       "rejected",
 		"anthropic-ratelimit-unified-representative-claim": "seven_day",
 	}))
@@ -310,5 +314,75 @@ func TestUnknownWindowSuffixIsAGeneralRejectionNotAModelScopedOne(t *testing.T) 
 	}
 	if out.ScopedModel != "" {
 		t.Errorf("ScopedModel = %q, want empty — an unrecognised suffix must not make a general rejection model-scoped, which would skip MarkRateLimited", out.ScopedModel)
+	}
+}
+
+// The regression this whole fix is about. These are the real values captured
+// live from one account within the same minute as the JSON evidence in
+// TestBucketValueAcceptsJSONPercentage: the header carried 5h-utilization =
+// 0.55 and 7d-utilization = 0.12, describing the same account the JSON
+// endpoint separately reported as 56% and 12% used.
+//
+// A prior version divided this header value by 100 — correct for the JSON
+// percentage, wrong here — so 0.55 read back as 0.0055: an account at 55%
+// looked 1% used, and eligibleLocked's switchThreshold comparison (0.98)
+// never tripped. This must fail against that code.
+func TestParseBucketsHeaderIsAlreadyAFraction(t *testing.T) {
+	h := resp(200, map[string]string{
+		"anthropic-ratelimit-unified-5h-utilization": "0.55",
+		"anthropic-ratelimit-unified-7d-utilization": "0.12",
+	}).Header
+
+	got := parseBuckets(h)
+	byName := map[string]provider.QuotaBucket{}
+	for _, b := range got {
+		byName[b.Name] = b
+	}
+
+	if b := byName["5h"]; b.Utilization != 0.55 {
+		t.Errorf("5h Utilization = %v, want 0.55", b.Utilization)
+	}
+	if b := byName["7d"]; b.Utilization != 0.12 {
+		t.Errorf("7d Utilization = %v, want 0.12", b.Utilization)
+	}
+}
+
+// The two scales, live evidence for the same account in the same minute
+// (see scale.go), must agree once each is normalized: the header's 0.55/0.12
+// fraction and the JSON endpoint's 56/12 percentage both describe ~55-56%
+// and ~12% used. This is the assertion that would have caught the original
+// bug — a header-path regression that reintroduces the /100 division moves
+// the header-derived value far outside this tolerance.
+func TestHeaderAndJSONUtilizationAgreeForTheSameQuota(t *testing.T) {
+	cases := []struct {
+		name           string
+		headerFraction string
+		jsonPercent    float64
+	}{
+		{"5h", "0.55", 56},
+		{"7d", "0.12", 12},
+	}
+	const tolerance = 0.02 // measurements taken moments apart, not identical
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			headerBuckets := parseBuckets(resp(200, map[string]string{
+				"anthropic-ratelimit-unified-" + c.name + "-utilization": c.headerFraction,
+			}).Header)
+			if len(headerBuckets) != 1 {
+				t.Fatalf("got %d buckets from header, want 1", len(headerBuckets))
+			}
+			fromHeader := headerBuckets[0].Utilization
+
+			fromJSON, ok := normalizeUtilization(c.jsonPercent, percentScale)
+			if !ok {
+				t.Fatalf("normalizeUtilization(%v, percentScale) rejected an in-range percentage", c.jsonPercent)
+			}
+
+			if diff := fromHeader - fromJSON; diff > tolerance || diff < -tolerance {
+				t.Errorf("header-derived %v and JSON-derived %v disagree by more than %v (header=%q json=%v%%)",
+					fromHeader, fromJSON, tolerance, c.headerFraction, c.jsonPercent)
+			}
+		})
 	}
 }
