@@ -343,8 +343,11 @@ func TestControlAPIUpdateSettingsRejectsInvalidValues(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
+	// Invalid in exactly one field — switchThreshold — so a 400 proves that is
+	// what was rejected rather than something else being incidentally absent.
 	body := `{"switchThreshold":-1,"retryBudgetMs":10000,"inlineAbsorbMaxMs":5000,` +
-		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90}`
+		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +372,8 @@ func TestControlAPIUpdateSettingsPersistsValidValues(t *testing.T) {
 
 	body := `{"switchThreshold":0.5,"retryBudgetMs":8000,"inlineAbsorbMaxMs":4000,` +
 		`"headerTimeoutMs":30000,"bodyIdleMs":60000,"sessionAffinity":false,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +401,8 @@ func TestControlAPIGetSettingsReflectsAPersistedUpdate(t *testing.T) {
 
 	body := `{"switchThreshold":0.6,"retryBudgetMs":8000,"inlineAbsorbMaxMs":4000,` +
 		`"headerTimeoutMs":30000,"bodyIdleMs":60000,"sessionAffinity":false,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -441,7 +446,8 @@ func TestControlAPIUpdateSettingsResponseReportsLiveAndNeedsRestartFields(t *tes
 	// neither list.
 	body := `{"switchThreshold":0.5,"retryBudgetMs":10000,"inlineAbsorbMaxMs":5000,` +
 		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"sessionAffinity":true,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)

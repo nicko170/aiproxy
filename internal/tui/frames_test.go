@@ -80,6 +80,7 @@ func fixtureModel(w, h int) Model {
 		HeaderTimeoutMS: 30_000, BodyIdleMS: 120_000, SessionAffinity: true,
 		BlockedModels: []string{"claude-3-*"}, QuotaProbeIntervalSeconds: 300,
 		MetricsRetentionDays: 90,
+		UpdateCheckEnabled:   true, UpdateCheckIntervalHours: 24,
 	}
 	m.settings.needsRestart = map[string]bool{"metricsRetentionDays": true}
 	m.settings.justApplied = map[string]bool{"switchThreshold": true}

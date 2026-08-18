@@ -519,7 +519,7 @@ func TestUpdateSettingsRejectsInvalidValuesWithoutPersisting(t *testing.T) {
 	bad := Settings{
 		SwitchThreshold: -1, RetryBudgetMS: 10000, InlineAbsorbMaxMS: 5000,
 		HeaderTimeoutMS: 60000, BodyIdleMS: 120000, QuotaProbeIntervalSeconds: 300,
-		MetricsRetentionDays: 90,
+		MetricsRetentionDays: 90, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), bad); err == nil {
 		t.Error("want an error for a negative switch threshold")
@@ -542,7 +542,7 @@ func TestUpdateSettingsPersistsAndAppliesLiveTunableFieldsImmediately(t *testing
 		SwitchThreshold: 0.5, RetryBudgetMS: 8000, InlineAbsorbMaxMS: 4000,
 		HeaderTimeoutMS: 30000, BodyIdleMS: 60000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 120,
-		MetricsRetentionDays: 30,
+		MetricsRetentionDays: 30, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), good); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
@@ -591,6 +591,8 @@ func TestUpdateSettingsReportsAppliedLiveAndNeedsRestartFields(t *testing.T) {
 		BlockedModels:             []string{"*fable*"}, // changed from []: restart-gated
 		QuotaProbeIntervalSeconds: def.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      def.Metrics.RetentionDays,
+		UpdateCheckEnabled:        def.Update.CheckEnabled,
+		UpdateCheckIntervalHours:  def.Update.CheckIntervalHours,
 	}
 	applied, err := h.local.UpdateSettings(context.Background(), s)
 	if err != nil {
@@ -624,7 +626,7 @@ func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
 		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*", "*mythos*"}, QuotaProbeIntervalSeconds: 200,
-		MetricsRetentionDays: 45,
+		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
@@ -650,7 +652,7 @@ func TestSettingsReadModifyWritePreservesUntouchedFields(t *testing.T) {
 		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 200,
-		MetricsRetentionDays: 45,
+		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), initial); err != nil {
 		t.Fatalf("UpdateSettings (seed): %v", err)
@@ -1016,5 +1018,48 @@ func TestImportCredentialsUnknownSourceReturnsError(t *testing.T) {
 	h := newHarness(t)
 	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSource("bogus")); err == nil {
 		t.Error("want an error for an unknown import source")
+	}
+}
+
+// The update settings round-trip through the seam like every other field, and
+// the interval is restart-gated because the checker's ticker is built once.
+func TestUpdateSettingsRoundTripsTheUpdateBlock(t *testing.T) {
+	local := newHarness(t).local
+	s, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.UpdateCheckEnabled || s.UpdateCheckIntervalHours != 24 {
+		t.Fatalf("defaults not surfaced: %+v", s)
+	}
+
+	s.UpdateCheckIntervalHours = 6
+	applied, err := local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(applied.NeedsRestart, "updateCheckIntervalHours") {
+		t.Errorf("NeedsRestart = %v, want updateCheckIntervalHours", applied.NeedsRestart)
+	}
+
+	back, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.UpdateCheckIntervalHours != 6 {
+		t.Errorf("interval did not persist: %d", back.UpdateCheckIntervalHours)
+	}
+}
+
+// A zero interval is refused before it is written: a bad value on disk
+// survives a restart, which is worse than a rejected call.
+func TestValidateRejectsANonPositiveUpdateInterval(t *testing.T) {
+	s := Settings{
+		SwitchThreshold: 0.9, RetryBudgetMS: 1000, HeaderTimeoutMS: 1000, BodyIdleMS: 1000,
+		QuotaProbeIntervalSeconds: 300, MetricsRetentionDays: 90,
+		UpdateCheckEnabled: true, UpdateCheckIntervalHours: 0,
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatal("Validate accepted a zero updateCheckIntervalHours")
 	}
 }

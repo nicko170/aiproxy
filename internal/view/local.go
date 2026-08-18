@@ -316,6 +316,8 @@ func settingsFromConfig(c config.Config) Settings {
 		BlockedModels:             c.Routing.BlockedModels,
 		QuotaProbeIntervalSeconds: c.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      c.Metrics.RetentionDays,
+		UpdateCheckEnabled:        c.Update.CheckEnabled,
+		UpdateCheckIntervalHours:  c.Update.CheckIntervalHours,
 	}
 }
 
@@ -331,6 +333,7 @@ var (
 	restartSettingsFields = []string{
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
+		"updateCheckEnabled", "updateCheckIntervalHours",
 	}
 )
 
@@ -382,6 +385,8 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		c.Retry.BodyIdleMS = s.BodyIdleMS
 		c.QuotaProbe.IntervalSeconds = s.QuotaProbeIntervalSeconds
 		c.Metrics.RetentionDays = s.MetricsRetentionDays
+		c.Update.CheckEnabled = s.UpdateCheckEnabled
+		c.Update.CheckIntervalHours = s.UpdateCheckIntervalHours
 		return nil
 	}); err != nil {
 		return Applied{}, err
@@ -410,6 +415,8 @@ func diffSettings(before, after Settings) Applied {
 		"bodyIdleMs":                before.BodyIdleMS != after.BodyIdleMS,
 		"quotaProbeIntervalSeconds": before.QuotaProbeIntervalSeconds != after.QuotaProbeIntervalSeconds,
 		"metricsRetentionDays":      before.MetricsRetentionDays != after.MetricsRetentionDays,
+		"updateCheckEnabled":        before.UpdateCheckEnabled != after.UpdateCheckEnabled,
+		"updateCheckIntervalHours":  before.UpdateCheckIntervalHours != after.UpdateCheckIntervalHours,
 	}
 	for _, name := range liveSettingsFields {
 		if changed[name] {

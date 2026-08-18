@@ -30,6 +30,9 @@ func (s Settings) Validate() error {
 	if s.MetricsRetentionDays <= 0 {
 		return fmt.Errorf("metricsRetentionDays must be positive, got %d", s.MetricsRetentionDays)
 	}
+	if s.UpdateCheckIntervalHours <= 0 {
+		return fmt.Errorf("updateCheckIntervalHours must be positive, got %d", s.UpdateCheckIntervalHours)
+	}
 	for _, pattern := range s.BlockedModels {
 		if _, err := path.Match(pattern, ""); err != nil {
 			return fmt.Errorf("blockedModels pattern %q is not a valid glob: %w", pattern, err)

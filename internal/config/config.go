@@ -74,6 +74,19 @@ type MITM struct {
 	Enabled bool `json:"enabled"`
 }
 
+// Update controls in-app update checking. CheckEnabled is opt-out rather than
+// opt-in because a proxy that silently runs months behind a security fix is
+// the worse default — but it IS an outbound request that tells github.com
+// this installation's IP and version, so turning it off must be one setting,
+// documented, and honoured absolutely (no request is made when it is false).
+//
+// CheckIntervalHours is a day by default: a release cadence measured in weeks
+// does not reward polling, and the answer is cached besides.
+type Update struct {
+	CheckEnabled       bool `json:"checkEnabled"`
+	CheckIntervalHours int  `json:"checkIntervalHours"`
+}
+
 type Config struct {
 	Listen     Listen     `json:"listen"`
 	Accounts   []Account  `json:"accounts"`
@@ -82,6 +95,7 @@ type Config struct {
 	QuotaProbe QuotaProbe `json:"quotaProbe"`
 	Metrics    Metrics    `json:"metrics"`
 	MITM       MITM       `json:"mitm"`
+	Update     Update     `json:"update"`
 }
 
 // Default returns the configuration for a fresh install.
@@ -99,6 +113,7 @@ func Default() Config {
 		QuotaProbe: QuotaProbe{IntervalSeconds: 300},
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},
+		Update:     Update{CheckEnabled: true, CheckIntervalHours: 24},
 	}
 }
 

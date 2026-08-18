@@ -149,3 +149,58 @@ func TestUpdateRollsBackOnCallbackError(t *testing.T) {
 		t.Error("a failed update must not be written")
 	}
 }
+
+// A config file predating the update block must decode to the defaults, not
+// to a disabled checker with a zero interval that would spin the loop.
+func TestUpdateDefaultsFillInForAnOlderConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"listen":{"addr":"127.0.0.1:9999","apiKey":"ap-x"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Update.CheckEnabled {
+		t.Error("CheckEnabled should default to true")
+	}
+	if cfg.Update.CheckIntervalHours != 24 {
+		t.Errorf("CheckIntervalHours = %d, want 24", cfg.Update.CheckIntervalHours)
+	}
+}
+
+// An explicit opt-out survives a reload — the whole point of it being a
+// setting rather than a flag.
+func TestUpdateOptOutIsHonoured(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"update":{"checkEnabled":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Update.CheckEnabled {
+		t.Error("CheckEnabled should stay false")
+	}
+	if cfg.Update.CheckIntervalHours != 24 {
+		t.Errorf("an absent interval inside a present block should still default: got %d",
+			cfg.Update.CheckIntervalHours)
+	}
+}
+
+// A hand-edited zero or negative interval is corrected on load rather than
+// handed to a ticker.
+func TestNonPositiveUpdateIntervalFallsBackToTheDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"update":{"checkEnabled":true,"checkIntervalHours":0}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Update.CheckIntervalHours != 24 {
+		t.Errorf("CheckIntervalHours = %d, want 24", cfg.Update.CheckIntervalHours)
+	}
+}

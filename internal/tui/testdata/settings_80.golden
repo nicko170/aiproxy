@@ -13,8 +13,8 @@
     bodyIdleMs                  120000 ms             
     quotaProbeIntervalSeconds   300 s                 
     metricsRetentionDays        90 d                  saved · restart to apply
-
-
+    updateCheckEnabled          on                    
+    updateCheckIntervalHours    24 h                  
 
 
 

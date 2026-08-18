@@ -150,9 +150,9 @@ type QuotaPoint struct {
 
 // Settings is the live-tunable subset of config (spec §6.2): switch
 // threshold, retry budget, inline absorb max, header timeout, body idle,
-// session affinity, blocked models, quota probe interval, and metrics
-// retention. Everything else in config.Config (listen address, accounts,
-// MITM) is not reachable through this call.
+// session affinity, blocked models, quota probe interval, metrics retention,
+// and update checking. Everything else in config.Config (listen address,
+// accounts, MITM) is not reachable through this call.
 type Settings struct {
 	SwitchThreshold           float64  `json:"switchThreshold"`
 	RetryBudgetMS             int      `json:"retryBudgetMs"`
@@ -163,6 +163,11 @@ type Settings struct {
 	BlockedModels             []string `json:"blockedModels"`
 	QuotaProbeIntervalSeconds int      `json:"quotaProbeIntervalSeconds"`
 	MetricsRetentionDays      int      `json:"metricsRetentionDays"`
+	// UpdateCheckEnabled and UpdateCheckIntervalHours control the background
+	// release check. Enabled is live-tunable; the interval is not, because the
+	// checker's ticker is built once at startup.
+	UpdateCheckEnabled       bool `json:"updateCheckEnabled"`
+	UpdateCheckIntervalHours int  `json:"updateCheckIntervalHours"`
 }
 
 // Applied reports which fields an UpdateSettings call actually put into
