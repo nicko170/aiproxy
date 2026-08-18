@@ -1,9 +1,11 @@
 package view
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,6 +22,8 @@ import (
 	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
+	"github.com/nicko170/aiproxy/internal/provider/anthropic"
+	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
 // testHarness wires a Local over real (in-memory / temp-file) services, the
@@ -741,35 +745,95 @@ func TestLoginPropagatesTheProvidersOwnError(t *testing.T) {
 	}
 }
 
-// The single most likely place to leak a credential is this flow. Even
-// though LoginResult's type cannot carry one (Profile/Err only), this
-// guards against a future regression by checking the actual bytes.
+// The single most likely place to leak a credential is this flow. This runs
+// a genuine login end to end — a real anthropic.Provider, a fake token
+// endpoint that hands back a known sentinel access/refresh token, a real
+// loopback callback — through Local.Login exactly as production drives it,
+// and checks the actual bytes of everything this layer produces: the
+// LoginSession (its URL), the LoginResult, and anything logged during the
+// flow. (The remaining leg — that the sentinel never reaches a control-API
+// poll response — is exercised with the same rigor, real secrets included,
+// by internal/proxy's TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial;
+// view has no HTTP layer of its own to poll.)
+//
+// Before this fix, `secret` was never placed into any real input — the
+// session and result here were hand-built stubs — so the strings.Contains
+// half of this test was inert and could not have failed no matter what
+// leaked; only the reflection field-name check below had any teeth.
 func TestLoginSessionNeverCarriesCredentialMaterial(t *testing.T) {
 	const secret = "sk-ant-super-secret-value"
-	done := make(chan provider.LoginResult, 1)
-	done <- provider.LoginResult{Profile: provider.Profile{Email: "a@example.com"}}
-	close(done)
+	up := testutil.NewFakeUpstream(t,
+		testutil.Script{Status: 200, Body: `{"access_token":"` + secret + `","refresh_token":"rt-` + secret + `","expires_in":3600}`},
+		testutil.Script{Status: 200, Body: `{"account":{"uuid":"acct-1","email":"a@example.com",
+			"display_name":"A"},"organization":{"uuid":"org-1","name":"Acme"}}`},
+	)
+	real := anthropic.New(http.DefaultClient)
+	real.TokenEndpointOverride = up.URL()
+	real.BaseURLOverride = up.URL()
+	real.LoginTimeoutOverride = 5 * time.Second
+
+	// Captures anything logged anywhere through the default logger for the
+	// duration of the flow; nothing in this path logs today, but a future
+	// regression that adds a log call anywhere Login's real code runs
+	// through must be caught here, not just by the code that writes it.
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prevLogger)
+
 	providers := map[string]provider.Provider{
-		"stub": stubProvider{},
-		"loginable": loginableProvider{session: provider.LoginSession{
-			URL: "https://example.invalid/authorize?code_challenge=abc&state=xyz", Done: done,
-		}},
+		"stub":      stubProvider{},
+		"anthropic": real,
 	}
 	h := newHarnessWithProviders(t, nil, providers)
 
-	sess, err := h.local.Login(context.Background(), "loginable")
+	sess, err := h.local.Login(context.Background(), "anthropic")
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	result := <-sess.Done
+
+	u, err := url.Parse(sess.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	state := u.Query().Get("state")
+	redirectURI := u.Query().Get("redirect_uri")
+	if state == "" || redirectURI == "" {
+		t.Fatalf("authorize URL missing state/redirect_uri: %s", sess.URL)
+	}
+
+	cbRes, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	cbRes.Body.Close()
+
+	var result provider.LoginResult
+	select {
+	case res, ok := <-sess.Done:
+		if !ok {
+			t.Fatal("Done closed with no value sent")
+		}
+		result = res
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LoginResult")
+	}
+	if result.Err != nil {
+		t.Fatalf("LoginResult.Err = %v, want nil", result.Err)
+	}
+	if result.Profile.Email != "a@example.com" {
+		t.Errorf("Profile = %+v, want the real exchange's profile", result.Profile)
+	}
 
 	raw, err := json.Marshal(result)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	blob := string(raw) + " " + sess.URL
-	if strings.Contains(blob, secret) {
-		t.Errorf("credential material leaked: %s", blob)
+	blob := string(raw) + " " + sess.URL + " " + logBuf.String()
+	for _, leak := range []string{secret, "rt-" + secret} {
+		if strings.Contains(blob, leak) {
+			t.Errorf("credential material %q leaked into %q", leak, blob)
+		}
 	}
 	// LoginResult's own shape enforces this at compile time (Profile, Err —
 	// no credential field exists to leak), but assert it structurally too so
