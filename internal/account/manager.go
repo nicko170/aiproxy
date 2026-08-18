@@ -34,6 +34,10 @@ type Options struct {
 	RefreshTimeout time.Duration
 	// Log receives the manager's own diagnostics. Nil takes slog.Default().
 	Log *slog.Logger
+	// OnQuota observes a quota update. Called without the registry lock held,
+	// so an observer may call back into the Manager. Must not block for long:
+	// the metrics sink it is wired to is non-blocking by contract.
+	OnQuota func(accountID string, buckets []provider.QuotaBucket, at int64)
 }
 
 // refreshCall is one in-flight refresh other callers wait on.
@@ -295,9 +299,9 @@ func (m *Manager) isExpiredLocked(a *Account) bool {
 // UpdateQuota records observed buckets for an account.
 func (m *Manager) UpdateQuota(id string, buckets []provider.QuotaBucket) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	a := m.byID[id]
 	if a == nil {
+		m.mu.Unlock()
 		return
 	}
 	if a.Buckets == nil {
@@ -305,5 +309,15 @@ func (m *Manager) UpdateQuota(id string, buckets []provider.QuotaBucket) {
 	}
 	for _, b := range buckets {
 		a.Buckets[b.Name] = b
+	}
+	at := m.opts.Now().UnixMilli()
+	hook := m.opts.OnQuota
+	m.mu.Unlock()
+
+	// Outside the lock deliberately: a slow observer must not stall account
+	// selection for every in-flight request, and it must be able to call back
+	// into the Manager without deadlocking.
+	if hook != nil && len(buckets) > 0 {
+		hook(id, buckets, at)
 	}
 }
