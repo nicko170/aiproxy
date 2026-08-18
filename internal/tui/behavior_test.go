@@ -498,3 +498,41 @@ func TestHeaderUnresolvedOutranksRedactionCountWhenBothAreSet(t *testing.T) {
 		t.Errorf("header = %q, must not also show the redaction count once unresolved is nonzero", got)
 	}
 }
+
+// Property 7: with onScanFailure:open and a broken model, every request goes
+// upstream completely unfiltered while the counters read exactly as they do for
+// a quiet, working filter. The header must be able to tell those apart.
+func TestHeaderWarnsWhenTheFilterIsFailing(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "error",
+		Redactions: map[string]int64{"SECRET": 9},
+		LastError:  "privacy: detector ner: model unavailable",
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "filter error") {
+		t.Errorf("header = %q, want the scan failure surfaced", got)
+	}
+	if strings.Contains(got, "redacted") {
+		t.Errorf("header = %q, must not show reassurance in place of a fault", got)
+	}
+}
+
+// The unfiltered count outlives the error that caused it: an operator who
+// restarts a broken model still needs to know requests went out unprotected.
+func TestHeaderWarnsOnRequestsSentUnfiltered(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions:     map[string]int64{"SECRET": 9},
+		SentUnfiltered: 3,
+		Unresolved:     2,
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "3 unfiltered") {
+		t.Errorf("header = %q, want the unfiltered count surfaced", got)
+	}
+	if strings.Contains(got, "redacted") || strings.Contains(got, "unresolved") {
+		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
+	}
+}

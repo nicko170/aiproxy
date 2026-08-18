@@ -695,9 +695,21 @@ outer:
 }
 
 // privacySegments returns the header's privacy wordings, longest first.
-// Unresolved placeholders outrank the redaction count: a count means the
-// filter is working, whereas an unresolved placeholder means the agent
-// received something wrong, which is the more urgent of the two.
+//
+// Four states, most urgent first, because only one segment fits:
+//
+//  1. A scan error. The filter is not doing its job at all, and under
+//     onScanFailure:open that is completely silent everywhere else.
+//  2. Requests sent unfiltered. Same condition seen from the other side, and it
+//     persists after the error that caused it has stopped recurring.
+//  3. An unresolved placeholder — the agent received something wrong.
+//  4. The redaction count, which merely means the filter is working.
+//
+// The first two outrank the third because "protecting nothing" is a failure of
+// the feature's purpose, whereas an unresolved placeholder is a visible,
+// self-correcting wrongness in one value (see the restore table's per-request
+// note). All three outrank the count for the reason the count exists: a count
+// is reassurance, and reassurance must never be shown in place of a fault.
 func (m Model) privacySegments() []string {
 	th := m.th
 	p := m.status.Privacy
@@ -707,6 +719,18 @@ func (m Model) privacySegments() []string {
 	glyph := "⊘ "
 	if th.mode == modeNone {
 		glyph = "[!] "
+	}
+	if p.LastError != "" {
+		return []string{
+			th.bad(glyph + "filter error"),
+			th.bad("filter error"),
+		}
+	}
+	if p.SentUnfiltered > 0 {
+		return []string{
+			th.bad(fmt.Sprintf("%s%d unfiltered", glyph, p.SentUnfiltered)),
+			th.bad(fmt.Sprintf("%d unfiltered", p.SentUnfiltered)),
+		}
 	}
 	if p.Unresolved > 0 {
 		return []string{

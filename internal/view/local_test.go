@@ -633,11 +633,13 @@ func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*", "*mythos*"}, QuotaProbeIntervalSeconds: 200,
 		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
-		// The two privacy failure modes cannot round-trip as "": config.loadLocked
-		// treats an empty value as unset and fills in the documented default on
-		// every load, so a Settings read back after a write always carries the
-		// non-empty string even when this literal sent none.
+		// The two privacy failure modes and the scan budget cannot round-trip as
+		// their zero values: config.loadLocked treats those as unset and fills in
+		// the documented default on every load, so a Settings read back after a
+		// write always carries the non-zero value even when this literal sent
+		// none.
 		PrivacyOnScanFailure: "closed", PrivacyOnUnresolved: "passthrough",
+		PrivacyScanTimeoutMS: 10000,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)

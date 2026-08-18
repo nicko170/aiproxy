@@ -289,6 +289,16 @@ func buildPrivacy(cfg config.Config, log *slog.Logger) (*privacy.Filter, error) 
 		modelState = nd.ModelState
 	}
 
+	// Enabled with nothing to detect is a legitimate config to write by hand and
+	// a silent no-op to run: "privacy filter active" is logged, the header shows
+	// a filter that is on, Status reports enabled:true, and not one byte is ever
+	// examined. Warn rather than refuse — refusing would turn a harmless
+	// misconfiguration into a proxy that will not start.
+	if len(dets) == 0 {
+		log.Warn("privacy filter is enabled but has no detectors; nothing will be scanned. " +
+			"Set privacy.rules.builtinSecrets, add privacy.denylist entries, or enable privacy.ner with labels.")
+	}
+
 	// The salt carries everything that changes what a scan MEANS, so a toggle or
 	// a denylist edit invalidates the cache without any expiry logic.
 	salt := privacy.Salt(
@@ -304,6 +314,7 @@ func buildPrivacy(cfg config.Config, log *slog.Logger) (*privacy.Filter, error) 
 		Key:           key,
 		Unresolved:    unresolved,
 		OnScanFailure: scanFail,
+		ScanTimeout:   time.Duration(cfg.Privacy.ScanTimeoutMS) * time.Millisecond,
 		ModelState:    modelState,
 	}), nil
 }
@@ -404,6 +415,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	if pf != nil {
 		log.Info("privacy filter active",
 			"onScanFailure", cfg.Privacy.OnScanFailure,
+			"scanTimeoutMS", cfg.Privacy.ScanTimeoutMS,
 			"denylist", len(cfg.Privacy.Denylist),
 			"nerLabels", len(cfg.Privacy.NER.Labels))
 	}

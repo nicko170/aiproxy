@@ -62,6 +62,12 @@ func (s *Store) loadLocked() (Config, error) {
 	if cfg.Privacy.NER.MaxScanBytes <= 0 {
 		cfg.Privacy.NER.MaxScanBytes = Default().Privacy.NER.MaxScanBytes
 	}
+	// There is deliberately no "unbounded" setting: an unbounded scan is the
+	// defect this timeout exists to fix, and a hand-edited 0 would reinstate it
+	// silently. Raise it if you would rather wait than refuse.
+	if cfg.Privacy.ScanTimeoutMS <= 0 {
+		cfg.Privacy.ScanTimeoutMS = Default().Privacy.ScanTimeoutMS
+	}
 	if cfg.Privacy.OnScanFailure == "" {
 		cfg.Privacy.OnScanFailure = Default().Privacy.OnScanFailure
 	}

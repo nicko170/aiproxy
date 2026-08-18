@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -88,7 +89,7 @@ type fakeRunner struct {
 	n   int // number of labels
 }
 
-func (f *fakeRunner) Run(ids, mask []int64) ([][]float32, error) {
+func (f *fakeRunner) Run(_ context.Context, ids, mask []int64) ([][]float32, error) {
 	w := f.calls
 	f.calls++
 	f.widths = append(f.widths, len(ids))
@@ -455,7 +456,7 @@ func TestRealSessionProducesLogitsOfTheExpectedShape(t *testing.T) {
 	for i, tk := range toks {
 		ids[i], mask[i] = int64(tk.ID), 1
 	}
-	logits, err := r.Run(ids, mask)
+	logits, err := r.Run(context.Background(), ids, mask)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,5 +952,81 @@ func TestModelStateReportsInstalledBeforeTheFirstScan(t *testing.T) {
 	}
 	if got := d.ModelState(); got != stateReady {
 		t.Errorf("ModelState after a successful scan = %q, want %q", got, stateReady)
+	}
+}
+
+// detectorWithRunner builds a Detector wired to an arbitrary runner, with
+// loadOnce already consumed so nothing is ever loaded from disk.
+func detectorWithRunner(t *testing.T, r runner) *Detector {
+	t.Helper()
+	d, err := New(Options{Dir: t.TempDir(), Labels: []string{"private_person"}, MaxScanBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.tok = byteTokenizer{}
+	d.labels = configLabels
+	d.trans = transitionMatrix(configLabels, nil)
+	d.session = r
+	d.loadOnce.Do(func() {})
+	return d
+}
+
+// blockingRunner holds the model for as long as it is asked to, so a caller's
+// deadline can be observed against a busy session.
+type blockingRunner struct {
+	entered chan struct{}
+	release chan struct{}
+	calls   atomic.Int64
+}
+
+func (b *blockingRunner) Run(ctx context.Context, ids, _ []int64) ([][]float32, error) {
+	b.calls.Add(1)
+	select {
+	case b.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	out := make([][]float32, len(ids))
+	for i := range out {
+		out[i] = make([]float32, len(configLabels))
+	}
+	return out, nil
+}
+
+func (b *blockingRunner) Close() error { return nil }
+
+// The session is process-wide and serialised, so one slow inference is a
+// head-of-line block on every other request that needs the model. A request
+// whose own scan deadline has already passed must leave the queue rather than
+// wait for work it will discard: sync.Mutex has no cancellable acquire, which is
+// why Run gates on a channel.
+func TestScanLeavesTheModelQueueWhenTheContextIsDone(t *testing.T) {
+	r := &blockingRunner{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	defer close(r.release)
+
+	// One scan takes the session and holds it.
+	holder := detectorWithRunner(t, r)
+	go holder.Scan(context.Background(), strings.Repeat("a b ", 40))
+	select {
+	case <-r.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first scan never reached the runner")
+	}
+
+	// A second scan whose deadline expires while it waits must return promptly.
+	waiter := detectorWithRunner(t, r)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := waiter.Scan(ctx, strings.Repeat("a b ", 40))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Scan = %v, want the deadline to be observed while queued", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Scan waited %s on a busy session; the queue is not cancellable", elapsed)
 	}
 }

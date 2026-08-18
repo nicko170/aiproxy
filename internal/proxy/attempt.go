@@ -612,7 +612,16 @@ func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRe
 			acc.Observe(d)
 		},
 	}
-	if req.Restore != nil && a.privacy != nil {
+	// Len() > 0, not merely non-nil. Filter.Redact ALWAYS returns a table, so
+	// req.Restore is non-nil for every request once the filter is on — and an
+	// empty table provably cannot resolve anything, because the table is complete
+	// by construction when redaction finishes (see privacy.Table). Arming the
+	// restorer anyway put restoreChunk in the path of every stream, which buffers
+	// to the last event terminator and turns a token stream into a batch: with
+	// the filter on, a 121-byte stream that wrote 113/7 bytes wrote 0/120
+	// instead. Property 3 — no sentinel, no added buffering — is restored exactly
+	// for the majority of requests, which redact nothing.
+	if a.privacy != nil && req.Restore.Len() > 0 {
 		ropts.Restore = a.privacy.Restorer(req.Restore)
 	}
 	n, err := Relay(ctx, w, upstreamRes.Body, ropts)

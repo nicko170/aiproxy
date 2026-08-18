@@ -73,8 +73,13 @@ type encoder interface {
 // binding's API surface to newRunner, so a signature change upstream is a
 // one-function fix rather than a rewrite — and lets the chunking, mapping, and
 // de-duplication below be tested against a fake.
+//
+// Run takes a context because the session is process-wide and serialised: one
+// request's inference head-of-line blocks every other request that needs the
+// model, so a caller whose own deadline has passed must be able to stop waiting
+// rather than joining the queue.
 type runner interface {
-	Run(inputIDs, attnMask []int64) ([][]float32, error)
+	Run(ctx context.Context, inputIDs, attnMask []int64) ([][]float32, error)
 	Close() error
 }
 
@@ -206,7 +211,7 @@ func (d *Detector) Scan(ctx context.Context, text string) ([]privacy.Finding, er
 		for i, tk := range chunk {
 			ids[i], mask[i] = int64(tk.ID), 1
 		}
-		logits, err := d.session.Run(ids, mask)
+		logits, err := d.session.Run(ctx, ids, mask)
 		if err != nil {
 			return nil, fmt.Errorf("ner: inference: %w", err)
 		}
@@ -391,13 +396,16 @@ type onnxSession struct {
 	sess    *onnxrt.Session
 	nLabels int
 
-	// mu serialises Run. ONNX Runtime documents its sessions as safe for
-	// concurrent Run, and its own intra-op pool already parallelises a single
-	// inference, but this is the first native library this process loads and a
-	// fault inside it is not recoverable in Go. Serialising costs throughput
-	// under concurrency and buys a much smaller blast radius; it is one line to
-	// remove once the integration has run in anger.
-	mu sync.Mutex
+	// sem serialises Run, capacity one. ONNX Runtime documents its sessions as
+	// safe for concurrent Run, and its own intra-op pool already parallelises a
+	// single inference, but this is the first native library this process loads
+	// and a fault inside it is not recoverable in Go. Serialising costs
+	// throughput under concurrency and buys a much smaller blast radius.
+	//
+	// A buffered channel rather than a sync.Mutex because acquisition must be
+	// cancellable: this is a process-wide queue, and a request whose scan
+	// deadline has expired should not wait in it (see Run).
+	sem chan struct{}
 }
 
 // newRunner creates the session. This is the ONLY binding-dependent code in the
@@ -424,7 +432,7 @@ func newRunner(libPath, modelPath string, nLabels int) (runner, error) {
 		_ = rt.Close()
 		return nil, fmt.Errorf("open %s: %w", modelPath, err)
 	}
-	s := &onnxSession{rt: rt, env: env, sess: sess, nLabels: nLabels}
+	s := &onnxSession{rt: rt, env: env, sess: sess, nLabels: nLabels, sem: make(chan struct{}, 1)}
 	if err := s.checkIO(); err != nil {
 		_ = s.Close()
 		return nil, err
@@ -451,12 +459,20 @@ func (s *onnxSession) checkIO() error {
 	return fmt.Errorf("model outputs are %v, want one named logits", s.sess.OutputNames())
 }
 
-func (s *onnxSession) Run(inputIDs, attnMask []int64) ([][]float32, error) {
+func (s *onnxSession) Run(ctx context.Context, inputIDs, attnMask []int64) ([][]float32, error) {
 	if len(inputIDs) == 0 || len(inputIDs) != len(attnMask) {
 		return nil, fmt.Errorf("ner: %d ids and %d mask entries", len(inputIDs), len(attnMask))
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// A channel rather than a sync.Mutex because sync.Mutex has no cancellable
+	// acquire. The session is single-threaded, so every request needing the model
+	// queues here; a request whose scan deadline has already expired must leave
+	// the queue instead of waiting for inference it will then discard.
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-s.sem }()
 
 	shape := []int64{1, int64(len(inputIDs))}
 	idsVal, err := onnxrt.NewTensorValue(s.rt, inputIDs, shape)
@@ -470,7 +486,7 @@ func (s *onnxSession) Run(inputIDs, attnMask []int64) ([][]float32, error) {
 	}
 	defer maskVal.Close()
 
-	outs, err := s.sess.Run(context.Background(), map[string]*onnxrt.Value{
+	outs, err := s.sess.Run(ctx, map[string]*onnxrt.Value{
 		"input_ids":      idsVal,
 		"attention_mask": maskVal,
 	}, onnxrt.WithOutputNames("logits"))

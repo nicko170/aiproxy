@@ -64,7 +64,13 @@ func (t *Table) Add(label Label, value string) (string, error) {
 			t.byValue[vk] = p
 			return p, nil
 		case existing == value:
-			// Same value reached by a different label path; reuse it.
+			// Unreachable through the public API, and kept as a guard rather
+			// than an expectation. The only way to reach a taken placeholder
+			// already holding OUR value would be a different (label, value) pair
+			// minting the same string — impossible, because the label is written
+			// literally into the placeholder text, so a differing label differs
+			// in the placeholder too, and an identical (label, value) pair is
+			// already served by byValue above. Only forceForTest can get here.
 			t.byValue[vk] = p
 			return p, nil
 		}
@@ -78,9 +84,18 @@ func (t *Table) Lookup(placeholder string) (string, bool) {
 	return v, ok
 }
 
-// Len is the number of distinct placeholders minted, which the TUI reports as
-// the per-request redaction count.
-func (t *Table) Len() int { return len(t.byPlaceholder) }
+// Len is the number of distinct placeholders minted.
+//
+// Nil-safe, and deliberately so: the relay uses it to decide whether to arm a
+// restorer at all, and "no filter configured" (nil) and "filter ran, found
+// nothing" (empty) must take the same branch — neither can resolve anything, and
+// a table is complete by construction once redaction finishes.
+func (t *Table) Len() int {
+	if t == nil {
+		return 0
+	}
+	return len(t.byPlaceholder)
+}
 
 // forceForTest seeds a mapping directly, so the collision path can be exercised
 // without searching for a 12-hex collision that does not naturally occur.

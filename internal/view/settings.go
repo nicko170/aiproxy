@@ -50,6 +50,12 @@ func (s Settings) Validate() error {
 			return err
 		}
 	}
+	// Zero is accepted and normalized to the default by UpdateSettings, so a
+	// caller that never mentions the field is not rejected. Negative is not a
+	// longer timeout, it is a scan that expires before it starts.
+	if s.PrivacyScanTimeoutMS < 0 {
+		return fmt.Errorf("privacyScanTimeoutMs must not be negative, got %d", s.PrivacyScanTimeoutMS)
+	}
 	switch s.PrivacyOnUnresolved {
 	case "", "passthrough", "error":
 	default:

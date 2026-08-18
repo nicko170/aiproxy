@@ -163,10 +163,12 @@ func (l *Local) privacyStatus() PrivacyStatus {
 	}
 	snap := l.privacy.Snapshot()
 	out := PrivacyStatus{
-		Enabled:    true,
-		ModelState: l.privacy.ModelState(),
-		Redactions: snap.Redactions,
-		Unresolved: snap.Unresolved,
+		Enabled:        true,
+		ModelState:     l.privacy.ModelState(),
+		Redactions:     snap.Redactions,
+		Unresolved:     snap.Unresolved,
+		SentUnfiltered: snap.SentUnfiltered,
+		LastError:      snap.LastError,
 	}
 	if total := snap.CacheHits + snap.CacheMisses; total > 0 {
 		out.CacheHitRate = float64(snap.CacheHits) / float64(total)
@@ -430,6 +432,7 @@ func settingsFromConfig(c config.Config) Settings {
 		PrivacyEnabled:            c.Privacy.Enabled,
 		PrivacyOnScanFailure:      c.Privacy.OnScanFailure,
 		PrivacyOnUnresolved:       c.Privacy.OnUnresolvedPlaceholder,
+		PrivacyScanTimeoutMS:      c.Privacy.ScanTimeoutMS,
 		PrivacyDenylist:           c.Privacy.Denylist,
 	}
 }
@@ -447,7 +450,8 @@ var (
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
 		"updateCheckIntervalHours",
-		"privacyEnabled", "privacyOnScanFailure", "privacyOnUnresolved", "privacyDenylist",
+		"privacyEnabled", "privacyOnScanFailure", "privacyOnUnresolved",
+		"privacyScanTimeoutMs", "privacyDenylist",
 	}
 )
 
@@ -494,6 +498,12 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 	if s.PrivacyOnUnresolved == "" {
 		s.PrivacyOnUnresolved = config.Default().Privacy.OnUnresolvedPlaceholder
 	}
+	// Zero is "unset", not "unbounded", for the same reason: a client built
+	// before this field existed omits it, and must not be reported as having
+	// turned the scan budget off.
+	if s.PrivacyScanTimeoutMS == 0 {
+		s.PrivacyScanTimeoutMS = config.Default().Privacy.ScanTimeoutMS
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -517,6 +527,7 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		c.Privacy.Enabled = s.PrivacyEnabled
 		c.Privacy.OnScanFailure = s.PrivacyOnScanFailure
 		c.Privacy.OnUnresolvedPlaceholder = s.PrivacyOnUnresolved
+		c.Privacy.ScanTimeoutMS = s.PrivacyScanTimeoutMS
 		c.Privacy.Denylist = s.PrivacyDenylist
 		return nil
 	}); err != nil {
@@ -554,6 +565,7 @@ func diffSettings(before, after Settings) Applied {
 		"privacyEnabled":            before.PrivacyEnabled != after.PrivacyEnabled,
 		"privacyOnScanFailure":      before.PrivacyOnScanFailure != after.PrivacyOnScanFailure,
 		"privacyOnUnresolved":       before.PrivacyOnUnresolved != after.PrivacyOnUnresolved,
+		"privacyScanTimeoutMs":      before.PrivacyScanTimeoutMS != after.PrivacyScanTimeoutMS,
 		"privacyDenylist":           !stringSlicesEqual(before.PrivacyDenylist, after.PrivacyDenylist),
 	}
 	for _, name := range liveSettingsFields {
