@@ -49,6 +49,11 @@ func (s *Store) loadLocked() (Config, error) {
 	if cfg.Listen.APIKey == "" {
 		cfg.Listen.APIKey = newAPIKey()
 	}
+	// A hand-edited 0 (or a negative) would be handed to a ticker; correct it
+	// here rather than making every consumer defend against it.
+	if cfg.Update.CheckIntervalHours <= 0 {
+		cfg.Update.CheckIntervalHours = Default().Update.CheckIntervalHours
+	}
 	return cfg, nil
 }
 

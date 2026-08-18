@@ -17,6 +17,7 @@ import (
 
 	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/testutil"
+	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -343,8 +344,11 @@ func TestControlAPIUpdateSettingsRejectsInvalidValues(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
+	// Invalid in exactly one field — switchThreshold — so a 400 proves that is
+	// what was rejected rather than something else being incidentally absent.
 	body := `{"switchThreshold":-1,"retryBudgetMs":10000,"inlineAbsorbMaxMs":5000,` +
-		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90}`
+		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +373,8 @@ func TestControlAPIUpdateSettingsPersistsValidValues(t *testing.T) {
 
 	body := `{"switchThreshold":0.5,"retryBudgetMs":8000,"inlineAbsorbMaxMs":4000,` +
 		`"headerTimeoutMs":30000,"bodyIdleMs":60000,"sessionAffinity":false,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -397,7 +402,8 @@ func TestControlAPIGetSettingsReflectsAPersistedUpdate(t *testing.T) {
 
 	body := `{"switchThreshold":0.6,"retryBudgetMs":8000,"inlineAbsorbMaxMs":4000,` +
 		`"headerTimeoutMs":30000,"bodyIdleMs":60000,"sessionAffinity":false,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":120,"metricsRetentionDays":30,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -441,7 +447,8 @@ func TestControlAPIUpdateSettingsResponseReportsLiveAndNeedsRestartFields(t *tes
 	// neither list.
 	body := `{"switchThreshold":0.5,"retryBudgetMs":10000,"inlineAbsorbMaxMs":5000,` +
 		`"headerTimeoutMs":60000,"bodyIdleMs":120000,"sessionAffinity":true,` +
-		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90}`
+		`"blockedModels":["*fable*"],"quotaProbeIntervalSeconds":300,"metricsRetentionDays":90,` +
+		`"updateCheckEnabled":true,"updateCheckIntervalHours":24}`
 	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/settings", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -910,4 +917,72 @@ func TestControlAPILoginOutlivesTheBeginRequestAndStillTimesOut(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("login session never timed out; it must not have finished on its own")
+}
+
+// The update route distinguishes its failures, because "500" tells an
+// operator nothing about whether to re-run the installer, wait, or worry.
+func TestUpdateRouteMapsFailuresToDistinctStatuses(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"in progress", updater.ErrUpdateInProgress, http.StatusConflict},
+		{"dev build", updater.ErrDevBuild, http.StatusPreconditionFailed},
+		{"not writable", fmt.Errorf("%w: /usr/local/bin", updater.ErrNotWritable), http.StatusForbidden},
+		{"checksum", fmt.Errorf("%w: bad digest", updater.ErrChecksumMismatch), http.StatusBadGateway},
+		{"other", errors.New("network is unreachable"), http.StatusInternalServerError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			writeUpdateError(rec, tc.err)
+			if rec.Code != tc.want {
+				t.Errorf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
+// The route is reachable, gated like every other control endpoint, and
+// answers with JSON rather than falling through to the proxy. The harness's
+// view.Local has no checker attached, so this asserts the wiring and the
+// error path; the happy path is covered in internal/updater and internal/view.
+func TestControlAPIUpdateRouteIsWiredAndNotProxied(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	req, _ := http.NewRequest(http.MethodPost, h.srv.URL+ReservedPrefix+"/api/v1/update", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+
+	// 500 because no checker is configured — never 404 (unrouted) and never a
+	// proxied upstream answer.
+	if res.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, body = %s", res.StatusCode, body)
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
+		t.Errorf("Content-Type = %q, want JSON", ct)
+	}
+	if !strings.Contains(string(body), "not configured") {
+		t.Errorf("body = %s, want it to say why", body)
+	}
+}
+
+// A GET on the update path must not be forwarded upstream with a credential
+// attached — the same hazard router.go's MethodNotAllowed comment describes.
+func TestControlAPIUpdateRejectsGet(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	res, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, res.Body)
+	if res.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", res.StatusCode)
+	}
 }

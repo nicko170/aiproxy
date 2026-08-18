@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/testutil"
+	"github.com/nicko170/aiproxy/internal/updater"
 )
 
 // testHarness wires a Local over real (in-memory / temp-file) services, the
@@ -90,7 +92,7 @@ func newHarnessWithProviders(t *testing.T, now func() time.Time, providers map[s
 	if now != nil {
 		opts = append(opts, withClock(now))
 	}
-	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, pb, opts...)
+	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, pb, nil, opts...)
 	return &testHarness{t: t, local: local, mgr: mgr, ms: ms, cs: cs, ing: ing, probe: pb, dropped: dropped}
 }
 
@@ -519,7 +521,7 @@ func TestUpdateSettingsRejectsInvalidValuesWithoutPersisting(t *testing.T) {
 	bad := Settings{
 		SwitchThreshold: -1, RetryBudgetMS: 10000, InlineAbsorbMaxMS: 5000,
 		HeaderTimeoutMS: 60000, BodyIdleMS: 120000, QuotaProbeIntervalSeconds: 300,
-		MetricsRetentionDays: 90,
+		MetricsRetentionDays: 90, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), bad); err == nil {
 		t.Error("want an error for a negative switch threshold")
@@ -542,7 +544,7 @@ func TestUpdateSettingsPersistsAndAppliesLiveTunableFieldsImmediately(t *testing
 		SwitchThreshold: 0.5, RetryBudgetMS: 8000, InlineAbsorbMaxMS: 4000,
 		HeaderTimeoutMS: 30000, BodyIdleMS: 60000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 120,
-		MetricsRetentionDays: 30,
+		MetricsRetentionDays: 30, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), good); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
@@ -591,6 +593,8 @@ func TestUpdateSettingsReportsAppliedLiveAndNeedsRestartFields(t *testing.T) {
 		BlockedModels:             []string{"*fable*"}, // changed from []: restart-gated
 		QuotaProbeIntervalSeconds: def.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      def.Metrics.RetentionDays,
+		UpdateCheckEnabled:        def.Update.CheckEnabled,
+		UpdateCheckIntervalHours:  def.Update.CheckIntervalHours,
 	}
 	applied, err := h.local.UpdateSettings(context.Background(), s)
 	if err != nil {
@@ -624,7 +628,7 @@ func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
 		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*", "*mythos*"}, QuotaProbeIntervalSeconds: 200,
-		MetricsRetentionDays: 45,
+		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
@@ -650,7 +654,7 @@ func TestSettingsReadModifyWritePreservesUntouchedFields(t *testing.T) {
 		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 200,
-		MetricsRetentionDays: 45,
+		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), initial); err != nil {
 		t.Fatalf("UpdateSettings (seed): %v", err)
@@ -1016,5 +1020,214 @@ func TestImportCredentialsUnknownSourceReturnsError(t *testing.T) {
 	h := newHarness(t)
 	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSource("bogus")); err == nil {
 		t.Error("want an error for an unknown import source")
+	}
+}
+
+// The update settings round-trip through the seam like every other field, and
+// the interval is restart-gated because the checker's ticker is built once.
+func TestUpdateSettingsRoundTripsTheUpdateBlock(t *testing.T) {
+	local := newHarness(t).local
+	s, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.UpdateCheckEnabled || s.UpdateCheckIntervalHours != 24 {
+		t.Fatalf("defaults not surfaced: %+v", s)
+	}
+
+	s.UpdateCheckIntervalHours = 6
+	applied, err := local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(applied.NeedsRestart, "updateCheckIntervalHours") {
+		t.Errorf("NeedsRestart = %v, want updateCheckIntervalHours", applied.NeedsRestart)
+	}
+
+	back, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.UpdateCheckIntervalHours != 6 {
+		t.Errorf("interval did not persist: %d", back.UpdateCheckIntervalHours)
+	}
+}
+
+// A zero interval is refused before it is written: a bad value on disk
+// survives a restart, which is worse than a rejected call.
+func TestValidateRejectsANonPositiveUpdateInterval(t *testing.T) {
+	s := Settings{
+		SwitchThreshold: 0.9, RetryBudgetMS: 1000, HeaderTimeoutMS: 1000, BodyIdleMS: 1000,
+		QuotaProbeIntervalSeconds: 300, MetricsRetentionDays: 90,
+		UpdateCheckEnabled: true, UpdateCheckIntervalHours: 0,
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatal("Validate accepted a zero updateCheckIntervalHours")
+	}
+}
+
+// newLocalWithUpdater reuses the existing harness and attaches ck. Setting the
+// field rather than adding a constructor parameter keeps newHarness — used by
+// every other test in this file — passing nil for it, unchanged.
+func newLocalWithUpdater(t *testing.T, ck *updater.Checker) *Local {
+	t.Helper()
+	local := newHarness(t).local
+	local.updates = ck
+	return local
+}
+
+// latestReleaseServer answers the redirect Check follows, reporting tag as the
+// latest release and counting every request it receives.
+func latestReleaseServer(t *testing.T, tag string, hits *int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits != nil {
+			*hits++
+		}
+		w.Header().Set("Location", "/owner/repo/releases/tag/"+tag)
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func startedChecker(t *testing.T, srv *httptest.Server, current string, delay time.Duration) *updater.Checker {
+	t.Helper()
+	c := updater.New("owner/repo", current,
+		updater.WithBaseURL(srv.URL), updater.WithHTTPClient(srv.Client()))
+	ck := updater.NewChecker(c, true, time.Hour, updater.WithInitialDelay(delay))
+	ck.Start()
+	t.Cleanup(ck.Stop)
+	return ck
+}
+
+// awaitUpdateStatus polls ServerStatus until cond holds, so a test observes the
+// background checker the way the TUI does rather than by reaching into it.
+func awaitUpdateStatus(t *testing.T, local *Local, cond func(UpdateStatus) bool) UpdateStatus {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var last UpdateStatus
+	for time.Now().Before(deadline) {
+		st, err := local.ServerStatus(context.Background())
+		if err != nil {
+			t.Fatalf("ServerStatus: %v", err)
+		}
+		last = st.Update
+		if cond(last) {
+			return last
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out; last Update = %+v", last)
+	return last
+}
+
+// Update availability rides on Status, exactly as Probe does, so the TUI's
+// existing status poll renders it with no second poll and no new route.
+func TestServerStatusReportsUpdateAvailability(t *testing.T) {
+	srv := latestReleaseServer(t, "v0.9.0", nil)
+	local := newLocalWithUpdater(t, startedChecker(t, srv, "0.1.0", time.Millisecond))
+
+	up := awaitUpdateStatus(t, local, func(u UpdateStatus) bool { return u.Available })
+	if up.CurrentVersion != "0.1.0" || up.LatestVersion != "0.9.0" {
+		t.Errorf("Update = %+v", up)
+	}
+	if up.ReleaseURL == "" || up.CheckedAt == 0 {
+		t.Errorf("Update = %+v", up)
+	}
+	if up.CheckError != "" || up.Disabled || up.DevBuild {
+		t.Errorf("Update = %+v", up)
+	}
+}
+
+// Property 4: reading Status never touches the network. The checker polls on
+// its own cadence and ServerStatus reads a cache, so a hundred status reads
+// cost exactly the requests the checker already made — which is what keeps a
+// TUI frame and a proxied request from ever waiting on github.com.
+func TestServerStatusNeverHitsTheNetwork(t *testing.T) {
+	hits := 0
+	// A one-hour interval means the loop checks once and then sleeps well past
+	// the end of this test, so any growth in hits came from ServerStatus.
+	srv := latestReleaseServer(t, "v0.9.0", &hits)
+	local := newLocalWithUpdater(t, startedChecker(t, srv, "0.1.0", time.Millisecond))
+	awaitUpdateStatus(t, local, func(u UpdateStatus) bool { return u.Available })
+
+	before := hits
+	for i := 0; i < 100; i++ {
+		if _, err := local.ServerStatus(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hits != before {
+		t.Errorf("100 status reads made %d extra requests, want 0", hits-before)
+	}
+}
+
+// A Local built without a checker reports a disabled update status rather than
+// panicking — the same courtesy probeStatus already extends to a nil prober.
+func TestServerStatusWithoutAnUpdaterReportsDisabled(t *testing.T) {
+	local := newLocalWithUpdater(t, nil)
+	st, err := local.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Update.Disabled || st.Update.Available {
+		t.Errorf("Update = %+v, want Disabled and not Available", st.Update)
+	}
+}
+
+func TestApplyUpdateWithoutAnUpdaterFails(t *testing.T) {
+	local := newLocalWithUpdater(t, nil)
+	if _, err := local.ApplyUpdate(context.Background()); err == nil {
+		t.Fatal("ApplyUpdate should fail with no updater configured")
+	}
+}
+
+// Nothing-to-do outcomes are results, not errors: a caller must be able to
+// render "already on 0.1.0" without inspecting an error string.
+func TestApplyUpdateReportsUpToDateAsAResult(t *testing.T) {
+	srv := latestReleaseServer(t, "v0.1.0", nil)
+	local := newLocalWithUpdater(t, startedChecker(t, srv, "0.1.0", time.Hour))
+
+	res, err := local.ApplyUpdate(context.Background())
+	if err != nil {
+		t.Fatalf("ApplyUpdate: %v", err)
+	}
+	if res.Updated {
+		t.Error("Updated should be false")
+	}
+	if res.Message == "" {
+		t.Error("Message should say what happened")
+	}
+}
+
+// updateCheckEnabled is live: toggling it through the seam reaches the running
+// checker, which is why it belongs in liveSettingsFields.
+func TestUpdateSettingsAppliesCheckEnabledLive(t *testing.T) {
+	srv := latestReleaseServer(t, "v0.9.0", nil)
+	local := newLocalWithUpdater(t, startedChecker(t, srv, "0.1.0", time.Millisecond))
+	awaitUpdateStatus(t, local, func(u UpdateStatus) bool { return u.Available })
+
+	s, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.UpdateCheckEnabled = false
+	applied, err := local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(applied.Live, "updateCheckEnabled") {
+		t.Errorf("Live = %v, want updateCheckEnabled", applied.Live)
+	}
+	st, err := local.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Update.Disabled {
+		t.Error("disabling the check should show up in Status immediately")
+	}
+	if st.Update.Available {
+		t.Error("a disabled check must stop offering an update")
 	}
 }

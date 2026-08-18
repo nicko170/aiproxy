@@ -2,6 +2,7 @@ package view
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
+	"github.com/nicko170/aiproxy/internal/updater"
 )
 
 // statusLatencyWindow bounds how far back ServerStatus looks for its p95
@@ -29,6 +31,7 @@ type Local struct {
 	metrics *metrics.Store
 	config  *config.Store
 	probe   *prober.Prober
+	updates *updater.Checker
 
 	listenAddr string
 	started    time.Time
@@ -49,6 +52,16 @@ type Local struct {
 	// whole body of each mutation makes the pair atomic with respect to every
 	// other mutation.
 	mu sync.Mutex
+
+	// updMu serializes ApplyUpdate against itself, and only against itself.
+	// It is not l.mu because an install downloads several megabytes over a
+	// possibly slow link: holding the mutation lock across that would block
+	// SetPriority, SetAccountEnabled, and UpdateSettings for the duration, and
+	// there is nothing in an install that could interleave badly with them
+	// anyway (it touches no config and no Manager state). What must not happen
+	// is two installs racing to rename over the same path, which is exactly
+	// what this prevents.
+	updMu sync.Mutex
 }
 
 // option configures a Local at construction. It exists so tests can inject a
@@ -72,7 +85,12 @@ func withClock(now func() time.Time) option {
 // constructs one (even with quotaProbe.intervalSeconds 0, which disables
 // only its periodic loop — see prober.New's doc comment), so pb is never nil
 // in production.
-func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, pb *prober.Prober, opts ...option) *Local {
+//
+// upd is the background update checker ServerStatus reports from and
+// ApplyUpdate installs through; it may be nil (a Local built without one
+// reports update checking as disabled rather than panicking, matching how pb
+// is handled).
+func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, pb *prober.Prober, upd *updater.Checker, opts ...option) *Local {
 	if dropped == nil {
 		dropped = func() int64 { return 0 }
 	}
@@ -82,6 +100,7 @@ func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenA
 		metrics:    ms,
 		config:     cs,
 		probe:      pb,
+		updates:    upd,
 		listenAddr: listenAddr,
 		started:    now(),
 		dropped:    dropped,
@@ -122,6 +141,67 @@ func (l *Local) ServerStatus(ctx context.Context) (Status, error) {
 		MetricsDropped: l.dropped(),
 		EventsDropped:  l.hub.droppedCount(),
 		Probe:          l.probeStatus(),
+		Update:         l.updateStatus(),
+	}, nil
+}
+
+// updateStatus converts the checker's cached state into the view-level shape
+// ServerStatus reports. This never performs I/O — that is the entire reason
+// the checker caches — so a status poll costs the same whether or not a check
+// is due. A nil checker reports Disabled rather than an empty "up to date",
+// which would be a lie about a question that was never asked.
+func (l *Local) updateStatus() UpdateStatus {
+	if l.updates == nil {
+		return UpdateStatus{Disabled: true}
+	}
+	st := l.updates.State()
+	return UpdateStatus{
+		CurrentVersion: st.Current,
+		LatestVersion:  st.Latest,
+		Available:      st.Available,
+		ReleaseURL:     st.PageURL,
+		CheckedAt:      st.CheckedAt,
+		CheckError:     st.Err,
+		Disabled:       st.Disabled,
+		DevBuild:       st.DevBuild,
+	}
+}
+
+// ApplyUpdate installs the latest release over the running binary.
+//
+// The two nothing-to-do outcomes — already current, and no releases published
+// — come back as a Result with Updated false and a nil error, because a
+// settings screen showing them in red would be wrong. Everything else is a
+// real error, wrapped by internal/updater's sentinels so the control API can
+// map it to a status code that means something (see writeUpdateError).
+func (l *Local) ApplyUpdate(ctx context.Context) (UpdateResult, error) {
+	if l.updates == nil {
+		return UpdateResult{}, fmt.Errorf("update checking is not configured")
+	}
+	if !l.updMu.TryLock() {
+		return UpdateResult{}, updater.ErrUpdateInProgress
+	}
+	defer l.updMu.Unlock()
+
+	res, err := l.updates.Apply(ctx)
+	switch {
+	case errors.Is(err, updater.ErrUpToDate):
+		return UpdateResult{
+			PreviousVersion: res.PreviousVersion,
+			Version:         res.Version,
+			Message:         "already on " + res.Version,
+		}, nil
+	case errors.Is(err, updater.ErrNoReleases):
+		return UpdateResult{Message: "no releases published yet"}, nil
+	case err != nil:
+		return UpdateResult{}, err
+	}
+	return UpdateResult{
+		Updated:         true,
+		PreviousVersion: res.PreviousVersion,
+		Version:         res.Version,
+		Path:            res.Path,
+		Message:         "updated to " + res.Version + " — restart to apply",
 	}, nil
 }
 
@@ -316,6 +396,8 @@ func settingsFromConfig(c config.Config) Settings {
 		BlockedModels:             c.Routing.BlockedModels,
 		QuotaProbeIntervalSeconds: c.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      c.Metrics.RetentionDays,
+		UpdateCheckEnabled:        c.Update.CheckEnabled,
+		UpdateCheckIntervalHours:  c.Update.CheckIntervalHours,
 	}
 }
 
@@ -327,10 +409,11 @@ func settingsFromConfig(c config.Config) Settings {
 // wire the corresponding Manager setter; UpdateSettings's diff logic does not
 // change.
 var (
-	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity"}
+	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity", "updateCheckEnabled"}
 	restartSettingsFields = []string{
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
+		"updateCheckIntervalHours",
 	}
 )
 
@@ -382,6 +465,8 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		c.Retry.BodyIdleMS = s.BodyIdleMS
 		c.QuotaProbe.IntervalSeconds = s.QuotaProbeIntervalSeconds
 		c.Metrics.RetentionDays = s.MetricsRetentionDays
+		c.Update.CheckEnabled = s.UpdateCheckEnabled
+		c.Update.CheckIntervalHours = s.UpdateCheckIntervalHours
 		return nil
 	}); err != nil {
 		return Applied{}, err
@@ -389,6 +474,9 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 
 	l.mgr.SetSwitchThreshold(s.SwitchThreshold)
 	l.mgr.SetSessionAffinity(s.SessionAffinity)
+	if l.updates != nil {
+		l.updates.SetEnabled(s.UpdateCheckEnabled)
+	}
 	return applied, nil
 }
 
@@ -410,6 +498,8 @@ func diffSettings(before, after Settings) Applied {
 		"bodyIdleMs":                before.BodyIdleMS != after.BodyIdleMS,
 		"quotaProbeIntervalSeconds": before.QuotaProbeIntervalSeconds != after.QuotaProbeIntervalSeconds,
 		"metricsRetentionDays":      before.MetricsRetentionDays != after.MetricsRetentionDays,
+		"updateCheckEnabled":        before.UpdateCheckEnabled != after.UpdateCheckEnabled,
+		"updateCheckIntervalHours":  before.UpdateCheckIntervalHours != after.UpdateCheckIntervalHours,
 	}
 	for _, name := range liveSettingsFields {
 		if changed[name] {

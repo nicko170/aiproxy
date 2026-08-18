@@ -73,10 +73,16 @@ type Model struct {
 	help          bool
 	flash         flash
 
-	status     view.Status
-	statusErr  string
-	accounts   []view.Account
-	accountsAt time.Time
+	status    view.Status
+	statusErr string
+	// updateInstalled is the version a successful in-app update wrote to disk
+	// this session, or "". It is TUI-local rather than a Status field because
+	// it is a fact about this UI's own action, not about the running proxy:
+	// the flash announcing it expires in five seconds and the pending restart
+	// does not, so the header keeps saying so.
+	updateInstalled string
+	accounts        []view.Account
+	accountsAt      time.Time
 
 	// resets holds the latest observed reset instant per account per bucket
 	// (unix ms), read from quota history; sparks holds each account's
@@ -173,6 +179,15 @@ type actionMsg struct {
 }
 
 type openedMsg struct{ err error }
+
+// updateAppliedMsg reports an in-app update attempt. It is not an actionMsg:
+// the success wording comes from view.UpdateResult.Message (one place words
+// "restart to apply", shared with the CLI) rather than from a past-tense verb
+// chosen here.
+type updateAppliedMsg struct {
+	res view.UpdateResult
+	err error
+}
 
 // --- commands ---
 
@@ -283,6 +298,20 @@ func (m Model) probeNow() tea.Cmd {
 	}
 }
 
+// applyUpdate installs the latest release. The download runs in a command, on
+// its own goroutine, with a timeout of its own: fetching several megabytes has
+// nothing to do with fetchTimeout, which bounds a status read.
+func (m Model) applyUpdate() tea.Cmd {
+	src := m.src
+	parent := m.ctx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(parent, 10*time.Minute)
+		defer cancel()
+		res, err := src.ApplyUpdate(ctx)
+		return updateAppliedMsg{res: res, err: err}
+	}
+}
+
 // openDashboard opens the control UI in the default browser, from a command
 // so a slow launcher never stalls a frame.
 func (m Model) openDashboard() tea.Cmd {
@@ -380,6 +409,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case updateAppliedMsg:
+		if msg.err != nil {
+			m.flash = m.newFlash(sevBad, "update failed: "+msg.err.Error())
+			return m, nil
+		}
+		if msg.res.Updated {
+			m.updateInstalled = msg.res.Version
+		}
+		m.flash = m.newFlash(sevOK, msg.res.Message)
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -453,6 +493,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.probeNow()
 	case "o":
 		return m, m.openDashboard()
+	case "u":
+		return m.startUpdate()
 	default:
 		switch m.screen {
 		case screenActivity:
@@ -464,6 +506,27 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case screenSettings:
 			return m.settingsKey(msg)
 		}
+	}
+	return m, nil
+}
+
+// startUpdate applies an available update, or explains why it will not. The
+// three no-op cases are distinguished on purpose: "nothing available", "your
+// check is switched off", and "this is a dev build" are different situations,
+// and one shared "nothing to do" would leave two of them looking like a bug.
+func (m Model) startUpdate() (tea.Model, tea.Cmd) {
+	switch {
+	case m.updateInstalled != "":
+		m.flash = m.newFlash(sevOK, "already updated to "+m.updateInstalled+" — restart to apply")
+	case m.status.Update.DevBuild:
+		m.flash = m.newFlash(sevWarn, "dev build — install a release to update in place")
+	case m.status.Update.Disabled:
+		m.flash = m.newFlash(sevWarn, "update checking is off — enable it in settings")
+	case !m.status.Update.Available:
+		m.flash = m.newFlash(sevOK, "no newer release available")
+	default:
+		m.flash = m.newFlash(sevOK, "updating to "+m.status.Update.LatestVersion+"…")
+		return m, m.applyUpdate()
 	}
 	return m, nil
 }
@@ -587,8 +650,66 @@ func (m Model) viewHeader() string {
 	if m.statusErr != "" {
 		segs = append(segs, th.bad("status query failed"))
 	}
-	line := strings.Join(segs, th.dim("  ·  "))
+
+	// The update segment degrades in three steps rather than being width-gated
+	// like "up" and "p95" above. A gate would hide it entirely on an
+	// 80-column terminal, and being seen is the whole point of it; appending it
+	// unconditionally would let clipAnsi cut it mid-word ("^ 0.2.0 availab"),
+	// which reads as a rendering fault. So: try the full wording, fall back to
+	// just the version, and only drop it when even that will not fit.
+	join := func(extra string) string {
+		if extra == "" {
+			return strings.Join(segs, th.dim("  ·  "))
+		}
+		return strings.Join(append(append([]string{}, segs...), extra), th.dim("  ·  "))
+	}
+	line := join("")
+	for _, seg := range m.updateSegments() {
+		if candidate := join(seg); lipgloss.Width(candidate) <= m.width {
+			line = candidate
+			break
+		}
+	}
 	return padAnsi(line, m.width)
+}
+
+// updateSegments returns the header's update wordings from longest to
+// shortest, already styled, or nothing when there is no update to report.
+//
+// One wording, never both: updater.Checker.Apply clears Available the moment
+// an update is installed, so "available" and "installed" cannot both be true —
+// and an installed update outranks an available one regardless, because the
+// action it asks for (restart) is the only one left.
+func (m Model) updateSegments() []string {
+	th := m.th
+	arrow := "↑ "
+	if th.mode == modeNone {
+		arrow = "^ "
+	}
+	switch {
+	case m.updateInstalled != "":
+		sep := " · "
+		if th.mode == modeNone {
+			sep = " - "
+		}
+		// The shortest form keeps "restart" and drops the version, not the
+		// other way round: under modeNone the two states have no colour to
+		// tell them apart, and "^ 0.2.0" alone would read identically to an
+		// update that is merely available — pointing at the wrong key.
+		return []string{
+			th.warn(arrow + m.updateInstalled + " installed" + sep + "restart"),
+			th.warn(arrow + m.updateInstalled + sep + "restart"),
+			th.warn(arrow + "restart"),
+			th.warn("restart"),
+		}
+	case m.status.Update.Available:
+		v := m.status.Update.LatestVersion
+		return []string{
+			th.accent(arrow + v + " available"),
+			th.accent(arrow + v),
+		}
+	}
+	return nil
 }
 
 func (m Model) viewTabs() string {
@@ -624,7 +745,7 @@ func (m Model) viewFooter() string {
 	default:
 		switch m.screen {
 		case screenOverview:
-			keys = []string{"l login", "p probe", "o dashboard"}
+			keys = []string{"l login", "p probe", "o dashboard", "u update"}
 		case screenActivity:
 			keys = m.activityFooter()
 		case screenUsage:
@@ -661,32 +782,41 @@ func (m Model) viewFooter() string {
 
 func (m Model) viewHelp(h int) string {
 	th := m.th
+	// Every row here must be visible at a 28-line terminal, the shortest the
+	// golden frames pin. overlay does not scroll and fitHeight clips the frame
+	// from the bottom, so a panel one line too tall silently hides a key
+	// rather than reporting anything — which is exactly what it did before the
+	// blank separators came out and "q quit" (already in the footer of every
+	// screen, this one included) stopped being repeated here. The dim section
+	// headers do the grouping the blank lines used to.
 	rows := [][2]string{
 		{"1–5, tab", "switch screens"},
 		{"l", "log in with Anthropic"},
 		{"p", "probe quota now"},
 		{"o", "open the dashboard"},
-		{"", ""},
+		{"u", "install the latest release"},
 		{"activity", ""},
 		{"space", "pause and resume the feed"},
 		{"j/k", "scroll; G returns to live tail"},
 		{"a m c", "filter by account, model, outcome"},
 		{"v", "switch between requests and the log"},
-		{"", ""},
 		{"usage", ""},
 		{"r", "cycle range: 1h, 24h, 7d, 30d"},
 		{"g", "group by account, model, or outcome"},
-		{"", ""},
 		{"accounts", ""},
 		{"e", "enable or disable"},
 		{"+/-", "raise or lower priority"},
 		{"x", "remove (asks first)"},
 		{"i", "import credentials"},
-		{"", ""},
-		{"q", "quit aiproxy"},
 	}
+	// "q quit" is deliberately absent: the footer shows it on every screen,
+	// including this one, and the panel is height-clipped by fitHeight — a
+	// duplicated row costs two lines that a real key would otherwise use.
 	var b strings.Builder
-	b.WriteString(th.bold("keys") + "\n\n")
+	// One newline, not two: the panel's own top padding already separates the
+	// title, and at a 28-line terminal the extra line is what pushes the
+	// closing border off the bottom.
+	b.WriteString(th.bold("keys") + "\n")
 	for _, r := range rows {
 		if r[0] == "" && r[1] == "" {
 			b.WriteString("\n")

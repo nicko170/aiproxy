@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -65,7 +67,7 @@ func TestEndToEndProxiesAStreamingCompletion(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -144,7 +146,7 @@ func TestBuildHandlerWiresTransportHeaderTimeoutFromConfig(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -176,7 +178,7 @@ func TestEndToEndStatusEndpoint(t *testing.T) {
 		return nil
 	})
 
-	h, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -234,7 +236,7 @@ func TestBuildHandlerPersistsRefreshedCredentials(t *testing.T) {
 		}}
 		return nil
 	})
-	if _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t)); err != nil {
+	if _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t)); err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
 
@@ -298,5 +300,54 @@ func TestFirstRunImportSkipsWhenAccountsExist(t *testing.T) {
 	cfg, _ := store.Load()
 	if len(cfg.Accounts) != 1 || cfg.Accounts[0].Label != "mine" {
 		t.Errorf("accounts = %+v, want the existing one untouched", cfg.Accounts)
+	}
+}
+
+// The status endpoint reports the running version through the seam, so the
+// TUI and a future dashboard both learn it from one place rather than each
+// being handed a version string separately.
+func TestStatusReportsTheRunningVersion(t *testing.T) {
+	cfg := config.Default()
+	cfg.Update.CheckEnabled = false // no outbound request from a test
+	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+
+	_, _, vl, ck, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ck.Start()
+	defer ck.Stop()
+
+	st, err := vl.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Update.CurrentVersion != version {
+		t.Errorf("CurrentVersion = %q, want %q", st.Update.CurrentVersion, version)
+	}
+	if !st.Update.Disabled {
+		t.Error("Disabled should be true when update.checkEnabled is false")
+	}
+}
+
+func TestUnknownSubcommandIsRejected(t *testing.T) {
+	var out bytes.Buffer
+	code := dispatchSubcommand([]string{"updat"}, &out)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	if !strings.Contains(out.String(), "update") {
+		t.Errorf("output = %q, want it to name the valid subcommands", out.String())
+	}
+}
+
+// A leading flag is the server's, not a subcommand's: dispatch must hand it
+// back rather than reporting "unknown command -addr".
+func TestNoSubcommandRunsTheServer(t *testing.T) {
+	var out bytes.Buffer
+	for _, args := range [][]string{nil, {"--headless"}, {"-addr", "127.0.0.1:0"}} {
+		if code := dispatchSubcommand(args, &out); code != -1 {
+			t.Errorf("dispatchSubcommand(%v) = %d, want -1 (not a subcommand, run the server)", args, code)
+		}
 	}
 }

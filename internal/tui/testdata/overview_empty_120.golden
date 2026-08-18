@@ -25,4 +25,4 @@ x aiproxy  ·  on 127.0.0.1:8118  ·  up 4h12m  ·  2 in flight  ·  p95 1.24s
                                                                                                                         
                                                                                                                         
 
-  l login  ·  p probe  ·  o dashboard  ·  ? help  ·  q quit                                                             
+  l login  ·  p probe  ·  o dashboard  ·  u update  ·  ? help  ·  q quit                                                

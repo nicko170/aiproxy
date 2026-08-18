@@ -117,6 +117,26 @@ func settingFields() []settingField {
 			get:  func(s view.Settings) string { return strconv.Itoa(s.MetricsRetentionDays) },
 			set:  func(s *view.Settings, v string) error { return setInt(&s.MetricsRetentionDays)(s, v) },
 		},
+		{
+			name: "updateCheckEnabled", boolean: true,
+			desc: "check github for newer aiproxy releases in the background",
+			get: func(s view.Settings) string {
+				if s.UpdateCheckEnabled {
+					return "on"
+				}
+				return "off"
+			},
+			set: func(s *view.Settings, v string) error {
+				s.UpdateCheckEnabled = v == "on"
+				return nil
+			},
+		},
+		{
+			name: "updateCheckIntervalHours", unit: "h",
+			desc: "how often to check for a newer release",
+			get:  func(s view.Settings) string { return strconv.Itoa(s.UpdateCheckIntervalHours) },
+			set:  func(s *view.Settings, v string) error { return setInt(&s.UpdateCheckIntervalHours)(s, v) },
+		},
 	}
 }
 
