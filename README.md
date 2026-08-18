@@ -54,6 +54,46 @@ go install github.com/nicko170/aiproxy/cmd/aiproxy@latest
 go build -o aiproxy ./cmd/aiproxy   # from a checkout
 ```
 
+## Updating
+
+aiproxy checks for a newer release once a day and says so in the TUI header:
+
+```
+● aiproxy  ·  on 127.0.0.1:3456  ·  up 4h12m  ·  2 in flight  ·  p95 240ms  ·  ↑ 0.2.0 available
+```
+
+Press `u` to install it, or from a shell:
+
+```sh
+aiproxy update           # install the latest release
+aiproxy update --check   # report only; exits 1 when an update is available
+```
+
+Either way the download is verified against the release's `checksums.txt`
+before anything is replaced, and the running process keeps serving on the old
+binary until you restart it — an update never interrupts a request in flight.
+Once one is installed the header says `↑ 0.2.0 installed · restart` until you do.
+
+If aiproxy was installed somewhere it can't write (a Homebrew or root-owned
+path), it says so and points you back at the installer rather than reaching for
+`sudo`.
+
+**Turning it off.** The check is one HTTPS request to github.com per day, which
+tells GitHub this installation's IP address and version. To stop it, toggle it
+on the Settings screen (`5`) or set it in `config.json`:
+
+```json
+"update": { "checkEnabled": false, "checkIntervalHours": 24 }
+```
+
+With `checkEnabled` false, aiproxy makes no outbound request at all.
+`aiproxy update` still works, because running it is an explicit request.
+
+**What is verified, and what isn't.** `checksums.txt` is fetched over TLS from
+the same origin as the release asset, so it defends against a corrupted or
+truncated download. It is not a signature: anyone who could publish a release
+could publish its checksum too. Release signing isn't implemented yet.
+
 ## Quick start
 
 ```sh
@@ -95,8 +135,9 @@ everything. You can also import on demand from the Accounts screen with `i`:
 | `5` | Settings | edit runtime settings in place |
 
 `tab` / `shift+tab` cycle screens. `?` opens help, `q` quits (and shuts the
-proxy down with it). `l` starts a login, `p` forces a quota probe, and `o`
-opens the dashboard.
+proxy down with it). `l` starts a login, `p` forces a quota probe, `o`
+opens the dashboard, and `u` installs an available update (see
+[Updating](#updating)).
 
 Per-screen keys are shown in the footer: `space` pauses the activity feed,
 `a`/`m`/`c` filter it by account/model/outcome and `v` toggles the log view;
@@ -117,7 +158,8 @@ you on first run; the Settings screen edits most of it live.
   "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000 },
   "quotaProbe": { "intervalSeconds": 300 },
   "metrics": { "retentionDays": 90 },
-  "mitm": { "enabled": true }
+  "mitm": { "enabled": true },
+  "update": { "checkEnabled": true, "checkIntervalHours": 24 }
 }
 ```
 
@@ -135,6 +177,9 @@ you on first run; the Settings screen edits most of it live.
   endpoint is itself rate limited — polling it aggressively gets the probe
   throttled and leaves selection deciding on stale numbers. Set it to `0` to
   disable the background loop; `p` in the TUI still works.
+- **`update.checkEnabled`** turns the daily release check on or off and takes
+  effect immediately; **`checkIntervalHours`** takes effect on restart, because
+  the checker's ticker is built once at startup. See [Updating](#updating).
 
 ## Flags
 
@@ -145,6 +190,9 @@ you on first run; the Settings screen edits most of it live.
 | `--headless` | run without the TUI, logging to stderr |
 | `--log-level` | `debug`, `info`, `warn`, or `error` |
 | `--version` | print version and exit |
+
+One subcommand: `aiproxy update` (see [Updating](#updating)). Everything else is
+flags.
 
 `--headless` is how you run it as a service. The TUI and stderr logging can't
 share a terminal, so under the TUI logs feed the Activity screen's ring buffer
@@ -170,6 +218,7 @@ DELETE /_aiproxy/api/v1/accounts/{id}
 GET    /_aiproxy/api/v1/settings
 POST   /_aiproxy/api/v1/settings
 POST   /_aiproxy/api/v1/probe
+POST   /_aiproxy/api/v1/update
 POST   /_aiproxy/api/v1/accounts/import
 POST   /_aiproxy/api/v1/accounts/login
 ```
@@ -198,8 +247,9 @@ git tag v0.1.0 && git push origin v0.1.0
 `.github/workflows/release.yml` runs the suite, cross-compiles the four
 targets with the version stamped in via `-ldflags`, writes `checksums.txt`,
 and publishes the lot to a GitHub release. The asset naming
-(`aiproxy_<version>_<os>_<arch>.tar.gz`) is load-bearing — `install.sh`
-constructs that exact string.
+(`aiproxy_<version>_<os>_<arch>.tar.gz`) is load-bearing in three places:
+the workflow writes it, `install.sh` constructs it, and so does
+`internal/updater`'s `release` method. Change one and change all three.
 
 ## License
 
