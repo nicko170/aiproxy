@@ -36,10 +36,11 @@ That fetches the latest release for your platform, verifies it against the
 release's `checksums.txt`, and installs to `/usr/local/bin` — or to
 `~/.local/bin` if the system path isn't writable, rather than reaching for
 `sudo`. Set `BINDIR` to install elsewhere, or `AIPROXY_VERSION` to pin a
-version:
+version — on `sh`, not on `curl`, or the pipeline hands them to the wrong
+process and they are silently ignored:
 
 ```sh
-BINDIR=~/bin AIPROXY_VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/nicko170/aiproxy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/nicko170/aiproxy/main/install.sh | BINDIR=~/bin AIPROXY_VERSION=0.1.0 sh
 ```
 
 Prebuilt binaries are on the [releases page](https://github.com/nicko170/aiproxy/releases)
