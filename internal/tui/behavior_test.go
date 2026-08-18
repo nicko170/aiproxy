@@ -318,3 +318,136 @@ func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 		t.Error("a resultless close must say something happened")
 	}
 }
+
+// The header must offer an update when one exists and say nothing at all when
+// none does — a segment that is always present, reading "up to date", is
+// noise on every frame for the sake of one.
+func TestHeaderShowsAnAvailableUpdate(t *testing.T) {
+	m := fixtureModel(120, 28)
+	if strings.Contains(m.viewHeader(), "available") {
+		t.Fatal("header mentions an update when none is available")
+	}
+
+	m.status.Update = view.UpdateStatus{
+		CurrentVersion: "0.1.0", LatestVersion: "0.2.0", Available: true,
+	}
+	if !strings.Contains(m.viewHeader(), "0.2.0 available") {
+		t.Errorf("header = %q, want it to offer 0.2.0", m.viewHeader())
+	}
+}
+
+// Once installed, the header stops offering the update and starts asking for a
+// restart: the flash that said so has five seconds, and the pending restart
+// outlives it.
+func TestHeaderAsksForARestartAfterInstalling(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Update = view.UpdateStatus{CurrentVersion: "0.1.0", LatestVersion: "0.2.0"}
+	m.updateInstalled = "0.2.0"
+	h := m.viewHeader()
+	if !strings.Contains(h, "0.2.0 installed") || !strings.Contains(h, "restart") {
+		t.Errorf("header = %q, want it to ask for a restart", h)
+	}
+	if strings.Contains(h, "available") {
+		t.Errorf("header = %q, must not offer and report the same update at once", h)
+	}
+}
+
+// u with nothing available explains itself instead of failing.
+func TestUWithNoUpdateAvailableFlashesAnExplanation(t *testing.T) {
+	m := fixtureModel(80, 28)
+	m.status.Update = view.UpdateStatus{CurrentVersion: "0.1.0", LatestVersion: "0.1.0"}
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	got, _ := mustModel(next, cmd)
+	if got.flash.text == "" {
+		t.Error("u should say why it did nothing")
+	}
+	if cmd != nil {
+		t.Error("u must not call the seam when there is nothing to install")
+	}
+}
+
+// A dev build is told what it is, not that it is up to date.
+func TestUOnADevBuildSaysSo(t *testing.T) {
+	m := fixtureModel(80, 28)
+	m.status.Update = view.UpdateStatus{CurrentVersion: "dev", DevBuild: true}
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	got, _ := mustModel(next, cmd)
+	if !strings.Contains(got.flash.text, "dev build") {
+		t.Errorf("flash = %q, want it to mention a dev build", got.flash.text)
+	}
+}
+
+// The result's Message is rendered verbatim: the wording of "restart to
+// apply" lives in one place (view.Local.ApplyUpdate) so the TUI and the CLI
+// cannot drift apart on it.
+func TestUpdateAppliedMessageIsShownAndRemembered(t *testing.T) {
+	m := fixtureModel(80, 28)
+	next, _ := m.Update(updateAppliedMsg{res: view.UpdateResult{
+		Updated: true, Version: "0.2.0", Message: "updated to 0.2.0 — restart to apply",
+	}})
+	got, _ := mustModel(next, nil)
+	if got.flash.text != "updated to 0.2.0 — restart to apply" {
+		t.Errorf("flash = %q", got.flash.text)
+	}
+	if got.updateInstalled != "0.2.0" {
+		t.Errorf("updateInstalled = %q, want 0.2.0", got.updateInstalled)
+	}
+}
+
+func TestUpdateFailureFlashesTheError(t *testing.T) {
+	m := fixtureModel(80, 28)
+	next, _ := m.Update(updateAppliedMsg{err: errFake("checksum mismatch")})
+	got, _ := mustModel(next, nil)
+	if !strings.Contains(got.flash.text, "checksum mismatch") {
+		t.Errorf("flash = %q", got.flash.text)
+	}
+	if got.flash.sev != sevBad {
+		t.Error("a failed update should read as bad")
+	}
+	if got.updateInstalled != "" {
+		t.Error("a failed update must not claim a restart is pending")
+	}
+}
+
+// The header sheds whole words rather than letting clipAnsi cut one in half,
+// and whatever survives must still tell the operator which key to press. A
+// bare version number means "press u"; the word restart means "you already
+// did". Measured on View's first line, since that is the clipped one the
+// operator sees — viewHeader alone only pads.
+func TestUpdateHeaderDegradesWithoutBecomingAmbiguous(t *testing.T) {
+	headerOf := func(m Model) string {
+		return strings.SplitN(m.View(), "\n", 2)[0]
+	}
+	for _, w := range []int{40, 60, 80, 120} {
+		avail := fixtureModel(w, 28)
+		avail.status.Update = view.UpdateStatus{
+			CurrentVersion: "0.1.0", LatestVersion: "0.2.0", Available: true,
+		}
+		instal := fixtureModel(w, 28)
+		instal.status.Update = view.UpdateStatus{CurrentVersion: "0.1.0", LatestVersion: "0.2.0"}
+		instal.updateInstalled = "0.2.0"
+
+		availHdr, instalHdr := headerOf(avail), headerOf(instal)
+		for name, hdr := range map[string]string{"available": availHdr, "installed": instalHdr} {
+			if got := visibleWidth(hdr); got > w {
+				t.Errorf("%s header at %d is %d cells wide", name, w, got)
+			}
+			// A truncated word is the failure mode a width gate would have
+			// avoided and a bare append would have caused: any prefix present
+			// must be present in full.
+			for prefix, whole := range map[string]string{
+				"availa": "available", "instal": "installed", "resta": "restart",
+			} {
+				if strings.Contains(hdr, prefix) && !strings.Contains(hdr, whole) {
+					t.Errorf("%s header at %d was clipped mid-word: %q", name, w, hdr)
+				}
+			}
+		}
+		// At 40 columns the mandatory segments already fill the line, so
+		// dropping the update segment is correct — but wherever one IS shown,
+		// the two states must not read alike.
+		if w >= 60 && availHdr == instalHdr {
+			t.Errorf("at %d columns an available update and an installed one render identically:\n%q", w, availHdr)
+		}
+	}
+}

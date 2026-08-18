@@ -132,6 +132,21 @@ func fixtureModel(w, h int) Model {
 func frameCases() map[string]func(w, h int) Model {
 	return map[string]func(w, h int) Model{
 		"overview": func(w, h int) Model { return fixtureModel(w, h) },
+		"overview_update_available": func(w, h int) Model {
+			m := fixtureModel(w, h)
+			m.status.Update = view.UpdateStatus{
+				CurrentVersion: "0.1.0", LatestVersion: "0.2.0", Available: true,
+				ReleaseURL: "https://github.com/nicko170/aiproxy/releases/tag/v0.2.0",
+				CheckedAt:  fixtureNow.Add(-2 * time.Hour).UnixMilli(),
+			}
+			return m
+		},
+		"overview_update_installed": func(w, h int) Model {
+			m := fixtureModel(w, h)
+			m.status.Update = view.UpdateStatus{CurrentVersion: "0.1.0", LatestVersion: "0.2.0"}
+			m.updateInstalled = "0.2.0"
+			return m
+		},
 		"overview_empty": func(w, h int) Model {
 			m := fixtureModel(w, h)
 			m.accounts = nil

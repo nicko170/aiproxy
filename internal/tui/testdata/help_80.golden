@@ -4,25 +4,25 @@
             ╭─────────────────────────────────────────────────────╮             
             │                                                     │             
             │   keys                                              │             
-            │                                                     │             
             │     1–5, tab  switch screens                        │             
             │     l         log in with Anthropic                 │             
             │     p         probe quota now                       │             
             │     o         open the dashboard                    │             
-            │                                                     │             
+            │     u         install the latest release            │             
             │   activity                                          │             
             │     space     pause and resume the feed             │             
             │     j/k       scroll; G returns to live tail        │             
             │     a m c     filter by account, model, outcome     │             
             │     v         switch between requests and the log   │             
-            │                                                     │             
             │   usage                                             │             
             │     r         cycle range: 1h, 24h, 7d, 30d         │             
             │     g         group by account, model, or outcome   │             
-            │                                                     │             
             │   accounts                                          │             
             │     e         enable or disable                     │             
             │     +/-       raise or lower priority               │             
             │     x         remove (asks first)                   │             
+            │     i         import credentials                    │             
+            │                                                     │             
+            ╰─────────────────────────────────────────────────────╯             
 
   esc close  ·  ? help  ·  q quit                                               
