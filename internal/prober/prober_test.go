@@ -34,6 +34,17 @@ type fakeProvider struct {
 	block <-chan struct{}
 	// started, if non-nil, receives once per Quota call, before blocking.
 	started chan struct{}
+
+	// requireToken, when non-empty, makes Quota reject any credential whose
+	// access token differs — the way a real usage endpoint rejects a stale
+	// one. Empty (the default) accepts anything, so existing tests are
+	// unaffected.
+	requireToken string
+	// refreshTo is the credential Refresh hands back; refreshErr overrides it
+	// with a failure. refreshes counts the calls.
+	refreshTo  provider.Credential
+	refreshErr error
+	refreshes  atomic.Int32
 }
 
 type quotaResult struct {
@@ -43,7 +54,11 @@ type quotaResult struct {
 
 func (f *fakeProvider) Name() string { return "fake" }
 func (f *fakeProvider) Refresh(context.Context, provider.Credential) (provider.Credential, error) {
-	return provider.Credential{}, nil
+	f.refreshes.Add(1)
+	if f.refreshErr != nil {
+		return provider.Credential{}, f.refreshErr
+	}
+	return f.refreshTo, nil
 }
 func (f *fakeProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
 	return provider.Profile{}, provider.ErrUnsupported
@@ -61,8 +76,11 @@ func (f *fakeProvider) ClassifyResponse(*http.Response) provider.Outcome        
 func (f *fakeProvider) ParseUsage([]byte) (*provider.UsageDelta, bool)           { return nil, false }
 func (f *fakeProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)       { return nil, false }
 
-func (f *fakeProvider) Quota(ctx context.Context, _ provider.Credential) (provider.Quota, error) {
+func (f *fakeProvider) Quota(ctx context.Context, c provider.Credential) (provider.Quota, error) {
 	f.calls.Add(1)
+	if f.requireToken != "" && c.AccessToken != f.requireToken {
+		return provider.Quota{}, errors.New("usage: HTTP 401")
+	}
 	if f.started != nil {
 		f.started <- struct{}{}
 	}
@@ -86,7 +104,8 @@ func (f *fakeProvider) Quota(ctx context.Context, _ provider.Credential) (provid
 	return f.results[i].quota, f.results[i].err
 }
 
-func (f *fakeProvider) callCount() int { return int(f.calls.Load()) }
+func (f *fakeProvider) callCount() int    { return int(f.calls.Load()) }
+func (f *fakeProvider) refreshCount() int { return int(f.refreshes.Load()) }
 
 func oauthAcct(id string) config.Account {
 	return config.Account{
@@ -510,5 +529,97 @@ func TestStatusPrunesAccountsNoLongerInTheManager(t *testing.T) {
 	}
 	if _, ok := p.Status().Accounts["a"]; ok {
 		t.Error("Status().Accounts still has account \"a\" after it was removed from the Manager")
+	}
+}
+
+// expiringOAuthAcct is an OAuth account whose access token expires at
+// expiresAt, carrying a refresh token so a renewal is actually possible.
+func expiringOAuthAcct(id, token string, expiresAt time.Time) config.Account {
+	return config.Account{
+		ID: id, Provider: "fake", Label: id,
+		Credential: provider.Credential{
+			Type:         provider.CredentialOAuth,
+			AccessToken:  token,
+			RefreshToken: "rt",
+			ExpiresAt:    expiresAt.UnixMilli(),
+		},
+	}
+}
+
+// The prober read a.Credential straight off the manager snapshot and never
+// asked for it to be renewed, so an access token that expired while the proxy
+// sat idle made every cycle fail with HTTP 401 — and, since that is not a
+// throttling error, fail again every interval with no backoff. Utilization
+// then stayed frozen at its last reading until an inference request happened
+// to refresh the token on its own path, which is exactly when an operator
+// least wants to discover their quota numbers were fiction.
+func TestProbeRefreshesAnExpiredCredentialBeforeReading(t *testing.T) {
+	fp := &fakeProvider{
+		results:      []quotaResult{quotaOK(provider.QuotaBucket{Name: "5h", Utilization: 0.42})},
+		requireToken: "fresh",
+		refreshTo: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: "fresh", RefreshToken: "rt2",
+			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+		},
+	}
+	mgr := newMgr(t, fp, expiringOAuthAcct("a", "stale", time.Now().Add(-time.Minute)))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if got := fp.refreshCount(); got != 1 {
+		t.Errorf("refreshes = %d, want 1: the probe must renew an expired credential", got)
+	}
+	got := mgr.All()
+	if len(got) != 1 || got[0].Buckets["5h"].Utilization != 0.42 {
+		t.Errorf("buckets = %+v, want the 5h reading recorded", got[0].Buckets)
+	}
+	if st := p.Status().Accounts["a"]; st.LastError != "" {
+		t.Errorf("LastError = %q, want empty", st.LastError)
+	}
+}
+
+// A credential nowhere near expiry must not be renewed. The probe runs on a
+// timer against every account, so a refresh-on-every-cycle would rotate the
+// refresh token continuously and turn a read-only health check into the
+// noisiest writer in the system.
+func TestProbeDoesNotRefreshACredentialThatIsStillValid(t *testing.T) {
+	fp := &fakeProvider{
+		results:      []quotaResult{quotaOK(provider.QuotaBucket{Name: "5h", Utilization: 0.1})},
+		requireToken: "current",
+	}
+	mgr := newMgr(t, fp, expiringOAuthAcct("a", "current", time.Now().Add(time.Hour)))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if got := fp.refreshCount(); got != 0 {
+		t.Errorf("refreshes = %d, want 0 for a credential an hour from expiry", got)
+	}
+}
+
+// When the renewal itself fails there is nothing to probe with, so the cycle
+// records the failure rather than spending a call on a credential already
+// known to be rejected.
+func TestProbeRecordsARefreshFailureWithoutCallingQuota(t *testing.T) {
+	fp := &fakeProvider{
+		results:      []quotaResult{quotaOK()},
+		requireToken: "fresh",
+		refreshErr:   errors.New("refresh token revoked"),
+	}
+	mgr := newMgr(t, fp, expiringOAuthAcct("a", "stale", time.Now().Add(-time.Minute)))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err == nil {
+		t.Fatal("ProbeNow returned nil, want the refresh failure surfaced")
+	}
+	if got := fp.callCount(); got != 0 {
+		t.Errorf("Quota called %d times, want 0 when the credential could not be renewed", got)
+	}
+	st := p.Status().Accounts["a"]
+	if !strings.Contains(st.LastError, "refresh") {
+		t.Errorf("LastError = %q, want it to name the refresh failure", st.LastError)
 	}
 }
