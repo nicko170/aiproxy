@@ -101,6 +101,24 @@ type PrivacyRules struct {
 // URLs, API endpoints, doc links, changelog dates, and licence years are
 // everywhere — redacting them corrupts the agent's context for almost no privacy
 // gain.
+//
+// MaxScanBytes bounds how much of any ONE decoded string the model looks at, and
+// it is a LATENCY bound wearing a size limit's clothes. Measured on darwin/arm64
+// CPU: ~0.5 ms/token, ~4 bytes/token. 4 KB scans in ~520 ms, 16 KB in ~2.84 s,
+// and the original 262144 default extrapolated to ~45 s inside one Scan — with
+// the NER runner's Run serialised by a mutex, that is a head-of-line block on
+// every other request. 4 KB bounds the worst case for a newly-seen string to
+// roughly the same order as the p95 TTFB this proxy already reports, so the
+// model does not dominate a request it is only assisting.
+//
+// The recall tradeoff, stated plainly because the cap otherwise reads as a bug:
+// a string longer than the cap is scanned by the model only up to the cap, so
+// prose PII in the TAIL of a large file is missed by the model tier, and the
+// truncation is logged every time it happens. That is acceptable because the
+// deterministic rules have NO cap and still scan the whole string — credentials
+// and denylist entries anywhere in a large file are caught regardless. The model
+// tier exists for prose PII, and prose messages are short; large blobs are the
+// rules' domain.
 type PrivacyNER struct {
 	Enabled      bool     `json:"enabled"`
 	Labels       []string `json:"labels"`
@@ -159,7 +177,7 @@ func Default() Config {
 			Denylist:                []string{},
 			AllowlistExtra:          []string{},
 			CacheEntries:            50000,
-			NER:                     PrivacyNER{Enabled: false, Labels: []string{}, MaxScanBytes: 262144},
+			NER:                     PrivacyNER{Enabled: false, Labels: []string{}, MaxScanBytes: 4096},
 		},
 	}
 }

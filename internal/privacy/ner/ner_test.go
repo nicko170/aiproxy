@@ -14,6 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/privacy/tokenizer"
 )
@@ -665,5 +666,111 @@ func TestScanDropsAnAllWhitespaceSpan(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("an all-whitespace span was reported: %+v", got)
+	}
+}
+
+// The default cap is now 4 KB rather than 256 KB, so truncation stops being the
+// rare case and becomes the ordinary one: a 16 KB tool result gets scanned to
+// 4 KB. That MUST still be logged. This test reads the cap from config.Default()
+// rather than hardcoding it, so lowering the default further cannot quietly
+// break the log, and raising it cannot quietly reintroduce a 45-second scan
+// without TestPrivacyNERDefaultBoundsWorstCaseScanLatency also failing.
+func TestScanReportsTruncationAtTheConfiguredDefault(t *testing.T) {
+	limit := config.Default().Privacy.NER.MaxScanBytes
+	if limit <= 0 {
+		t.Fatalf("config default MaxScanBytes = %d", limit)
+	}
+
+	var buf bytes.Buffer
+	d, fake := newFakeDetectorWithLog(t, []string{"private_person"},
+		slog.New(slog.NewTextHandler(&buf, nil)))
+	d.opts.MaxScanBytes = limit
+	fake.tag = func(int, int) int { return labelIndex(t, d, "O") }
+
+	// A realistic oversized payload: a 16 KB tool result.
+	text := sourceCodeSample(16 << 10)
+	if _, err := d.Scan(context.Background(), text); err != nil {
+		t.Fatal(err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "truncated") {
+		t.Fatalf("a %d-byte input under a %d-byte cap logged nothing: %q", len(text), limit, logged)
+	}
+	// The operator needs the numbers, not just the word: how much arrived, how
+	// much was looked at, and what the cap was.
+	for _, want := range []string{
+		fmt.Sprintf("bytes=%d", len(text)),
+		fmt.Sprintf("scanned=%d", limit),
+		fmt.Sprintf("limit=%d", limit),
+		"level=WARN",
+	} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("truncation log is missing %q: %s", want, logged)
+		}
+	}
+	// And it must actually have stopped at the cap, not merely said so.
+	var total int
+	for _, w := range fake.widths {
+		total += w
+	}
+	if total == 0 || fake.widths[0] > limit {
+		t.Errorf("first window was %d tokens for a %d-byte cap", fake.widths[0], limit)
+	}
+}
+
+// A string at or under the cap must NOT log truncation, or the warning becomes
+// noise the operator learns to ignore.
+func TestScanIsSilentWhenNothingIsTruncated(t *testing.T) {
+	limit := config.Default().Privacy.NER.MaxScanBytes
+	var buf bytes.Buffer
+	d, fake := newFakeDetectorWithLog(t, []string{"private_person"},
+		slog.New(slog.NewTextHandler(&buf, nil)))
+	d.opts.MaxScanBytes = limit
+	fake.tag = func(int, int) int { return labelIndex(t, d, "O") }
+	if _, err := d.Scan(context.Background(), sourceCodeSample(limit)); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buf.String(), "truncated") {
+		t.Errorf("a %d-byte input under a %d-byte cap logged truncation: %s", limit, limit, buf.String())
+	}
+}
+
+// The same thing against the real model, so the new default is confirmed
+// end-to-end rather than only against a fake: a 16 KB payload under the 4 KB
+// default must be scanned to 4 KB, must say so, and must come back in the ~520 ms
+// the cap was chosen to buy.
+func TestRealDetectorTruncatesAndReportsAtTheConfiguredDefault(t *testing.T) {
+	dir := modelDir(t)
+	limit := config.Default().Privacy.NER.MaxScanBytes
+	var buf bytes.Buffer
+	d, err := New(Options{Dir: dir, Labels: []string{"private_person", "private_email"},
+		MaxScanBytes: limit, Log: slog.New(slog.NewTextHandler(&buf, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	text := sourceCodeSample(16 << 10)
+	if _, err := d.Scan(context.Background(), text); err != nil { // warm the session
+		t.Fatal(err)
+	}
+	buf.Reset()
+	t0 := time.Now()
+	got, err := d.Scan(context.Background(), text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(t0)
+	t.Logf("16KB input under a %d-byte cap: %v, %d findings", limit, elapsed, len(got))
+	t.Logf("log: %s", strings.TrimSpace(buf.String()))
+
+	if !strings.Contains(buf.String(), "truncated") {
+		t.Errorf("the real detector truncated %d bytes to %d silently", len(text), limit)
+	}
+	for _, f := range got {
+		if f.End > limit {
+			t.Errorf("finding [%d,%d) is past the %d-byte cap", f.Start, f.End, limit)
+		}
 	}
 }

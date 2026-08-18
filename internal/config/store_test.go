@@ -232,8 +232,27 @@ func TestPrivacyDefaultsAreOffAndSafe(t *testing.T) {
 	if cfg.Privacy.CacheEntries != 50000 {
 		t.Errorf("CacheEntries = %d, want 50000", cfg.Privacy.CacheEntries)
 	}
-	if cfg.Privacy.NER.MaxScanBytes != 262144 {
-		t.Errorf("MaxScanBytes = %d, want 262144", cfg.Privacy.NER.MaxScanBytes)
+	// 4096, not 262144: the model costs ~0.5 ms/token on CPU, so the old default
+	// was a ~45-second scan inside one request. See PrivacyNER's doc comment.
+	if cfg.Privacy.NER.MaxScanBytes != 4096 {
+		t.Errorf("MaxScanBytes = %d, want 4096", cfg.Privacy.NER.MaxScanBytes)
+	}
+}
+
+// The default must stay a bound a user will actually wait for. At the measured
+// ~0.5 ms/token and ~4 bytes/token, this is the arithmetic that condemned
+// 262144; if someone raises the default, this fails and makes them justify it.
+func TestPrivacyNERDefaultBoundsWorstCaseScanLatency(t *testing.T) {
+	const (
+		bytesPerToken = 4
+		msPerToken    = 0.5
+		budgetMillis  = 1000 // one newly-seen string must not cost more than ~1s
+	)
+	got := Default().Privacy.NER.MaxScanBytes
+	worst := float64(got) / bytesPerToken * msPerToken
+	if worst > budgetMillis {
+		t.Errorf("MaxScanBytes = %d implies a worst-case model scan of ~%.0f ms, over the %d ms budget",
+			got, worst, budgetMillis)
 	}
 }
 

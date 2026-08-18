@@ -456,9 +456,18 @@ approximate offsets.
 - **Decoding.** BIOES tags with constrained Viterbi, using the transition
   parameters in `viterbi_calibration.json`.
 - **Label filtering.** Only labels enabled in config produce findings.
-- **Bounds.** `maxScanBytes` (default 256 KiB) caps what any one string
+- **Bounds.** `maxScanBytes` (default 4 KiB) caps what any one string
   contributes; anything longer is scanned up to the cap and the truncation is
-  reported, never silently dropped.
+  reported, never silently dropped. This is a LATENCY bound, not a size limit:
+  measured on darwin/arm64 CPU the model costs ~0.5 ms/token at ~4 bytes/token,
+  so 4 KB scans in ~520 ms, 16 KB in ~2.84 s, and the 256 KiB this spec
+  originally specified extrapolated to ~45 s inside a single `Scan` — with the
+  runner serialised by a mutex, a head-of-line block on every other request.
+  The recall tradeoff is accepted deliberately: prose PII in the tail of a large
+  file is missed by the model tier, but the deterministic rules have no cap and
+  still scan the whole string, so credentials and denylist entries anywhere in a
+  large file are caught regardless. The model tier is for prose PII, and prose
+  messages are short; large blobs are the rules' domain.
 
 ### 9.4 Assets
 
@@ -490,7 +499,7 @@ operators who would rather not have it happen on demand.
   "ner": {
     "enabled": false,
     "labels": [],
-    "maxScanBytes": 262144
+    "maxScanBytes": 4096
   }
 }
 ```
