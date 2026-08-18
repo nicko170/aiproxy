@@ -271,7 +271,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			// clean, empty 200, which a client reads as a successful but empty
 			// answer instead of an error worth retrying.
 			a.log.Error("admission failed", "account", acct.Label, "err", err)
-			res.Outcome = provider.OutcomeServerError
+			res.Outcome = provider.OutcomeAdmissionError
 			res.Status = http.StatusBadGateway
 			a.writeJSON(w, http.StatusBadGateway, nil, "proxy_error",
 				"Could not admit the request to an account.")
@@ -299,11 +299,11 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			// was reported as a fleet with no capacity, which is the opposite of what
 			// happened: an account was selected, admitted, and sent to.
 			//
-			// OutcomeServerError rather than a new kind: the values are persisted and
-			// append-only, and this is not policy-distinct — it rotates like any other
-			// failed send, and the label already means "the attempt failed for a
-			// reason that is neither the client's nor a quota or credential state".
-			res.Outcome = provider.OutcomeServerError
+			// OutcomeUpstreamError: a transport-level failure reaching the upstream
+			// (connection reset, TLS failure, or the per-attempt header timeout),
+			// distinct from OutcomeServerError, which is a genuine upstream 5xx
+			// response actually received.
+			res.Outcome = provider.OutcomeUpstreamError
 			exclude[acct.ID] = true
 			res.Rotated = true
 			continue

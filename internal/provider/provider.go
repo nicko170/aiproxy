@@ -87,6 +87,11 @@ const (
 	//
 	// Append new kinds here, never insert: these values are persisted.
 	OutcomeNoAccountReady
+	// OutcomeUpstreamError is a transport-level failure reaching the upstream:
+	// connection reset, TLS failure, or the per-attempt header timeout.
+	OutcomeUpstreamError
+	// OutcomeAdmissionError is a local failure before any request was sent.
+	OutcomeAdmissionError
 )
 
 func (k OutcomeKind) String() string {
@@ -109,6 +114,10 @@ func (k OutcomeKind) String() string {
 		return "server_error"
 	case OutcomeNoAccountReady:
 		return "no_account_ready"
+	case OutcomeUpstreamError:
+		return "upstream_error"
+	case OutcomeAdmissionError:
+		return "admission_error"
 	}
 	return "unknown"
 }

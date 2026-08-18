@@ -518,8 +518,8 @@ func TestAttemptWritesBadGatewayWhenAdmissionFailsLocally(t *testing.T) {
 	if res.Status != http.StatusBadGateway {
 		t.Errorf("Result.Status = %d, want 502", res.Status)
 	}
-	if res.Outcome != provider.OutcomeServerError {
-		t.Errorf("Outcome = %v, want server_error", res.Outcome)
+	if res.Outcome != provider.OutcomeAdmissionError {
+		t.Errorf("Outcome = %v, want admission_error", res.Outcome)
 	}
 	if body := rec.Body.String(); !strings.Contains(body, "proxy_error") {
 		t.Errorf("body = %q, want a proxy_error payload", body)
@@ -703,14 +703,12 @@ func TestAttemptServesAnUpstreamSlowerThanTheBudget(t *testing.T) {
 // An attempt abandoned on the header timeout must not be recorded as
 // no_account_ready. There WAS a ready account; it was sent to, and it timed out.
 //
-// OutcomeServerError is the label chosen, over adding a new kind: the OutcomeKind
-// values are persisted and append-only, and this case is not policy-distinct —
-// nothing in the retry engine branches on it, it rotates exactly like any other
-// failed send. OutcomeServerError already carries the meaning "the attempt failed
-// for a reason that is neither the client's nor a quota or credential state",
-// which is precisely this. What matters is that no_account_ready keeps meaning
-// what its name says, or stage 2's outcome breakdown counts a timed-out upstream
-// as a fleet with no capacity.
+// OutcomeUpstreamError is the label chosen: a header timeout is a
+// transport-level failure reaching the upstream, distinct from
+// OutcomeServerError, which means a genuine 5xx response was actually
+// received. What matters here is that no_account_ready keeps meaning what its
+// name says, or stage 2's outcome breakdown counts a timed-out upstream as a
+// fleet with no capacity.
 func TestAttemptDoesNotReportNoAccountReadyForAHeaderTimeout(t *testing.T) {
 	cfg := RetryConfig{
 		Budget: 10 * time.Second, InlineAbsorbMax: time.Second, BodyIdle: 5 * time.Second,
@@ -732,8 +730,8 @@ func TestAttemptDoesNotReportNoAccountReadyForAHeaderTimeout(t *testing.T) {
 			"a header timeout is an attempt that failed, not an absence of capacity",
 			got.Attempts)
 	}
-	if got.Outcome != provider.OutcomeServerError {
-		t.Errorf("Outcome = %v, want server_error", got.Outcome)
+	if got.Outcome != provider.OutcomeUpstreamError {
+		t.Errorf("Outcome = %v, want upstream_error", got.Outcome)
 	}
 }
 
