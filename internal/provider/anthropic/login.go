@@ -144,6 +144,14 @@ type loginFlow struct {
 
 	once      sync.Once
 	completed atomic.Bool
+
+	// terminated is set the instant any call to finish begins, before the
+	// once-guarded shutdown-and-send even runs — so complete (running
+	// concurrently on its own goroutine, mid-exchange or mid-profile-read)
+	// can notice a Cancel or timeout that reached finish first and skip
+	// OnLoginSuccess instead of persisting an account the caller has already
+	// been told failed or was cancelled (see complete's doc comment).
+	terminated atomic.Bool
 }
 
 // tryClaim reports whether the caller is the first to reach a terminal
@@ -169,7 +177,16 @@ func (f *loginFlow) tryClaim() bool {
 // it here means the handler returns immediately, the connection goes idle
 // right away, and Shutdown completes promptly instead of stalling every
 // state-mismatch and no-code response for the length of its grace period.
+//
+// Done is deliberately never closed after the send: a second receive on a
+// closed buffered channel returns the zero LoginResult (Err == nil, an empty
+// Profile) with ok == false, which by value alone is indistinguishable from
+// a successful login — a caller that reads with a bare "v := <-ch" instead
+// of "v, ok := <-ch" would silently see success. Leaving the channel open
+// means a second receive simply blocks forever instead of lying; only
+// "v, ok := <-ch" is a safe read of Done, exactly once.
 func (f *loginFlow) finish(res provider.LoginResult) {
+	f.terminated.Store(true)
 	f.once.Do(func() {
 		f.cancel()
 		go func() {
@@ -177,7 +194,6 @@ func (f *loginFlow) finish(res provider.LoginResult) {
 			defer cancel()
 			f.srv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort; the listener is torn down either way
 			f.done <- res
-			close(f.done)
 		}()
 	})
 }
@@ -188,6 +204,17 @@ func (f *loginFlow) serve(ln net.Listener) {
 	}
 }
 
+// awaitTimeout ends the flow once d elapses with no callback or submitted
+// code, or once f.ctx is done for any other reason — including the parent
+// context Login was called with being cancelled out from under the flow
+// (e.g. the control API used to hand this an HTTP request's context, done
+// the instant the begin handler returned). Previously the ctx.Done() branch
+// assumed only finish() itself (via f.cancel) could ever reach it, and did
+// nothing — so a parent cancellation left the flow never finished: the
+// listener stayed bound, this goroutine and the one this flow started never
+// exited, and (via the control API) the session's registry entry never
+// released. Calling finish() here unconditionally fixes that; if finish
+// already ran on another path, once.Do makes this a no-op.
 func (f *loginFlow) awaitTimeout(d time.Duration) {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -195,8 +222,7 @@ func (f *loginFlow) awaitTimeout(d time.Duration) {
 	case <-t.C:
 		f.finish(provider.LoginResult{Err: ErrLoginTimedOut})
 	case <-f.ctx.Done():
-		// Completed or cancelled elsewhere; finish() (which cancels f.ctx) has
-		// already run or is running.
+		f.finish(provider.LoginResult{Err: f.ctx.Err()})
 	}
 }
 
@@ -204,17 +230,29 @@ func (f *loginFlow) cancelSession() {
 	f.finish(provider.LoginResult{Err: ErrLoginCancelled})
 }
 
+// handleCallback checks state before claiming the flow, deliberately: this
+// listener only ever exists for one flow, but that does not mean every
+// request it ever receives is the legitimate redirect — a scanner probing
+// the ephemeral port, a browser prefetch, or any other stray GET can arrive
+// first. Claiming (tryClaim) before validating state used to let exactly
+// that stray request win the flow's one chance to complete and finish() it
+// with ErrStateMismatch, so the real callback — arriving moments later with
+// the correct state — found the flow already claimed and got "already
+// complete" instead of ever succeeding. A state mismatch is correctly an
+// error for the request that sent it either way (this handler always
+// answers it 400); the fix is only about not letting that request take the
+// whole flow down with it. A flow that only ever receives wrong-state
+// requests still terminates on its own via awaitTimeout.
 func (f *loginFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
-	if !f.tryClaim() {
-		http.Error(w, "login session already complete", http.StatusGone)
-		return
-	}
 	q := r.URL.Query()
 	state := q.Get("state")
 	code := q.Get("code")
 	if state != f.state {
 		http.Error(w, "state mismatch", http.StatusBadRequest)
-		f.finish(provider.LoginResult{Err: ErrStateMismatch})
+		return
+	}
+	if !f.tryClaim() {
+		http.Error(w, "login session already complete", http.StatusGone)
 		return
 	}
 	if code == "" {
@@ -255,6 +293,15 @@ func (f *loginFlow) SubmitCode(code string) error {
 // OnLoginSuccess, and finishes the session — always off the calling
 // goroutine (the HTTP handler, or SubmitCode's caller), so neither blocks on
 // the network round trips this performs.
+//
+// Both network calls run on f.ctx, not context.Background(): finish()
+// cancels f.ctx as its very first action, so a Cancel or timeout that reaches
+// finish while either call is still in flight now aborts it directly instead
+// of letting it run to completion in the background. The terminated check
+// immediately before OnLoginSuccess closes the remaining gap — both calls
+// happening to complete successfully in the narrow window before f.ctx's
+// cancellation is observed — so a login the caller was already told failed
+// or was cancelled can never still persist and go live via mgr.Add.
 func (f *loginFlow) complete(code string) {
 	go func() {
 		cred, err := f.exchange(code)
@@ -262,9 +309,16 @@ func (f *loginFlow) complete(code string) {
 			f.finish(provider.LoginResult{Err: err})
 			return
 		}
-		profile, err := f.a.Profile(context.Background(), cred)
+		profile, err := f.a.Profile(f.ctx, cred)
 		if err != nil {
 			f.finish(provider.LoginResult{Err: fmt.Errorf("read profile after login: %w", err)})
+			return
+		}
+		if f.terminated.Load() {
+			// Cancel or the timeout already finished this flow while the
+			// exchange or profile read above was in flight (see this method's
+			// doc comment) — the caller has already received that result and
+			// must not also see the credential persisted.
 			return
 		}
 		if f.a.OnLoginSuccess != nil {
@@ -293,7 +347,7 @@ func (f *loginFlow) exchange(code string) (provider.Credential, error) {
 		return provider.Credential{}, err
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+	req, err := http.NewRequestWithContext(f.ctx, http.MethodPost,
 		f.a.tokenEndpoint(), bytes.NewReader(payload))
 	if err != nil {
 		return provider.Credential{}, err
@@ -311,9 +365,9 @@ func (f *loginFlow) exchange(code string) (provider.Credential, error) {
 	}()
 
 	if res.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+		body, _ := io.ReadAll(io.LimitReader(res.Body, 4096))
 		return provider.Credential{}, fmt.Errorf("code exchange failed with %d: %s",
-			res.StatusCode, bytes.TrimSpace(body))
+			res.StatusCode, summarizeExchangeError(body))
 	}
 
 	var tr tokenResponse
@@ -338,4 +392,35 @@ func (f *loginFlow) exchange(code string) (provider.Credential, error) {
 		cred.ExpiresAt = time.Now().Add(time.Duration(secs) * time.Second).UnixMilli()
 	}
 	return cred, nil
+}
+
+// maxExchangeErrorSummary bounds how much of the token endpoint's error body
+// reaches LoginResult.Err, and from there a control-API poll response
+// verbatim. It carries no credential today, but it is upstream-controlled
+// text on a path everything else here works hard to keep clean, so it is
+// bounded harder than a raw body read and reduced to a single-line summary
+// rather than echoed as-is.
+const maxExchangeErrorSummary = 200
+
+// summarizeExchangeError collapses an upstream error body to a short,
+// single-line summary: newlines and other control characters (an HTML error
+// page, an escape sequence) are stripped rather than passed through, and the
+// result is capped well below the 4096-byte read that produced body.
+func summarizeExchangeError(body []byte) string {
+	body = bytes.TrimSpace(body)
+	s := strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			return ' '
+		case r < 0x20:
+			return -1
+		default:
+			return r
+		}
+	}, string(body))
+	s = strings.TrimSpace(s)
+	if len(s) > maxExchangeErrorSummary {
+		return s[:maxExchangeErrorSummary] + "..."
+	}
+	return s
 }

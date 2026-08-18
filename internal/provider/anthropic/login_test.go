@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -170,7 +171,57 @@ func TestLoginCallbackWithCorrectStateSucceedsAndPersists(t *testing.T) {
 	assertListenerClosed(t, redirectURI)
 }
 
-func TestLoginCallbackWithWrongStateIsAnErrorNotAWarning(t *testing.T) {
+// A wrong-state callback is answered with an error (400) itself, but must
+// not consume the flow's one chance to complete: before the fix, tryClaim
+// ran before the state check, so this request — indistinguishable from a
+// stray/forged one from the flow's point of view — claimed the flow and
+// finished it with ErrStateMismatch. The real callback, arriving moments
+// later with the correct state, then found the flow already claimed and got
+// "already complete" instead of ever succeeding. This proves the fix: a
+// wrong-state request first, followed by the real one, still succeeds.
+func TestLoginCallbackWithWrongStateDoesNotConsumeTheFlow(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+	p.LoginTimeoutOverride = 5 * time.Second // long enough that only completion, not a timeout, explains the result
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	state, redirectURI := sessionParams(t, sess.URL)
+
+	badRes, err := http.Get(redirectURI + "?code=auth-code-1&state=wrong-state")
+	if err != nil {
+		t.Fatalf("simulate stray callback: %v", err)
+	}
+	badRes.Body.Close()
+	if badRes.StatusCode != http.StatusBadRequest {
+		t.Errorf("stray callback status = %d, want 400", badRes.StatusCode)
+	}
+
+	goodRes, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate real callback: %v", err)
+	}
+	goodRes.Body.Close()
+	if goodRes.StatusCode != http.StatusOK {
+		t.Errorf("real callback status = %d, want 200", goodRes.StatusCode)
+	}
+
+	result := awaitResult(t, sess.Done)
+	if result.Err != nil {
+		t.Fatalf("Err = %v, want nil: the wrong-state callback must not have killed the flow", result.Err)
+	}
+	if result.Profile.Email != "a@example.com" {
+		t.Errorf("Profile = %+v", result.Profile)
+	}
+	assertListenerClosed(t, redirectURI)
+}
+
+// A flow that only ever receives wrong-state callbacks (no legitimate one
+// ever arrives) must still terminate on its own — bounded by the ordinary
+// timeout, not left to leak the listener forever.
+func TestLoginCallbackWithOnlyWrongStateEventuallyTimesOut(t *testing.T) {
 	up := loginUpstream(t, "at", "rt")
 	p := newLoginProvider(t, up)
 
@@ -187,8 +238,8 @@ func TestLoginCallbackWithWrongStateIsAnErrorNotAWarning(t *testing.T) {
 	res.Body.Close()
 
 	result := awaitResult(t, sess.Done)
-	if !errors.Is(result.Err, ErrStateMismatch) {
-		t.Fatalf("Err = %v, want ErrStateMismatch", result.Err)
+	if !errors.Is(result.Err, ErrLoginTimedOut) {
+		t.Fatalf("Err = %v, want ErrLoginTimedOut", result.Err)
 	}
 	if result.Profile != (provider.Profile{}) {
 		t.Errorf("Profile = %+v, want zero value on a failed login", result.Profile)
@@ -333,5 +384,108 @@ func TestLoginNeverReturnsCredentialMaterial(t *testing.T) {
 		if strings.Contains(blob, secret) {
 			t.Errorf("credential material %q leaked into %q", secret, blob)
 		}
+	}
+}
+
+// C1: the control API hands Login the HTTP request's own context, which is
+// done the instant the begin handler returns — long before a real user has
+// had a chance to finish signing in. Before the fix, awaitTimeout's
+// ctx.Done() branch assumed only finish() itself (via f.cancel) could ever
+// reach it and did nothing there, so this left the flow never finished: the
+// listener stayed bound, its goroutines never exited, and the timeout was
+// silently defeated. This proves a cancelled parent context terminates the
+// flow promptly instead.
+func TestLoginParentContextCancellationTerminatesTheFlow(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+	p.LoginTimeoutOverride = 5 * time.Second // long enough that only cancellation explains a prompt result
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sess, err := p.Login(ctx)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	_, redirectURI := sessionParams(t, sess.URL)
+
+	start := time.Now()
+	cancel()
+	result := awaitResult(t, sess.Done)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("parent context cancellation took %v to terminate the flow, want promptly", elapsed)
+	}
+	if !errors.Is(result.Err, context.Canceled) {
+		t.Errorf("Err = %v, want context.Canceled", result.Err)
+	}
+	assertListenerClosed(t, redirectURI)
+}
+
+// C2: a Cancel racing an in-flight exchange must not still create the
+// account. The token endpoint deliberately stalls so the callback's
+// exchange is still outstanding when Cancel runs; before the fix, exchange
+// and Profile ran on context.Background() and complete() never rechecked
+// whether the flow had already terminated, so the exchange (and
+// OnLoginSuccess) ran to completion in the background regardless — the
+// caller was told the login was cancelled, and an account showed up anyway.
+func TestLoginCancelMidExchangeNeverPersistsTheAccount(t *testing.T) {
+	// Two scripts, deliberately: FakeUpstream repeats its last script for
+	// every request past the first, so a single delayed script would have
+	// made the (unguarded) Profile call that follows exchange stall for
+	// another 2s on top of exchange's own 2s — pushing the whole unguarded
+	// path past this test's check window below and leaving it unable to
+	// fail no matter what leaked, exactly the "test that cannot fail"
+	// pattern this suite is otherwise on guard against. Only the exchange
+	// delays; Profile answers immediately, so an unguarded OnLoginSuccess
+	// would fire at ~2.0s — well inside the window below — while a
+	// correctly cancelled flow never reaches it at all.
+	up := testutil.NewFakeUpstream(t,
+		testutil.Script{
+			Status: 200, HeaderDelay: 2 * time.Second,
+			Body: `{"access_token":"at","refresh_token":"rt","expires_in":3600}`,
+		},
+		testutil.Script{
+			Status: 200,
+			Body:   `{"account":{"uuid":"acct-1","email":"a@example.com"},"organization":{"uuid":"org-1","name":"Acme"}}`,
+		},
+	)
+	p := newLoginProvider(t, up)
+	p.LoginTimeoutOverride = 5 * time.Second
+
+	var hookCalled atomic.Bool
+	p.OnLoginSuccess = func(context.Context, provider.Credential, provider.Profile) error {
+		hookCalled.Store(true)
+		return nil
+	}
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	state, redirectURI := sessionParams(t, sess.URL)
+
+	res, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	res.Body.Close()
+
+	// Give the exchange a moment to actually land on the fake upstream and
+	// start waiting on HeaderDelay, so this exercises "cancel while the
+	// exchange is genuinely in flight" rather than racing complete()'s own
+	// goroutine startup.
+	time.Sleep(50 * time.Millisecond)
+	sess.Cancel()
+
+	result := awaitResult(t, sess.Done)
+	if !errors.Is(result.Err, ErrLoginCancelled) {
+		t.Fatalf("Err = %v, want ErrLoginCancelled", result.Err)
+	}
+
+	// Give complete()'s goroutine every chance to (wrongly) let the exchange
+	// run to completion and call OnLoginSuccess before checking — longer
+	// than the fake upstream's 2s HeaderDelay would take if cancellation had
+	// no effect on it.
+	time.Sleep(2500 * time.Millisecond)
+	if hookCalled.Load() {
+		t.Error("OnLoginSuccess ran after Cancel raced the exchange: a cancelled login must never persist an account")
 	}
 }

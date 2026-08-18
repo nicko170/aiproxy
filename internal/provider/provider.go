@@ -208,9 +208,12 @@ type LoginSession struct {
 	// comment) — a library that shells out to open a browser is untestable.
 	URL string
 	// Done receives exactly one LoginResult: on a verified callback, a
-	// submitted code, a state mismatch, a timeout, or a Cancel. It is closed
-	// immediately after that single send, so range and multiple reads both
-	// observe termination cleanly.
+	// submitted code, a timeout, or a Cancel. It is deliberately never
+	// closed after that single send — a second receive on a closed buffered
+	// channel would return the zero LoginResult (Err == nil, an empty
+	// Profile) with ok == false, indistinguishable by value alone from a
+	// successful login. Only "v, ok := <-ch" is a safe read; a bare
+	// "v := <-ch" after the first receive blocks forever instead of lying.
 	Done <-chan LoginResult
 	// Cancel abandons the flow: the loopback listener and every goroutine
 	// Login started are torn down, and Done still receives exactly one
