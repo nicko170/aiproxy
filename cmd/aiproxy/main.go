@@ -31,6 +31,13 @@ import (
 var version = "dev"
 
 func main() {
+	// Subcommands are dispatched before flag.Parse so that "aiproxy update
+	// --check" reaches the subcommand's own FlagSet: the top-level flag package
+	// stops at the first non-flag argument, and --check is not a server flag.
+	if code := dispatchSubcommand(os.Args[1:], os.Stdout); code >= 0 {
+		os.Exit(code)
+	}
+
 	var (
 		configPath = flag.String("config", "", "path to config.json (default: XDG config dir)")
 		addr       = flag.String("addr", "", "listen address (overrides config)")
