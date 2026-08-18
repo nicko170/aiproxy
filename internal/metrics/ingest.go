@@ -131,6 +131,12 @@ func (i *Ingester) RecordQuota(q QuotaSample) {
 // Dropped is the number of samples discarded because the buffer was full.
 func (i *Ingester) Dropped() int64 { return i.dropped.Load() }
 
+// Store returns the accounting database the ingester writes into, so a
+// caller that already holds an Ingester (cmd/aiproxy does, for wiring
+// OnResult) does not also need to thread the *Store through separately just
+// to build a query-only consumer like view.Local.
+func (i *Ingester) Store() *Store { return i.store }
+
 // Flush blocks until everything queued at call time has been written.
 func (i *Ingester) Flush() error {
 	reply := make(chan error, 1)

@@ -21,6 +21,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/proxy"
+	"github.com/nicko170/aiproxy/internal/view"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=..."
@@ -191,6 +192,12 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			HeaderTimeout:   headerTimeout,
 		}, log)
 
+	// view.Local is the presentation seam (spec §3.1): the control API below
+	// reads through it rather than computing anything of its own, which is
+	// what lets a future view.HTTP (a detached daemon) replace it without
+	// internal/proxy's routes changing at all.
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped)
+
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
 		Manager:       mgr,
@@ -202,6 +209,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		Upstream:            anthropic.DefaultBaseURL,
 		PassthroughPrefixes: proxy.DefaultPassthroughPrefixes,
 		Dropped:             ing.Dropped,
+		View:                vl,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,
@@ -224,6 +232,17 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 					Input: res.InputTokens, Output: res.OutputTokens,
 					CacheRead: res.CacheReadTokens, CacheWrite: res.CacheWriteTokens,
 				}),
+			})
+
+			// Same hook, same event: the TUI's activity feed and the dashboard
+			// (stage 4/5) will see exactly the requests metrics ingestion sees,
+			// which is spec invariant 4 ("one number, one source") extended to
+			// the live event stream.
+			vl.Publish(view.Event{
+				Time: res.StartedAt, Model: req.Model, Account: res.AccountID,
+				Status: res.Status, Outcome: res.Outcome.String(), DurationMS: res.DurationMS,
+				TTFBMS: res.TTFBMS, InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
+				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
 			})
 		},
 	}), nil

@@ -171,7 +171,10 @@ func TestBuildHandlerWiresTransportHeaderTimeoutFromConfig(t *testing.T) {
 
 func TestEndToEndStatusEndpoint(t *testing.T) {
 	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
-	cfg, _ := store.Update(func(c *config.Config) error { return nil })
+	cfg, _ := store.Update(func(c *config.Config) error {
+		c.Accounts = []config.Account{{ID: "a1", Provider: "anthropic", Label: "test"}}
+		return nil
+	})
 
 	h, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
@@ -192,8 +195,30 @@ func TestEndToEndStatusEndpoint(t *testing.T) {
 	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if _, ok := got["accounts"]; !ok {
-		t.Errorf("status payload missing accounts: %+v", got)
+	// Stage 3 splits the stage-1 status readout: /status is server-level only
+	// (spec §3.1's view.Status) and accounts move to their own /accounts route,
+	// both backed by the same view.Source buildHandler wires here.
+	if _, ok := got["listenAddr"]; !ok {
+		t.Errorf("status payload missing listenAddr: %+v", got)
+	}
+	if _, ok := got["accounts"]; ok {
+		t.Errorf("status payload should no longer carry accounts (moved to /accounts): %+v", got)
+	}
+
+	accRes, err := http.Get(srv.URL + "/_aiproxy/api/v1/accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer accRes.Body.Close()
+	if accRes.StatusCode != 200 {
+		t.Fatalf("accounts status = %d", accRes.StatusCode)
+	}
+	var accts []map[string]any
+	if err := json.NewDecoder(accRes.Body).Decode(&accts); err != nil {
+		t.Fatalf("decode accounts: %v", err)
+	}
+	if len(accts) != 1 || accts[0]["id"] != "a1" {
+		t.Errorf("accounts = %+v", accts)
 	}
 }
 

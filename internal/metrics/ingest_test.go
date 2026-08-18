@@ -23,6 +23,24 @@ func drainInto(t *testing.T, s *Store, ing *Ingester) {
 	}
 }
 
+// Store lets a caller that only holds an *Ingester (cmd/aiproxy's OnResult
+// wiring) build a query-only consumer, such as view.Local, over the same
+// database without threading a second *Store parameter through separately.
+func TestIngesterStoreReturnsTheUnderlyingStore(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ing := NewIngester(s, IngestOptions{})
+	defer ing.Close()
+
+	if ing.Store() != s {
+		t.Error("Store() did not return the same *Store the ingester was built with")
+	}
+}
+
 func TestRecordPersistsRows(t *testing.T) {
 	s, err := OpenMemory()
 	if err != nil {

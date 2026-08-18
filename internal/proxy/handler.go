@@ -15,6 +15,7 @@ import (
 
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/provider"
+	"github.com/nicko170/aiproxy/internal/view"
 )
 
 // ReservedPrefix is the control-plane namespace. Nothing under it is ever
@@ -106,6 +107,11 @@ type HandlerOptions struct {
 	// the ingester's buffer was full, so degradation is visible rather than
 	// silent (spec §7.3). Nil is treated as always zero.
 	Dropped func() int64
+	// View backs the control API (spec §9): every handler under
+	// ReservedPrefix's api/v1 tree is a thin adapter over View and contains no
+	// aggregation logic of its own. A nil View is only safe when no test or
+	// caller exercises a control route.
+	View view.Source
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.

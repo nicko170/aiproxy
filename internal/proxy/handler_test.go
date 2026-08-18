@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -13,9 +14,11 @@ import (
 
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/testutil"
+	"github.com/nicko170/aiproxy/internal/view"
 )
 
 func TestIsLoopback(t *testing.T) {
@@ -90,6 +93,10 @@ func TestModelMatches(t *testing.T) {
 type routerHarness struct {
 	srv     *httptest.Server
 	up      *testutil.FakeUpstream
+	mgr     *account.Manager
+	ms      *metrics.Store
+	cs      *config.Store
+	view    *view.Local
 	mu      sync.Mutex
 	results []Result
 }
@@ -101,31 +108,64 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 	p.TokenEndpointOverride = fakeTokenEndpoint(t)
 	providers := map[string]provider.Provider{"anthropic": p}
 
-	mgr := account.New([]config.Account{{
+	accts := []config.Account{{
 		ID: "acct-0", Provider: "anthropic", Label: "acct-0", Upstream: up.URL(),
 		Credential: provider.Credential{
 			Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
 			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
 		},
-	}}, providers, account.Options{
+	}}
+	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
 		Persist:         func(string, provider.Credential) error { return nil },
 	})
 
-	h := &routerHarness{up: up}
+	ms, err := metrics.OpenMemory()
+	if err != nil {
+		t.Fatalf("OpenMemory: %v", err)
+	}
+	t.Cleanup(func() { ms.Close() })
+
+	cs := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	if _, err := cs.Update(func(c *config.Config) error {
+		c.Accounts = accts
+		return nil
+	}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+
+	h := &routerHarness{up: up, mgr: mgr, ms: ms, cs: cs}
 	ho := HandlerOptions{
 		Attempter: NewAttempter(mgr, providers, NewTransport(TransportOptions{}), defaultRetry(), quietLogger()),
 		Manager:   mgr,
 		Log:       quietLogger(),
-		OnResult: func(_ Request, r Result) {
+		OnResult: func(req Request, r Result) {
 			h.mu.Lock()
-			defer h.mu.Unlock()
 			h.results = append(h.results, r)
+			h.mu.Unlock()
+			// Mirrors cmd/aiproxy's production wiring: the same OnResult hook
+			// that feeds metrics ingestion also publishes to the view event
+			// stream, so a test against /events exercises the real path.
+			if h.view != nil {
+				h.view.Publish(view.Event{
+					Time: r.StartedAt, Model: req.Model, Account: r.AccountID,
+					Status: r.Status, Outcome: r.Outcome.String(), DurationMS: r.DurationMS,
+					TTFBMS: r.TTFBMS, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+					CacheReadTokens: r.CacheReadTokens, CacheWriteTokens: r.CacheWriteTokens,
+				})
+			}
 		},
 	}
 	if opts != nil {
 		opts(&ho)
 	}
+	// Built after opts runs so a test overriding o.Dropped (e.g.
+	// TestRouterStatusReportsMetricsDropped) is reflected in what ServerStatus
+	// reports; view.Local captures the func at construction.
+	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped)
+	h.view = vl
+	ho.View = vl
+
 	h.srv = httptest.NewServer(NewRouter(ho))
 	t.Cleanup(h.srv.Close)
 	return h
@@ -213,6 +253,13 @@ func TestRouterRejectsUnauthorizedRemoteCaller(t *testing.T) {
 	}
 }
 
+// Stage 3 splits the stage-1 status readout: /status is now server-level only
+// (listen address, uptime, in-flight, p95 TTFB, drop count) and accounts move
+// to their own /accounts route, backed by the same view.Source (spec §3.1,
+// §9). This test used to decode an "accounts" array out of /status itself;
+// that shape no longer exists by design, so the accounts assertion moved to
+// TestRouterServesAccountsUnderReservedPrefix below and this test now checks
+// the fields Status actually carries.
 func TestRouterServesStatusUnderReservedPrefix(t *testing.T) {
 	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
 
@@ -226,17 +273,46 @@ func TestRouterServesStatusUnderReservedPrefix(t *testing.T) {
 	}
 
 	var got struct {
-		Accounts []struct {
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			Status string `json:"status"`
-		} `json:"accounts"`
+		ListenAddr    string `json:"listenAddr"`
+		UptimeSeconds int64  `json:"uptimeSeconds"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(got.Accounts) != 1 || got.Accounts[0].ID != "acct-0" {
-		t.Errorf("accounts = %+v", got.Accounts)
+	if got.ListenAddr == "" {
+		t.Error("status should report the listen address")
+	}
+	if got.UptimeSeconds < 0 {
+		t.Errorf("uptimeSeconds = %d, want >= 0", got.UptimeSeconds)
+	}
+	if len(h.up.Requests()) != 0 {
+		t.Error("a control-plane path must never be proxied upstream")
+	}
+}
+
+// The accounts list that used to live inside /status now has its own route.
+func TestRouterServesAccountsUnderReservedPrefix(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d", res.StatusCode)
+	}
+
+	var accts []struct {
+		ID     string `json:"id"`
+		Label  string `json:"label"`
+		Status string `json:"status"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&accts); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(accts) != 1 || accts[0].ID != "acct-0" {
+		t.Errorf("accounts = %+v", accts)
 	}
 	if len(h.up.Requests()) != 0 {
 		t.Error("a control-plane path must never be proxied upstream")
