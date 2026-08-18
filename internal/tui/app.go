@@ -1,0 +1,774 @@
+package tui
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/nicko170/aiproxy/internal/view"
+)
+
+// screenID names the five screens, in tab order.
+type screenID int
+
+const (
+	screenOverview screenID = iota
+	screenActivity
+	screenUsage
+	screenAccounts
+	screenSettings
+	screenCount
+)
+
+func (s screenID) String() string {
+	return [...]string{"overview", "activity", "usage", "accounts", "settings"}[s]
+}
+
+// refreshEvery is the cadence of the status/accounts snapshot. It is a
+// glanceable instrument, not a profiler; two seconds keeps the countdowns
+// honest without hammering the seam.
+const refreshEvery = 2 * time.Second
+
+// overviewEvery is the cadence of the heavier overview queries (per-account
+// quota history and the throughput sparkline series).
+const overviewEvery = 15 * time.Second
+
+// fetchTimeout bounds every Source call made from a command. The render path
+// never touches the Source at all; a query slower than this surfaces as an
+// error line, never as a frozen frame.
+const fetchTimeout = 10 * time.Second
+
+// flash is the transient one-line acknowledgement above the footer: what
+// just happened, in the severity it happened with.
+type flash struct {
+	text  string
+	sev   severity
+	until time.Time
+}
+
+// Model is the whole TUI. Everything View renders lives here as plain data;
+// every Source call happens in a tea.Cmd on its own goroutine and lands back
+// as a message. now is a field, not time.Now(): the render path takes no
+// clock and no lock, so a frame is a pure function of this struct.
+type Model struct {
+	src     view.Source
+	ctx     context.Context
+	th      theme
+	loc     *time.Location
+	version string
+	logs    *LogRing
+
+	width, height int
+	now           time.Time
+	screen        screenID
+	help          bool
+	flash         flash
+
+	status     view.Status
+	statusErr  string
+	accounts   []view.Account
+	accountsAt time.Time
+
+	// resets holds the latest observed reset instant per account per bucket
+	// (unix ms), read from quota history; sparks holds each account's
+	// last-hour throughput per minute.
+	resets map[string]map[string]int64
+	sparks map[string][]float64
+
+	activity activityState
+	usage    usageState
+	accts    acctsState
+	settings settingsState
+	login    loginState
+
+	fetchingStatus   bool
+	fetchingOverview bool
+	lastOverviewAt   time.Time
+}
+
+// New builds the TUI over src. ctx cancels the event subscription and every
+// in-flight fetch when the program exits. logs may be nil.
+func New(ctx context.Context, src view.Source, version string, logs *LogRing) Model {
+	return Model{
+		src:     src,
+		ctx:     ctx,
+		th:      newTheme(),
+		loc:     time.Local,
+		version: version,
+		logs:    logs,
+		now:     time.Now(),
+		resets:  map[string]map[string]int64{},
+		sparks:  map[string][]float64{},
+		activity: activityState{
+			events: make([]view.Event, 0, activityRing),
+		},
+		usage:    newUsageState(),
+		settings: newSettingsState(),
+	}
+}
+
+// Run runs the program until quit or ctx cancellation.
+func Run(ctx context.Context, src view.Source, version string, logs *LogRing) error {
+	p := tea.NewProgram(New(ctx, src, version, logs), tea.WithAltScreen(), tea.WithContext(ctx))
+	_, err := p.Run()
+	if err != nil && ctx.Err() != nil {
+		// A cancelled context (SIGINT while the server winds down) is a
+		// normal exit, not a TUI failure.
+		return nil
+	}
+	return err
+}
+
+func (m Model) Init() tea.Cmd {
+	return tea.Batch(
+		m.fetchStatus(),
+		m.fetchOverview(),
+		m.enterSettings(), // the overview gauge's redline needs switchThreshold
+		m.subscribe(),
+		tickCmd(),
+	)
+}
+
+// --- messages ---
+
+type tickMsg time.Time
+
+type statusMsg struct {
+	status   view.Status
+	accounts []view.Account
+	err      error
+}
+
+type overviewMsg struct {
+	resets map[string]map[string]int64
+	sparks map[string][]float64
+	err    error
+}
+
+type subscribedMsg struct {
+	ch  <-chan view.Event
+	err error
+}
+
+type eventMsg view.Event
+
+type eventsClosedMsg struct{}
+
+// actionMsg reports a fire-and-forget mutation: did is the past-tense
+// success note, fail the verb for the error line — the same word the key
+// hint used, kept through the flow.
+type actionMsg struct {
+	did  string
+	fail string
+	err  error
+}
+
+type openedMsg struct{ err error }
+
+// --- commands ---
+
+func tickCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func (m Model) fetchStatus() tea.Cmd {
+	src := m.src
+	parent := m.ctx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(parent, fetchTimeout)
+		defer cancel()
+		st, err := src.ServerStatus(ctx)
+		if err != nil {
+			return statusMsg{err: err}
+		}
+		accts, err := src.Accounts(ctx)
+		if err != nil {
+			return statusMsg{status: st, err: err}
+		}
+		return statusMsg{status: st, accounts: accts}
+	}
+}
+
+// fetchOverview reads the heavier per-account data: latest reset instants
+// from quota history, and one hour of per-minute throughput for the
+// sparklines. It re-reads the account list itself rather than trusting the
+// model's copy, so an account added or removed mid-flight cannot desync it.
+func (m Model) fetchOverview() tea.Cmd {
+	src := m.src
+	parent := m.ctx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(parent, fetchTimeout)
+		defer cancel()
+		now := time.Now()
+		accts, err := src.Accounts(ctx)
+		if err != nil {
+			return overviewMsg{err: err}
+		}
+
+		resets := make(map[string]map[string]int64, len(accts))
+		w := view.Window{From: now.Add(-24 * time.Hour).UnixMilli(), To: now.UnixMilli()}
+		for _, a := range accts {
+			hist, err := src.AccountQuotaHistory(ctx, a.ID, w)
+			if err != nil {
+				continue // an account may vanish between the list and this read
+			}
+			per := map[string]int64{}
+			latest := map[string]int64{}
+			for _, p := range hist {
+				if p.At >= latest[p.Bucket] && p.ResetsAt > 0 {
+					latest[p.Bucket] = p.At
+					per[p.Bucket] = p.ResetsAt
+				}
+			}
+			resets[a.ID] = per
+		}
+
+		series, err := src.UsageSeries(ctx, view.SeriesQuery{
+			Window:      view.Window{From: now.Add(-time.Hour).UnixMilli(), To: now.UnixMilli()},
+			Granularity: view.GranularityMinute,
+			GroupBy:     view.GroupByAccount,
+		})
+		if err != nil {
+			return overviewMsg{resets: resets, err: err}
+		}
+		samples := map[string][]sparkSample{}
+		for _, p := range series.Points {
+			samples[p.Key] = append(samples[p.Key], sparkSample{At: p.BucketStart, V: float64(p.Requests)})
+		}
+		sparks := map[string][]float64{}
+		for id, ss := range samples {
+			sparks[id] = sparkBuckets(ss, now.Add(-time.Hour).UnixMilli(), now.UnixMilli(), sparkCells)
+		}
+		return overviewMsg{resets: resets, sparks: sparks}
+	}
+}
+
+func (m Model) subscribe() tea.Cmd {
+	src := m.src
+	ctx := m.ctx
+	return func() tea.Msg {
+		ch, err := src.Subscribe(ctx)
+		return subscribedMsg{ch: ch, err: err}
+	}
+}
+
+// waitEvent blocks (in its own goroutine, never the render path) for the
+// next live event. The channel is closed when ctx is cancelled.
+func waitEvent(ch <-chan view.Event) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return eventsClosedMsg{}
+		}
+		return eventMsg(ev)
+	}
+}
+
+func (m Model) probeNow() tea.Cmd {
+	src := m.src
+	parent := m.ctx
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(parent, fetchTimeout)
+		defer cancel()
+		return actionMsg{did: "quota probe started", fail: "probe", err: src.ProbeNow(ctx)}
+	}
+}
+
+// openDashboard opens the control UI in the default browser, from a command
+// so a slow launcher never stalls a frame.
+func (m Model) openDashboard() tea.Cmd {
+	url := "http://" + displayAddr(m.status.ListenAddr) + "/_aiproxy/"
+	return func() tea.Msg {
+		var c *exec.Cmd
+		switch runtime.GOOS {
+		case "darwin":
+			c = exec.Command("open", url)
+		case "windows":
+			c = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+		default:
+			c = exec.Command("xdg-open", url)
+		}
+		return openedMsg{err: c.Start()}
+	}
+}
+
+// --- update ---
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+
+	case tickMsg:
+		m.now = time.Time(msg)
+		var cmds []tea.Cmd
+		cmds = append(cmds, tickCmd())
+		if !m.fetchingStatus && m.now.Sub(m.accountsAt) >= refreshEvery {
+			m.fetchingStatus = true
+			cmds = append(cmds, m.fetchStatus())
+		}
+		if !m.fetchingOverview && m.now.Sub(m.lastOverviewAt) >= overviewEvery {
+			m.fetchingOverview = true
+			cmds = append(cmds, m.fetchOverview())
+		}
+		return m, tea.Batch(cmds...)
+
+	case statusMsg:
+		m.fetchingStatus = false
+		m.accountsAt = m.now
+		if msg.err != nil {
+			m.statusErr = msg.err.Error()
+		} else {
+			m.statusErr = ""
+		}
+		if msg.accounts != nil || msg.err == nil {
+			m.accounts = msg.accounts
+		}
+		m.status = msg.status
+		return m, nil
+
+	case overviewMsg:
+		m.fetchingOverview = false
+		m.lastOverviewAt = m.now
+		if msg.resets != nil {
+			m.resets = msg.resets
+		}
+		if msg.sparks != nil {
+			m.sparks = msg.sparks
+		}
+		return m, nil
+
+	case subscribedMsg:
+		if msg.err != nil {
+			m.flash = m.newFlash(sevBad, "live feed unavailable: "+msg.err.Error())
+			return m, nil
+		}
+		m.activity.channel = msg.ch
+		return m, waitEvent(msg.ch)
+
+	case eventMsg:
+		m.activity.append(view.Event(msg))
+		return m, waitEvent(m.activity.ch())
+
+	case eventsClosedMsg:
+		return m, nil
+
+	case actionMsg:
+		if msg.err != nil {
+			m.flash = m.newFlash(sevBad, msg.fail+" failed: "+msg.err.Error())
+			return m, nil
+		}
+		m.flash = m.newFlash(sevOK, msg.did)
+		// A mutation changed the world; re-read it now rather than at the
+		// next cadence tick.
+		m.fetchingStatus = true
+		return m, m.fetchStatus()
+
+	case openedMsg:
+		if msg.err != nil {
+			m.flash = m.newFlash(sevBad, "open dashboard failed: "+msg.err.Error())
+		}
+		return m, nil
+
+	case tea.KeyMsg:
+		return m.handleKey(msg)
+	}
+
+	// Screen-specific messages.
+	var cmd tea.Cmd
+	m, cmd = m.updateUsage(msg)
+	if cmd != nil {
+		return m, cmd
+	}
+	m, cmd = m.updateAccounts(msg)
+	if cmd != nil {
+		return m, cmd
+	}
+	m, cmd = m.updateSettings(msg)
+	if cmd != nil {
+		return m, cmd
+	}
+	m, cmd = m.updateLogin(msg)
+	return m, cmd
+}
+
+func (m Model) newFlash(sev severity, text string) flash {
+	return flash{text: text, sev: sev, until: m.now.Add(5 * time.Second)}
+}
+
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// A focused input owns the keyboard; only its handler sees keys.
+	if m.login.active {
+		return m.loginKey(msg)
+	}
+	if m.screen == screenSettings && m.settings.editing {
+		return m.settingsKey(msg)
+	}
+	if m.screen == screenAccounts && (m.accts.confirming || m.accts.importing) {
+		return m.accountsKey(msg)
+	}
+
+	if m.help {
+		switch msg.String() {
+		case "?", "esc", "q":
+			m.help = false
+		}
+		return m, nil
+	}
+
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "1":
+		m.screen = screenOverview
+	case "2":
+		m.screen = screenActivity
+	case "3":
+		m.screen = screenUsage
+		return m, m.enterUsage()
+	case "4":
+		m.screen = screenAccounts
+	case "5":
+		m.screen = screenSettings
+		return m, m.enterSettings()
+	case "tab":
+		return m.switchScreen((m.screen + 1) % screenCount)
+	case "shift+tab":
+		return m.switchScreen((m.screen + screenCount - 1) % screenCount)
+	case "?":
+		m.help = true
+	case "l":
+		return m.startLogin()
+	case "p":
+		return m, m.probeNow()
+	case "o":
+		return m, m.openDashboard()
+	default:
+		switch m.screen {
+		case screenActivity:
+			return m.activityKey(msg)
+		case screenUsage:
+			return m.usageKey(msg)
+		case screenAccounts:
+			return m.accountsKey(msg)
+		case screenSettings:
+			return m.settingsKey(msg)
+		}
+	}
+	return m, nil
+}
+
+func (m Model) switchScreen(s screenID) (tea.Model, tea.Cmd) {
+	m.screen = s
+	switch s {
+	case screenUsage:
+		return m, m.enterUsage()
+	case screenSettings:
+		return m, m.enterSettings()
+	}
+	return m, nil
+}
+
+// --- view ---
+
+func (m Model) View() string {
+	if m.width <= 0 || m.height <= 0 {
+		return ""
+	}
+	header := m.viewHeader()
+	tabs := m.viewTabs()
+	rule := m.th.dim(strings.Repeat("─", m.width))
+	footer := m.viewFooter()
+
+	contentH := m.height - 5 // header, tabs, rule, flash line, footer
+	if contentH < 1 {
+		contentH = 1
+	}
+
+	var content string
+	switch {
+	case m.login.active:
+		content = m.viewLogin(contentH)
+	case m.help:
+		content = m.viewHelp(contentH)
+	default:
+		switch m.screen {
+		case screenOverview:
+			content = m.viewOverview(contentH)
+		case screenActivity:
+			content = m.viewActivity(contentH)
+		case screenUsage:
+			content = m.viewUsage(contentH)
+		case screenAccounts:
+			content = m.viewAccounts(contentH)
+		case screenSettings:
+			content = m.viewSettings(contentH)
+		}
+	}
+	content = fitHeight(content, contentH)
+
+	return strings.Join([]string{header, tabs, rule, content, m.viewFlash(), footer}, "\n")
+}
+
+// lamp is the one-glyph answer to "is anything wrong?": the worst severity
+// visible anywhere. It sits in the frame's top-left corner — the first cell
+// a glance lands on.
+func (m Model) lamp() severity {
+	worst := sevOK
+	raise := func(s severity) {
+		if s > worst {
+			worst = s
+		}
+	}
+	if m.statusErr != "" {
+		raise(sevBad)
+	}
+	if m.status.MetricsDropped > 0 || m.status.EventsDropped > 0 {
+		raise(sevWarn)
+	}
+	if len(m.settings.needsRestart) > 0 {
+		raise(sevWarn)
+	}
+	serving := 0
+	for _, a := range m.accounts {
+		if a.Disabled {
+			continue
+		}
+		if a.Status != "active" {
+			raise(sevBad)
+			continue
+		}
+		if a.RateLimitedUntil > m.now.UnixMilli() || a.PausedUntil > m.now.UnixMilli() {
+			raise(sevWarn)
+			continue
+		}
+		serving++
+	}
+	if serving == 0 {
+		raise(sevBad) // nothing can serve: no accounts, or all held out
+	}
+	for _, ps := range m.status.Probe.Accounts {
+		if ps.LastError != "" {
+			raise(sevWarn)
+		}
+	}
+	return worst
+}
+
+func (m Model) viewHeader() string {
+	th := m.th
+	lamp := th.sev(m.lamp(), "●")
+	if th.mode == modeNone {
+		lamp = [...]string{"=", "!", "x"}[m.lamp()]
+	}
+
+	segs := []string{lamp + " " + th.bold("aiproxy")}
+	segs = append(segs, th.dim("on ")+displayAddr(m.status.ListenAddr))
+	if m.width >= 70 {
+		segs = append(segs, th.dim("up ")+formatUptime(m.status.UptimeSeconds))
+	}
+	segs = append(segs, fmt.Sprintf("%d %s", m.status.InFlight, th.dim("in flight")))
+	if m.width >= 90 {
+		segs = append(segs, th.dim("p95 ")+formatMS(m.status.TTFBP95MS))
+	}
+	if d := m.status.MetricsDropped + m.status.EventsDropped; d > 0 {
+		segs = append(segs, th.warn(fmt.Sprintf("%d dropped", d)))
+	}
+	if m.statusErr != "" {
+		segs = append(segs, th.bad("status query failed"))
+	}
+	line := strings.Join(segs, th.dim("  ·  "))
+	return padAnsi(line, m.width)
+}
+
+func (m Model) viewTabs() string {
+	th := m.th
+	var parts []string
+	for s := screenOverview; s < screenCount; s++ {
+		name := s.String()
+		key := fmt.Sprintf("%d", int(s)+1)
+		if s == m.screen {
+			parts = append(parts, th.accent(key)+" "+th.bold(name))
+		} else {
+			parts = append(parts, th.dim(key+" "+name))
+		}
+	}
+	return padAnsi("  "+strings.Join(parts, "   "), m.width)
+}
+
+func (m Model) viewFlash() string {
+	if m.flash.text == "" || m.now.After(m.flash.until) {
+		return ""
+	}
+	return padAnsi("  "+m.th.sev(m.flash.sev, truncate(m.flash.text, m.width-4)), m.width)
+}
+
+func (m Model) viewFooter() string {
+	th := m.th
+	var keys []string
+	switch {
+	case m.login.active:
+		keys = []string{"enter submit code", "o open url", "esc cancel"}
+	case m.help:
+		keys = []string{"esc close"}
+	default:
+		switch m.screen {
+		case screenOverview:
+			keys = []string{"l login", "p probe", "o dashboard"}
+		case screenActivity:
+			keys = m.activityFooter()
+		case screenUsage:
+			keys = []string{"r range", "g group by", "j/k top table"}
+		case screenAccounts:
+			keys = m.accountsFooter()
+		case screenSettings:
+			keys = m.settingsFooter()
+		}
+	}
+	keys = append(keys, "? help", "q quit")
+
+	var parts []string
+	for _, k := range keys {
+		key, _, found := strings.Cut(k, " ")
+		if !found {
+			parts = append(parts, th.dim(k))
+			continue
+		}
+		parts = append(parts, th.accent(key)+" "+th.dim(k[len(key)+1:]))
+	}
+	line := "  " + strings.Join(parts, th.dim("  ·  "))
+	for lipgloss.Width(line) > m.width && len(parts) > 2 {
+		parts = parts[1:] // shed leftmost screen keys before the global pair
+		line = "  " + strings.Join(parts, th.dim("  ·  "))
+	}
+	return padAnsi(line, m.width)
+}
+
+func (m Model) viewHelp(h int) string {
+	th := m.th
+	rows := [][2]string{
+		{"1–5, tab", "switch screens"},
+		{"l", "log in with Anthropic"},
+		{"p", "probe quota now"},
+		{"o", "open the dashboard"},
+		{"", ""},
+		{"activity", ""},
+		{"space", "pause and resume the feed"},
+		{"j/k", "scroll; G returns to live tail"},
+		{"a m c", "filter by account, model, outcome"},
+		{"v", "switch between requests and the log"},
+		{"", ""},
+		{"usage", ""},
+		{"r", "cycle range: 1h, 24h, 7d, 30d"},
+		{"g", "group by account, model, or outcome"},
+		{"", ""},
+		{"accounts", ""},
+		{"e", "enable or disable"},
+		{"+/-", "raise or lower priority"},
+		{"x", "remove (asks first)"},
+		{"i", "import credentials"},
+		{"", ""},
+		{"q", "quit aiproxy"},
+	}
+	var b strings.Builder
+	b.WriteString(th.bold("keys") + "\n\n")
+	for _, r := range rows {
+		if r[0] == "" && r[1] == "" {
+			b.WriteString("\n")
+			continue
+		}
+		if r[1] == "" {
+			b.WriteString(th.dim(r[0]) + "\n")
+			continue
+		}
+		b.WriteString("  " + th.accent(padRight(r[0], 10)) + r[1] + "\n")
+	}
+	return overlay(b.String(), m.width, h)
+}
+
+// overlay centres a panel in the content area with a thin border — the one
+// place the UI draws a box, because a floating layer needs an edge to read
+// as floating.
+func overlay(body string, w, h int) string {
+	panel := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		Padding(1, 3).
+		Render(strings.TrimRight(body, "\n"))
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, panel)
+}
+
+// fitHeight pads or trims content to exactly h lines so the footer never
+// drifts.
+func fitHeight(s string, h int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for len(lines) < h {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+// padAnsi pads s with spaces to width cells, ANSI-aware, truncating by
+// dropping nothing (headers compose themselves to fit; this only pads).
+func padAnsi(s string, width int) string {
+	if n := width - lipgloss.Width(s); n > 0 {
+		return s + strings.Repeat(" ", n)
+	}
+	return s
+}
+
+// displayAddr renders a listen address for humans: an unspecified host
+// stays as-is, but the empty string (status not loaded yet) reads as a
+// placeholder rather than nothing.
+func displayAddr(addr string) string {
+	if addr == "" {
+		return "…"
+	}
+	return addr
+}
+
+// sortedBucketNames orders quota buckets the way the eye wants them: the
+// short window first, then the long one, then per-model buckets.
+func sortedBucketNames(buckets map[string]float64) []string {
+	names := make([]string, 0, len(buckets))
+	for n := range buckets {
+		names = append(names, n)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		return bucketRank(names[i]) < bucketRank(names[j]) ||
+			(bucketRank(names[i]) == bucketRank(names[j]) && names[i] < names[j])
+	})
+	return names
+}
+
+func bucketRank(name string) int {
+	switch name {
+	case "five_hour", "5h":
+		return 0
+	case "seven_day", "7d":
+		return 1
+	default:
+		return 2
+	}
+}
+
+// bucketLabel renders a provider bucket name as its instrument label.
+func bucketLabel(name string) string {
+	switch name {
+	case "five_hour":
+		return "5h"
+	case "seven_day":
+		return "7d"
+	}
+	return strings.ReplaceAll(name, "_", " ")
+}

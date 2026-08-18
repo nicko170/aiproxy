@@ -133,7 +133,6 @@ func (t theme) bad(s string) string    { return t.fg(colBad, s) }
 func (t theme) accent(s string) string { return t.fg(colAccent, s) }
 func (t theme) dim(s string) string    { return t.fg(colDim, s) }
 func (t theme) bold(s string) string   { return t.sgr(s, "1") }
-func (t theme) rev(s string) string    { return t.sgr(s, "7") }
 
 func sevColor(sev severity) color {
 	switch sev {
