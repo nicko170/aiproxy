@@ -489,3 +489,282 @@ func TestLoginCancelMidExchangeNeverPersistsTheAccount(t *testing.T) {
 		t.Error("OnLoginSuccess ran after Cancel raced the exchange: a cancelled login must never persist an account")
 	}
 }
+
+// The existing tests above all pass against a fake token endpoint and never
+// look at the authorize URL's exact shape, so a wrong query parameter (an
+// omitted "code=true", or a redirect_uri host Anthropic's consent page
+// doesn't recognize) passes them silently while still getting a real 400
+// from Anthropic in production. This pins every protocol-relevant parameter
+// of the authorize URL directly.
+func TestLoginAuthorizeURLPinsExactProtocolParameters(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	defer sess.Cancel()
+
+	u, err := url.Parse(sess.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	q := u.Query()
+
+	// code=true selects the CLI-style flow that produces a pasteable code.
+	// Without it, Anthropic's consent page submits a differently shaped
+	// request and answers with a 400 "Invalid request format" — this is the
+	// exact bug this test exists to pin.
+	if got := q.Get("code"); got != "true" {
+		t.Errorf(`authorize URL "code" param = %q, want "true"`, got)
+	}
+	if got := q.Get("client_id"); got != ClientID {
+		t.Errorf("authorize URL client_id = %q, want %q", got, ClientID)
+	}
+	if got := q.Get("response_type"); got != "code" {
+		t.Errorf("authorize URL response_type = %q, want %q", got, "code")
+	}
+	if got := q.Get("code_challenge_method"); got != "S256" {
+		t.Errorf("authorize URL code_challenge_method = %q, want %q", got, "S256")
+	}
+	if q.Get("code_challenge") == "" {
+		t.Error("authorize URL missing code_challenge")
+	}
+	if got := q.Get("scope"); got != Scopes {
+		t.Errorf("authorize URL scope = %q, want %q", got, Scopes)
+	}
+	if q.Get("state") == "" {
+		t.Error("authorize URL missing state")
+	}
+
+	redirectURI := q.Get("redirect_uri")
+	ru, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("parse redirect_uri %q: %v", redirectURI, err)
+	}
+	// Anthropic validates redirect_uri against a registered literal, and
+	// "127.0.0.1" is not interchangeable with "localhost" for that check —
+	// the other half of the 400 this test pins against regressing.
+	if ru.Hostname() != "localhost" {
+		t.Errorf("redirect_uri host = %q, want %q (got full redirect_uri %q)", ru.Hostname(), "localhost", redirectURI)
+	}
+}
+
+// This is the test that would have caught the localhost/127.0.0.1 mismatch
+// class of bug directly: it takes the redirect_uri exactly as advertised in
+// the authorize URL — not a hand-parsed address — and proves the callback
+// listener actually accepts a request sent to it, on both loopback address
+// families a browser resolving "localhost" might pick. A regression that
+// advertises "localhost" while binding only 127.0.0.1 (or vice versa) must
+// fail this: on the family it doesn't bind, the browser's redirect would
+// hang forever with no visible error instead of ever reaching the handler.
+func TestLoginListenerAcceptsTheAdvertisedRedirectURIOnBothLoopbackFamilies(t *testing.T) {
+	// Skip the IPv6 half where the test machine itself has no IPv6 loopback
+	// at all (some CI sandboxes) — that's an environment limitation, not a
+	// regression in this package, and in that environment "localhost" could
+	// never resolve to ::1 either.
+	ipv6Available := true
+	if probe, err := net.Listen("tcp6", "[::1]:0"); err != nil {
+		ipv6Available = false
+	} else {
+		probe.Close()
+	}
+
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	defer sess.Cancel()
+	state, redirectURI := sessionParams(t, sess.URL)
+
+	ru, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("parse redirect_uri: %v", err)
+	}
+	if ru.Hostname() != "localhost" {
+		t.Fatalf("redirect_uri host = %q, want %q", ru.Hostname(), "localhost")
+	}
+	port := ru.Port()
+
+	conn4, err := net.DialTimeout("tcp4", "127.0.0.1:"+port, 2*time.Second)
+	if err != nil {
+		t.Fatalf("callback listener not reachable on 127.0.0.1 at the advertised port %s: %v", port, err)
+	}
+	conn4.Close()
+
+	if ipv6Available {
+		conn6, err := net.DialTimeout("tcp6", "[::1]:"+port, 2*time.Second)
+		if err != nil {
+			t.Fatalf("callback listener not reachable on ::1 at the advertised port %s: %v — a browser "+
+				"resolving \"localhost\" to ::1 would hang with no visible error", port, err)
+		}
+		conn6.Close()
+	}
+
+	// And a real HTTP request to the exact advertised redirect_uri (as a
+	// browser redirect would send) must reach the handler and be answered,
+	// not just accepted at the TCP level.
+	res, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("request to advertised redirect_uri %q failed: %v", redirectURI, err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Errorf("advertised redirect_uri responded %d, want %d", res.StatusCode, http.StatusOK)
+	}
+
+	result := awaitResult(t, sess.Done)
+	if result.Err != nil {
+		t.Fatalf("Err = %v, want nil", result.Err)
+	}
+}
+
+// A user copying the callback out of the browser's address bar (because the
+// redirect never reached the loopback listener) will often paste the whole
+// URL, not just the bare code. SubmitCode must accept that shape too, and
+// still verify state when the pasted input carries one.
+func TestLoginSubmitCodeAcceptsAFullPastedCallbackURL(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	state, redirectURI := sessionParams(t, sess.URL)
+
+	pasted := redirectURI + "?code=pasted-code-1&state=" + state
+	if err := sess.SubmitCode(pasted); err != nil {
+		t.Fatalf("SubmitCode(%q): %v", pasted, err)
+	}
+
+	result := awaitResult(t, sess.Done)
+	if result.Err != nil {
+		t.Fatalf("Err = %v, want nil", result.Err)
+	}
+	if result.Profile.Email != "a@example.com" {
+		t.Errorf("Profile = %+v", result.Profile)
+	}
+	assertListenerClosed(t, redirectURI)
+}
+
+// The state-mismatch check must apply to a pasted full URL exactly as it
+// does to the "code#state" shape — a forged or stale callback URL is not
+// trustworthy just because it parses.
+func TestLoginSubmitCodeWithFullPastedURLAndWrongStateIsRejected(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	_, redirectURI := sessionParams(t, sess.URL)
+
+	pasted := redirectURI + "?code=pasted-code-1&state=wrong-state"
+	if err := sess.SubmitCode(pasted); !errors.Is(err, ErrStateMismatch) {
+		t.Fatalf("SubmitCode(%q) err = %v, want ErrStateMismatch", pasted, err)
+	}
+	result := awaitResult(t, sess.Done)
+	if !errors.Is(result.Err, ErrStateMismatch) {
+		t.Fatalf("Done Err = %v, want ErrStateMismatch", result.Err)
+	}
+}
+
+// referenceAuthorizeURL is the authorize URL a known-working reference
+// implementation of this same OAuth flow (teamclaude's `login`) actually
+// emitted for a login Anthropic accepted. Every assertion in
+// TestLoginAuthorizeURLMatchesReferenceStructure below is derived by parsing
+// this string, not by restating our own implementation's behaviour back at
+// itself — the failure mode that let the bug this test exists to catch
+// (url.Values.Encode alphabetizing the query, silently reordering it away
+// from what Anthropic accepts) pass every prior test in this file.
+const referenceAuthorizeURL = "https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A61764%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=X7R_oa7WT-z-8kjk7cL42_isUL4sbPm2Uz8MmQEaH3I&code_challenge_method=S256&state=jurIG8yrRb6rX_Prt1LBFVL2C3AVB81NcbS1_kVDFJ0"
+
+// queryParamOrder returns rawURL's query parameter keys in the exact order
+// they appear in the query string — unlike url.Values, a map, which throws
+// order away the instant a query string is parsed into it.
+func queryParamOrder(t *testing.T, rawURL string) []string {
+	t.Helper()
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", rawURL, err)
+	}
+	var keys []string
+	for _, pair := range strings.Split(u.RawQuery, "&") {
+		key, _, _ := strings.Cut(pair, "=")
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// TestLoginAuthorizeURLMatchesReferenceStructure pins the authorize URL's
+// full structure against referenceAuthorizeURL, on properties a value-only
+// check (TestLoginAuthorizeURLPinsExactProtocolParameters above) cannot see:
+// the exact order the query parameters appear in, and the scope string
+// byte-for-byte rather than just non-empty. This must fail if
+// url.Values.Encode() (which always sorts keys alphabetically) is
+// reintroduced in place of the ordered construction Login uses.
+func TestLoginAuthorizeURLMatchesReferenceStructure(t *testing.T) {
+	refKeys := queryParamOrder(t, referenceAuthorizeURL)
+	refU, err := url.Parse(referenceAuthorizeURL)
+	if err != nil {
+		t.Fatalf("parse referenceAuthorizeURL: %v", err)
+	}
+	refQ := refU.Query()
+
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	defer sess.Cancel()
+
+	gotKeys := queryParamOrder(t, sess.URL)
+	if len(gotKeys) != len(refKeys) {
+		t.Fatalf("authorize URL has %d query params, reference has %d\ngot:  %v\nwant: %v",
+			len(gotKeys), len(refKeys), gotKeys, refKeys)
+	}
+	for i := range refKeys {
+		if gotKeys[i] != refKeys[i] {
+			t.Errorf("query param %d = %q, want %q (order must match the reference exactly, not "+
+				"url.Values.Encode's alphabetical order)\ngot:  %v\nwant: %v",
+				i, gotKeys[i], refKeys[i], gotKeys, refKeys)
+		}
+	}
+
+	u, err := url.Parse(sess.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	q := u.Query()
+
+	if got, want := q.Get("scope"), refQ.Get("scope"); got != want {
+		t.Errorf("scope = %q, want byte-identical to reference %q", got, want)
+	}
+	if got := q.Get("code"); got != "true" {
+		t.Errorf(`"code" param = %q, want "true"`, got)
+	}
+	if got := q.Get("code_challenge_method"); got != "S256" {
+		t.Errorf("code_challenge_method = %q, want %q", got, "S256")
+	}
+	redirectURI := q.Get("redirect_uri")
+	ru, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("parse redirect_uri %q: %v", redirectURI, err)
+	}
+	if ru.Hostname() != "localhost" {
+		t.Errorf("redirect_uri host = %q, want %q", ru.Hostname(), "localhost")
+	}
+	// 43 characters: 32 random bytes, base64url-encoded with no padding —
+	// the same entropy and encoded length as the PKCE verifier, matching the
+	// reference rather than the shorter 22-character token this used before.
+	if state := q.Get("state"); len(state) != 43 {
+		t.Errorf("state = %q (%d chars), want 43", state, len(state))
+	}
+}

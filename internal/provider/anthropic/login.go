@@ -75,37 +75,117 @@ func (a *Anthropic) loginTimeout() time.Duration {
 // loopback callback listener on an ephemeral port, and an authorize URL the
 // caller shows and may open in a browser. Login never opens a browser or
 // logs anything itself — see provider.LoginSession's doc comment.
+// bindLoopback binds the login callback listener to the same ephemeral port
+// on both loopback address families. The redirect_uri advertised to
+// Anthropic uses the hostname "localhost" (required — see the comment in
+// Login), and a browser resolving that hostname is free to prefer either
+// 127.0.0.1 or ::1 (macOS commonly tries ::1 first). Binding only one family
+// while advertising "localhost" would turn a visible 400 into a callback
+// that silently never arrives on some machines.
+//
+// ln4 is required: if it fails to bind, the whole flow fails loudly, same as
+// before. ln6 is best-effort — some hosts and containers have IPv6 loopback
+// disabled entirely, and on those "localhost" only ever resolves to
+// 127.0.0.1 anyway, so ln4 alone still covers them; ln6 comes back nil in
+// that case rather than failing the login.
+//
+// Neither listener binds to all interfaces: this briefly accepts an
+// authorization code and must stay unreachable from the network.
+func bindLoopback() (ln4, ln6 net.Listener, port int, err error) {
+	ln4, err = net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	port = ln4.Addr().(*net.TCPAddr).Port
+	if l6, err6 := net.Listen("tcp6", fmt.Sprintf("[::1]:%d", port)); err6 == nil {
+		ln6 = l6
+	}
+	return ln4, ln6, port, nil
+}
+
+// authorizeParam is one key/value pair of the authorize URL's query string,
+// kept in an ordered slice rather than url.Values (a map) so callers control
+// the order the pairs are emitted in.
+type authorizeParam struct {
+	key, value string
+}
+
+// authorizeQuery renders params into a query string in exactly the order
+// given, unlike url.Values.Encode which always sorts keys alphabetically.
+// Each key and value is escaped individually with url.QueryEscape — the same
+// per-value escaping url.Values.Encode uses internally (space as "+", ":" as
+// "%3A", and so on) — so the only behavioural difference from Encode is
+// order, not encoding.
+func authorizeQuery(params []authorizeParam) string {
+	parts := make([]string, len(params))
+	for i, p := range params {
+		parts[i] = url.QueryEscape(p.key) + "=" + url.QueryEscape(p.value)
+	}
+	return strings.Join(parts, "&")
+}
+
 func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 	verifier, err := randToken(32)
 	if err != nil {
 		return provider.LoginSession{}, err
 	}
-	state, err := randToken(16)
+	// 32 bytes (43 base64url characters) — the same length as the PKCE
+	// verifier, not the 16 bytes this used before. Nothing in the spec ties
+	// state's entropy to the verifier's, but a shorter state was one more
+	// difference from the request Anthropic's authorize endpoint is known to
+	// accept, so it is eliminated along with the others.
+	state, err := randToken(32)
 	if err != nil {
 		return provider.LoginSession{}, err
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// The authorize page's redirect_uri must be "localhost", not "127.0.0.1"
+	// — Anthropic's OAuth consent submission is shaped differently (and
+	// rejected with a 400) if the two don't match what it expects. But a
+	// browser resolving "localhost" is free to prefer either address family
+	// (macOS commonly tries ::1 first), so the callback listener must accept
+	// on both 127.0.0.1 and ::1 for the same port; binding IPv4-only while
+	// advertising "localhost" would swap a visible 400 for a callback that
+	// silently never arrives. bindLoopback below guarantees that.
+	ln4, ln6, port, err := bindLoopback()
 	if err != nil {
 		return provider.LoginSession{}, fmt.Errorf("start login callback listener: %w", err)
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	redirectURI := fmt.Sprintf("http://localhost:%d/callback", port)
 
 	authURL, err := url.Parse(AuthorizeURL)
 	if err != nil {
-		ln.Close()
+		ln4.Close()
+		if ln6 != nil {
+			ln6.Close()
+		}
 		return provider.LoginSession{}, fmt.Errorf("parse authorize URL: %w", err)
 	}
-	q := authURL.Query()
-	q.Set("client_id", ClientID)
-	q.Set("response_type", "code")
-	q.Set("redirect_uri", redirectURI)
-	q.Set("scope", Scopes)
-	q.Set("code_challenge", pkceChallenge(verifier))
-	q.Set("code_challenge_method", "S256")
-	q.Set("state", state)
-	authURL.RawQuery = q.Encode()
+	// The query string is assembled by hand, from an ordered slice via
+	// authorizeQuery, rather than via url.Values.Encode() — Encode sorts
+	// keys alphabetically, and a
+	// known-working reference implementation of this same flow emits them in
+	// a fixed, non-alphabetical order (code, client_id, response_type,
+	// redirect_uri, scope, code_challenge, code_challenge_method, state).
+	// Every parameter *value* here was already correct before this comment
+	// existed; only reordering them to match is new. Whether Anthropic's
+	// authorize endpoint actually inspects order was never confirmed either
+	// way — the fix is to stop being the one difference from a request known
+	// to work, not to first prove which difference mattered.
+	authURL.RawQuery = authorizeQuery([]authorizeParam{
+		// code=true selects the CLI-style authorize flow that produces a
+		// pasteable code; omitting it makes the consent page submit a
+		// differently shaped request, which Anthropic answers with a 400
+		// "Invalid request format".
+		{"code", "true"},
+		{"client_id", ClientID},
+		{"response_type", "code"},
+		{"redirect_uri", redirectURI},
+		{"scope", Scopes},
+		{"code_challenge", pkceChallenge(verifier)},
+		{"code_challenge_method", "S256"},
+		{"state", state},
+	})
 
 	f := &loginFlow{
 		a: a, verifier: verifier, state: state, redirectURI: redirectURI,
@@ -117,7 +197,10 @@ func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 	mux.HandleFunc("/callback", f.handleCallback)
 	f.srv = &http.Server{Handler: mux}
 
-	go f.serve(ln)
+	go f.serve(ln4)
+	if ln6 != nil {
+		go f.serve(ln6)
+	}
 	go f.awaitTimeout(a.loginTimeout())
 
 	return provider.LoginSession{
@@ -265,28 +348,48 @@ func (f *loginFlow) handleCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 // SubmitCode accepts a pasted authorization code (spec §6.1's SSH fallback,
-// where no browser can reach the loopback listener at all). The provider's
-// real redirect page encodes the code as "code#state"; a bare code with no
-// "#" is accepted without a state check, since a manually pasted bare code
-// has nothing to check it against.
+// where no browser can reach the loopback listener at all). A user copying
+// from the browser may paste any of three shapes: the provider's own
+// "code#state" copy-paste format, the full callback URL (e.g. copied from
+// the address bar when the redirect failed to reach the loopback listener),
+// or a bare code with no state at all. A bare code is accepted without a
+// state check, since a manually pasted bare code has nothing to check it
+// against.
 func (f *loginFlow) SubmitCode(code string) error {
 	if !f.tryClaim() {
 		return ErrLoginSessionComplete
 	}
-	c, state, hasState := strings.Cut(code, "#")
+	c, state, hasState := parsePastedCode(code)
 	if hasState {
 		if state != f.state {
 			f.finish(provider.LoginResult{Err: ErrStateMismatch})
 			return ErrStateMismatch
 		}
-		code = c
 	}
-	if code == "" {
+	if c == "" {
 		f.finish(provider.LoginResult{Err: errors.New("oauth: empty code")})
 		return errors.New("oauth: empty code")
 	}
-	f.complete(code)
+	f.complete(c)
 	return nil
+}
+
+// parsePastedCode extracts an authorization code and, if present, a state
+// from manually pasted input, trying each accepted shape in turn: a full
+// callback URL with ?code=&state= query parameters, the provider's
+// "code#state" copy-paste format, and finally a bare code with no state.
+func parsePastedCode(input string) (code, state string, hasState bool) {
+	input = strings.TrimSpace(input)
+	if u, err := url.Parse(input); err == nil && u.Scheme != "" && u.Host != "" {
+		if c := u.Query().Get("code"); c != "" {
+			s := u.Query().Get("state")
+			return c, s, s != ""
+		}
+	}
+	if c, s, found := strings.Cut(input, "#"); found {
+		return c, s, true
+	}
+	return input, "", false
 }
 
 // complete exchanges the code, reads the profile, persists via
