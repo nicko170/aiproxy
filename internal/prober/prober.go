@@ -159,6 +159,18 @@ func (p *Prober) Start() {
 				<-p.stop
 				return
 			}
+			// One cycle immediately, before the ticker. Waiting a full interval
+			// left the proxy with NO quota data for its first interval —
+			// buckets are not persisted across restarts, so this is absent
+			// data rather than merely stale, and selection cannot apply
+			// switchThreshold to an account it knows nothing about. The first
+			// requests after a restart could therefore be sent to an account
+			// that was already spent.
+			//
+			// Inside the goroutine and under stopCtx, so Start stays
+			// non-blocking and a Stop during this first cycle still cancels it.
+			p.runCycle(stopCtx)
+
 			t := time.NewTicker(p.interval)
 			defer t.Stop()
 			for {
@@ -269,6 +281,37 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 		}
 		if !p.eligible(a.ID, now) {
 			continue
+		}
+
+		// Renew before reading. This loop is the one caller of Quota, and it
+		// runs on a timer rather than in response to traffic, so an access
+		// token routinely expires while the proxy sits idle with no request to
+		// renew it on the inference path. Reading with the stale token answers
+		// HTTP 401 — which is not a throttling error, so it carries no backoff
+		// and simply fails again every interval. Utilization then stays frozen
+		// at its last reading, most visibly across a quota reset, until an
+		// inference request happens to refresh the credential on its own path.
+		//
+		// EnsureFresh is a no-op for a credential that is not near expiry and
+		// for an API key, and it coalesces with a concurrent refresh on the
+		// request path, so in the common case this costs nothing. Its side
+		// effect is worth having in its own right: the probe now keeps
+		// credentials warm, so the first request after an idle spell no longer
+		// pays for a refresh on the critical path.
+		if err := p.mgr.EnsureFresh(ctx, a.ID, false); err != nil {
+			p.recordError(a.ID, fmt.Errorf("refresh: %w", err), now)
+			p.log.Warn("credential refresh failed before quota probe",
+				"account", a.Label, "id", a.ID, "err", err)
+			errs = append(errs, fmt.Errorf("probe account %s: refresh: %w", a.ID, err))
+			// Nothing to read with: probing on a credential already known to be
+			// rejected spends a call to learn what the refresh just reported.
+			continue
+		}
+		// Re-read after EnsureFresh, exactly as the attempt loop does: a is a
+		// value copy taken before the refresh, so its Credential is the token
+		// that was just superseded.
+		if fresh, ok := p.mgr.Get(a.ID); ok {
+			a = fresh
 		}
 
 		q, err := prov.Quota(ctx, a.Credential)
