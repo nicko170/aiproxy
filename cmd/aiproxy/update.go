@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"runtime"
 	"strings"
 
+	"github.com/nicko170/aiproxy/internal/privacy/ner"
 	"github.com/nicko170/aiproxy/internal/updater"
 )
 
@@ -44,10 +46,25 @@ func dispatchSubcommand(args []string, out io.Writer) int {
 	switch args[0] {
 	case "update":
 		return runUpdate(args[1:], version, out, realUpdateClient)
+	case "privacy":
+		assets, err := assetsForHost()
+		if err != nil {
+			fmt.Fprintln(out, "aiproxy:", err)
+			return updateExitError
+		}
+		return runPrivacy(args[1:], out, ner.Dir(), assets)
 	default:
-		fmt.Fprintf(out, "aiproxy: unknown command %q\nthe only subcommand is: update\nrun aiproxy --help for flags\n", args[0])
+		fmt.Fprintf(out, "aiproxy: unknown command %q\nthe subcommands are: update, privacy\nrun aiproxy --help for flags\n", args[0])
 		return updateExitError
 	}
+}
+
+// assetsForHost resolves the privacy filter's model assets for the running
+// platform. Assets already reports an unsupported platform as an error
+// rather than a panic; this just gives dispatchSubcommand a single call to
+// make.
+func assetsForHost() ([]ner.Asset, error) {
+	return ner.Assets(runtime.GOOS, runtime.GOARCH)
 }
 
 // runUpdate implements "aiproxy update" and "aiproxy update --check".

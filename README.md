@@ -95,6 +95,118 @@ the same origin as the release asset, so it defends against a corrupted or
 truncated download. It is not a signature: anyone who could publish a release
 could publish its checksum too. Release signing isn't implemented yet.
 
+## Privacy filter
+
+aiproxy can scan request bodies for secrets and personal information before
+they leave your machine, replacing each match with a stable placeholder and
+restoring the original value in the response so the agent never sees the
+substitution. **It is off by default.**
+
+```json
+"privacy": {
+  "enabled": false,
+  "onScanFailure": "closed",
+  "onUnresolvedPlaceholder": "passthrough",
+  "rules": { "builtinSecrets": true, "entropy": true },
+  "denylist": [],
+  "allowlistExtra": [],
+  "cacheEntries": 50000,
+  "ner": {
+    "enabled": false,
+    "labels": [],
+    "maxScanBytes": 4096
+  }
+}
+```
+
+Turning `enabled` on turns on the deterministic rules (`rules.builtinSecrets`
+and `rules.entropy`), because those are the reason to enable the filter at
+all — pattern-matched credentials (API keys, tokens, connection strings) and,
+with `entropy` on, high-entropy strings assigned to a credential-shaped
+variable. `denylist` adds your own literal strings or patterns to redact;
+`allowlistExtra` exempts values the rules would otherwise catch.
+`cacheEntries` bounds the LRU that remembers a string's findings so a repeated
+value (a system prompt sent on every turn) is not rescanned.
+
+The local NER model (`ner`) adds detection for prose PII — email addresses,
+phone numbers, physical addresses, and personal names — but **every label is
+individually opt-in, and the default set is empty even when `ner.enabled` is
+true.** Two categories the model supports, `private_url` and `private_date`,
+are deliberately left for you to enable rather than defaulted on: source code
+is full of import URLs, API endpoints, documentation links, changelog dates,
+and licence years, none of which are a privacy concern, and redacting them
+corrupts the agent's context for almost no privacy gain. `maxScanBytes`
+(default 4096) bounds how much of any one string the model looks at — see
+"Cost and limits" below; the deterministic rules have no such cap.
+
+### Installing the model
+
+The NER model is not bundled — it's roughly **850 MB** (a 27.9 MB tokenizer,
+an 809 MB quantized ONNX model and its weights file, and a 7–12 MB platform
+ONNX Runtime library), so it is fetched on demand:
+
+```sh
+aiproxy privacy install   # downloads and verifies every asset (~850 MB)
+aiproxy privacy status    # reports what's installed
+```
+
+Every download is checked against a SHA-256 digest compiled into the binary
+before it's used. The model is pinned to Hugging Face revision
+`7ffa9a043d54d1be65afb281eddf0ffbe629385b`, and the runtime to ONNX Runtime
+v1.23.2, so an install today and an install next year fetch byte-identical
+files. Supported platforms are darwin/arm64, darwin/amd64, linux/amd64, and
+linux/arm64 — there's no ONNX Runtime build for Windows in that pin, so the
+model tier is unavailable there. The deterministic rules have no such
+restriction and work on every platform.
+
+### Cost and limits
+
+Running the model costs time: measured on darwin/arm64 CPU, roughly 0.5 ms
+per token and about 4 bytes per token, so a 4 KB string takes on the order of
+520 ms to scan. That is why `ner.maxScanBytes` defaults to 4096 — before the
+cap existed, a 16 KB string took 2.84 s, serialized behind a mutex on every
+other request using the model at the time. A string longer than the cap is
+scanned by the model only up to the cap, and the truncation is logged, never
+silent, so it isn't mistaken for a full scan. This only affects the model
+tier: **the deterministic rules have no cap and always scan the whole
+string**, so a credential or a denylisted value anywhere in a large file is
+still caught.
+
+### Failure modes
+
+`onScanFailure` (default `closed`) governs the request side: if the filter
+can't scan a request — the model isn't installed, a detector errors, times
+out — `closed` refuses the request rather than sending it upstream
+unfiltered, because a privacy filter that silently degrades is worse than no
+filter: you'd believe you were protected exactly when you weren't. Setting it
+to `open` sends the request unfiltered and records that it happened.
+
+`onUnresolvedPlaceholder` (default `passthrough`) governs the response side:
+if a response contains a placeholder that isn't in this request's restore
+table, `passthrough` emits it verbatim and counts it, because the
+alternative — guessing at the original value — means writing a wrong value
+into your files. Setting it to `error` severs the stream instead.
+
+### What is and isn't protected
+
+Deterministic rules catch credentials and other pattern-matched or
+high-entropy secrets and identifiers, anywhere in a request, regardless of
+size. The NER model, where enabled, catches prose PII like names and contact
+details. Neither protects **the source code itself** — the agent needs to
+read and write your code to do its job, and no redaction scheme can change
+that. This filter is about what leaves your machine as an incidental,
+extractable secret or personal detail, not about hiding your codebase from
+the model you're paying to work on it.
+
+There is one intentional, residual disclosure even when everything works:
+each placeholder is a keyed hash of the original value, so the same secret
+always produces the same placeholder within an install. That's what keeps
+the provider's prompt cache working across turns — a value that changed
+identity on every request would bust the cache on every request. It does
+tell the provider "this is the same value as before, whatever it is": a
+hash, not the value, but a hash is still a bit of information they didn't
+have.
+
 ## Quick start
 
 ```sh
@@ -192,8 +304,9 @@ you on first run; the Settings screen edits most of it live.
 | `--log-level` | `debug`, `info`, `warn`, or `error` |
 | `--version` | print version and exit |
 
-One subcommand: `aiproxy update` (see [Updating](#updating)). Everything else is
-flags.
+Two subcommands: `aiproxy update` (see [Updating](#updating)) and `aiproxy
+privacy install` / `aiproxy privacy status` (see [Privacy filter](#privacy-filter)).
+Everything else is flags.
 
 `--headless` is how you run it as a service. The TUI and stderr logging can't
 share a terminal, so under the TUI logs feed the Activity screen's ring buffer

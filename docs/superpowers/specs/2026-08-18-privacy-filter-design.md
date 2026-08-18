@@ -526,7 +526,7 @@ rendered by the poll the TUI already makes:
 ```go
 type PrivacyStatus struct {
     Enabled       bool             `json:"enabled"`
-    ModelState    string           `json:"modelState"` // off, absent, downloading, loading, ready, error
+    ModelState    string           `json:"modelState"` // off, absent, installed, downloading, loading, ready, error
     DownloadedPct int              `json:"downloadedPct,omitempty"`
     Redactions    map[string]int64 `json:"redactions"` // label -> count this session
     CacheHitRate  float64          `json:"cacheHitRate"`

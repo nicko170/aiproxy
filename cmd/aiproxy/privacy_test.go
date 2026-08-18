@@ -1,13 +1,81 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/privacy/ner"
 )
+
+// TestPrivacyInstallDownloadsAssets proves "aiproxy privacy install" fetches
+// and verifies assets against an arbitrary URL and digest, without touching
+// the real Hugging Face/GitHub hosts or ner.Dir.
+func TestPrivacyInstallDownloadsAssets(t *testing.T) {
+	body := []byte("model bytes")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(body)
+	}))
+	defer srv.Close()
+
+	sum := sha256.Sum256(body)
+	assets := []ner.Asset{{Name: "m.onnx", URL: srv.URL + "/m", SHA256: hex.EncodeToString(sum[:])}}
+	dir := t.TempDir()
+
+	var out bytes.Buffer
+	if code := runPrivacy([]string{"install"}, &out, dir, assets); code != 0 {
+		t.Fatalf("exit code = %d, want 0; output: %s", code, out.String())
+	}
+	if _, err := os.Stat(filepath.Join(dir, "m.onnx")); err != nil {
+		t.Errorf("asset not installed: %v", err)
+	}
+	if !strings.Contains(out.String(), dir) {
+		t.Errorf("output should name where it installed: %s", out.String())
+	}
+}
+
+// TestPrivacyStatusReportsMissingAssets proves "aiproxy privacy status" exits
+// non-zero and names the fix when assets are absent.
+func TestPrivacyStatusReportsMissingAssets(t *testing.T) {
+	assets := []ner.Asset{{Name: "m.onnx", URL: "https://example.invalid/m", SHA256: "00"}}
+	var out bytes.Buffer
+	if code := runPrivacy([]string{"status"}, &out, t.TempDir(), assets); code != 2 {
+		t.Errorf("exit code = %d, want 2 when assets are missing", code)
+	}
+	if !strings.Contains(out.String(), "install") {
+		t.Errorf("output should name the fix: %s", out.String())
+	}
+}
+
+// TestPrivacyRejectsAnUnknownAction proves a typo in the action is an error,
+// not a silent no-op.
+func TestPrivacyRejectsAnUnknownAction(t *testing.T) {
+	var out bytes.Buffer
+	if code := runPrivacy([]string{"frobnicate"}, &out, t.TempDir(), nil); code != 2 {
+		t.Error("an unknown action must be rejected")
+	}
+}
+
+// TestPrivacySubcommandIsDispatched proves dispatchSubcommand routes
+// "privacy" to runPrivacy rather than treating it as an unknown command.
+func TestPrivacySubcommandIsDispatched(t *testing.T) {
+	var out bytes.Buffer
+	// "privacy" with no action prints usage and exits 2, which proves dispatch
+	// reached it rather than treating it as an unknown command.
+	code := dispatchSubcommand([]string{"privacy"}, &out)
+	if code != 2 || strings.Contains(out.String(), "unknown command") {
+		t.Errorf("privacy was not dispatched: code=%d out=%s", code, out.String())
+	}
+}
 
 // TestPrivacyRulesEntropyToggleControlsDetection proves that
 // privacy.rules.entropy is not a config field with no effect: turning it off
