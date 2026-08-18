@@ -102,6 +102,30 @@ func TestAccumulatorObserveWithoutStartMessageStillCounts(t *testing.T) {
 	}
 }
 
+// Per the corrected spec (docs/superpowers/specs/2026-08-17-aiproxy-design.md
+// §7.2): ALL usage fields in a message_delta are cumulative within the
+// message, not just output_tokens. A delta that repeats input_tokens and
+// cache_read_input_tokens alongside an advancing output count must not add
+// them a second time.
+func TestAccumulatorDoesNotDoubleCountRepeatedInputOrCache(t *testing.T) {
+	a := NewUsageAccumulator()
+	a.StartMessage()
+	a.Observe(d(210, 1, 3000, 12))  // message_start
+	a.Observe(d(210, 88, 3000, 12)) // message_delta repeats input/cache
+
+	got := a.Totals()
+	if got.InputTokens != 210 {
+		t.Errorf("InputTokens = %d, want 210 — repeated input must not double", got.InputTokens)
+	}
+	if got.CacheReadTokens != 3000 || got.CacheWriteTokens != 12 {
+		t.Errorf("cache = read %d / write %d, want 3000 / 12 — repeated cache must not double",
+			got.CacheReadTokens, got.CacheWriteTokens)
+	}
+	if got.OutputTokens != 88 {
+		t.Errorf("OutputTokens = %d, want 88", got.OutputTokens)
+	}
+}
+
 func TestAccumulatorIgnoresNilDelta(t *testing.T) {
 	a := NewUsageAccumulator()
 	a.StartMessage()
