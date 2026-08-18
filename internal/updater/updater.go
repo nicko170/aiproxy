@@ -1,7 +1,12 @@
 package updater
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,8 +15,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-
-	"errors"
 )
 
 // DefaultRepo is the GitHub repository releases are published to. It is a
@@ -239,4 +242,244 @@ func resolveExecPath() (string, error) {
 		return resolved, nil
 	}
 	return exe, nil
+}
+
+// maxArchiveBytes and maxChecksumBytes bound what a compromised or confused
+// server can make this process write to disk and hold in memory. The release
+// tarball is a few megabytes; 64 MiB is generous headroom and still a limit.
+const (
+	maxArchiveBytes  = 64 << 20
+	maxChecksumBytes = 1 << 20
+)
+
+// Apply installs rel over the running binary and reports what it did.
+//
+// The step order is the design, not an implementation detail. Nothing is
+// downloaded until the install directory has been proven writable, nothing is
+// unpacked until the archive has been verified against checksums.txt, and
+// nothing replaces the installed binary except a single os.Rename of a fully
+// written, correctly permissioned file in the same directory. Every failure
+// path therefore leaves the installed binary byte-identical, and every temp
+// file is removed on the way out.
+//
+// os.Rename is why the temp files live in filepath.Dir(exe) rather than
+// os.TempDir(): rename is only atomic within one filesystem, and /tmp is
+// frequently a different one.
+//
+// Apply does not restart anything. The running process keeps its open inode
+// and goes on serving the old code until the operator quits it; Result is
+// what the caller turns into "restart to apply".
+func (c *Client) Apply(ctx context.Context, rel Release) (Result, error) {
+	if c.current == devVersion {
+		return Result{}, ErrDevBuild
+	}
+	if !c.Newer(rel) {
+		// Reported with the running version in place, so a caller can say
+		// "already on 0.2.0" without having to look it up again.
+		return Result{PreviousVersion: c.current, Version: c.current}, ErrUpToDate
+	}
+
+	exe, err := c.execPath()
+	if err != nil {
+		return Result{}, fmt.Errorf("locate the running binary: %w", err)
+	}
+	dir := filepath.Dir(exe)
+
+	// Writability probe FIRST. A Homebrew-owned or root-owned install fails
+	// here, before a byte moves, and the error names the directory so the
+	// message above can suggest re-running the installer or using the package
+	// manager that owns it. Probing beats sniffing the path for known
+	// prefixes: it asks the only question that actually matters.
+	archive, err := os.CreateTemp(dir, ".aiproxy-update-*")
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %s", ErrNotWritable, dir)
+	}
+	archivePath := archive.Name()
+	defer os.Remove(archivePath)
+
+	n, err := c.download(ctx, rel.AssetURL, archive)
+	if cerr := archive.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return Result{}, err
+	}
+	if n == 0 {
+		return Result{}, fmt.Errorf("%s downloaded as an empty file", rel.AssetName)
+	}
+
+	sums, err := c.fetch(ctx, rel.ChecksumURL, maxChecksumBytes)
+	if err != nil {
+		return Result{}, err
+	}
+	want, ok := checksumFor(string(sums), rel.AssetName)
+	if !ok {
+		return Result{}, fmt.Errorf("%w: %s is not listed in checksums.txt",
+			ErrChecksumMismatch, rel.AssetName)
+	}
+	got, err := sha256File(archivePath)
+	if err != nil {
+		return Result{}, err
+	}
+	if got != want {
+		// Both digests are in the message deliberately. This is the one
+		// failure here that could mean something other than a bad day on the
+		// network, and summarizing it away would remove the only evidence.
+		return Result{}, fmt.Errorf("%w: %s expected sha256 %s, got %s",
+			ErrChecksumMismatch, rel.AssetName, want, got)
+	}
+
+	// Preserve the mode of what is being replaced rather than imposing a
+	// default: an operator who tightened permissions keeps them.
+	mode := os.FileMode(0o755)
+	if fi, err := os.Stat(exe); err == nil {
+		mode = fi.Mode().Perm()
+	}
+
+	staged, err := extractBinary(archivePath, dir, mode)
+	if err != nil {
+		return Result{}, err
+	}
+	// A no-op once the rename below succeeds; the safety net if it does not.
+	defer os.Remove(staged)
+
+	if err := os.Rename(staged, exe); err != nil {
+		return Result{}, fmt.Errorf("replace %s: %w", exe, err)
+	}
+	return Result{
+		Updated:         true,
+		PreviousVersion: c.current,
+		Version:         rel.Version,
+		Path:            exe,
+	}, nil
+}
+
+// get issues one GET and rejects anything but 200, so a 404 for a missing
+// asset does not get written to disk as if it were a tarball.
+func (c *Client) get(ctx context.Context, url string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch %s: %w", url, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("fetch %s: status %d", url, resp.StatusCode)
+	}
+	return resp, nil
+}
+
+// download streams url into w, capped at maxArchiveBytes. Hitting the cap
+// exactly is treated as an overrun rather than a complete download, because
+// there is no way to tell the two apart from a LimitReader.
+func (c *Client) download(ctx context.Context, url string, w io.Writer) (int64, error) {
+	resp, err := c.get(ctx, url)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	n, err := io.Copy(w, io.LimitReader(resp.Body, maxArchiveBytes))
+	if err != nil {
+		return n, fmt.Errorf("download %s: %w", url, err)
+	}
+	if n == maxArchiveBytes {
+		return n, fmt.Errorf("download %s: exceeds the %d-byte limit", url, int64(maxArchiveBytes))
+	}
+	return n, nil
+}
+
+func (c *Client) fetch(ctx context.Context, url string, max int64) ([]byte, error) {
+	resp, err := c.get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(io.LimitReader(resp.Body, max))
+}
+
+// checksumFor finds asset's expected digest in a sha256sum-format file. The
+// "*" prefix sha256sum writes for binary mode is tolerated, since that is a
+// property of how the file was generated rather than of what it means.
+func checksumFor(text, asset string) (string, bool) {
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		if strings.TrimPrefix(f[1], "*") == asset {
+			return f[0], true
+		}
+	}
+	return "", false
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// extractBinary writes the archive's "aiproxy" member into a temp file in dir
+// with the given mode, and returns its path. The member name is matched
+// exactly: the release tarball also carries LICENSE and README.md, which are
+// skipped, and anything else in there is skipped too rather than being
+// written somewhere on the strength of a path it chose for itself.
+func extractBinary(archivePath, dir string, mode os.FileMode) (string, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("read archive: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("read archive: %w", err)
+		}
+		if h.Typeflag != tar.TypeReg || h.Name != binaryName {
+			continue
+		}
+
+		out, err := os.CreateTemp(dir, ".aiproxy-new-*")
+		if err != nil {
+			return "", fmt.Errorf("%w: %s", ErrNotWritable, dir)
+		}
+		n, err := io.Copy(out, io.LimitReader(tr, maxArchiveBytes))
+		if err == nil && n == maxArchiveBytes {
+			err = fmt.Errorf("%s in the archive exceeds the %d-byte limit",
+				binaryName, int64(maxArchiveBytes))
+		}
+		if err == nil {
+			err = out.Chmod(mode)
+		}
+		if cerr := out.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			os.Remove(out.Name())
+			return "", err
+		}
+		return out.Name(), nil
+	}
+	return "", fmt.Errorf("archive %s does not contain %q", filepath.Base(archivePath), binaryName)
 }
