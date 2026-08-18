@@ -347,6 +347,45 @@ Per-screen keys are shown in the footer: `space` pauses the activity feed,
 (account, model, outcome); on Accounts, `e` toggles enabled, `+`/`-` change
 priority, `x` removes, and `enter` opens detail.
 
+## Overloaded upstreams
+
+Anthropic answers `529` with `overloaded_error` when the API itself is out of
+capacity. It used to be relayed straight to your agent. It is now absorbed:
+aiproxy waits and retries rather than handing the failure on.
+
+The handling is deliberately different from a `429`, because the two mean
+opposite things about what to do next. A `429` is about *your* account, so
+rotating to another one is the fix. A `529` is about *Anthropic*, and every
+account you own reaches the same exhausted upstream — so rotating just spends
+another account's attempts on a problem none of them can solve, and throws away
+the warm prompt cache on the account you were already using. A 529 therefore
+retries **in place**: same account, no hold, no rotation.
+
+Waits honour `Retry-After` when upstream sends one, and otherwise back off
+1s → 2s → 4s → 8s, with the last step repeating. A `Retry-After: 0` on a 529 is
+ignored in favour of the schedule — retrying an out-of-capacity API instantly is
+what turns an overload into a stampede, so the one case where upstream asks for
+exactly that is the case to override.
+
+`retry.overloadedBudgetMs` (default 30000) caps the total. It is deliberately
+*not* part of `budgetMs`: that budget protects the paths that recover a request
+— rotation, credential refresh, throttle absorption — and those compete with
+each other, which is why they share an allowance. Waiting out an overload
+competes with nothing, so charging it to the same pool would let one 529 consume
+the budget a later `401` needs to rotate, turning a transient overload into a
+failure for an unrelated reason.
+
+When the overload budget does run out, your agent receives Anthropic's real 529
+and body rather than a proxy-invented error — Claude Code understands 529 and
+has its own retry, and replacing it would hide what actually happened. Overloads
+appear in the outcome breakdown as `overloaded`, separate from `server_error`,
+because during an incident an overload storm and a genuine upstream fault are
+the two things worth telling apart.
+
+**Not covered:** Anthropic can also report `overloaded_error` as an SSE `error`
+event *mid-stream* under a `200`. Once bytes have reached your agent the request
+cannot be retried, so that case still surfaces. Only the 529 status is absorbed.
+
 ## Configuration
 
 Config lives at `~/.config/aiproxy/config.json` (honouring `XDG_CONFIG_HOME`),
@@ -360,7 +399,7 @@ that read those values are built once at startup.
 {
   "listen": { "addr": "127.0.0.1:3456", "apiKey": "ap-..." },
   "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [] },
-  "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000 },
+  "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000, "overloadedBudgetMs": 30000 },
   "quotaProbe": { "intervalSeconds": 300 },
   "metrics": { "retentionDays": 90 },
   "mitm": { "enabled": true },
@@ -377,10 +416,13 @@ that read those values are built once at startup.
 - **`retry.budgetMs`** bounds only the time *aiproxy* adds before the first
   byte — backoff, waiting on a paused account, absorbing a rate limit,
   refreshing a credential. **`headerTimeoutMs`** bounds one attempt's wait for
-  upstream headers, which is the model's own thinking time. They are two
-  separate clocks on purpose; conflating them cancels healthy requests. Note
-  that the privacy scan is a *third*: it runs before the retry loop, so
-  `budgetMs` does not cover it and `privacy.scanTimeoutMS` bounds it instead.
+  upstream headers, which is the model's own thinking time. They are separate
+  clocks on purpose; conflating them cancels healthy requests.
+- **`retry.overloadedBudgetMs`** (default 30000) is a clock of its own, for
+  waiting out Anthropic 529s. See [Overloaded upstreams](#overloaded-upstreams).
+  Two more clocks sit outside `budgetMs` for the same reason: the privacy scan
+  runs before the retry loop, bounded by `privacy.scanTimeoutMS`, and
+  `bodyIdleMs` governs the stream after the first byte.
 - **`quotaProbe.intervalSeconds`** defaults to 300 because the zero-spend usage
   endpoint is itself rate limited — polling it aggressively gets the probe
   throttled and leaves selection deciding on stale numbers. Set it to `0` to

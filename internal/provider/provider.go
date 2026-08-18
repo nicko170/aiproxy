@@ -124,6 +124,22 @@ const (
 	//
 	// Appended after OutcomeClientDisconnected; see the note above.
 	OutcomeBlocked
+	// OutcomeOverloaded is upstream reporting that IT has no capacity right now
+	// — Anthropic's 529 — as opposed to this account having no allowance left.
+	//
+	// It is split out from OutcomeServerError because the two call for opposite
+	// handling. A 500 or 503 says nothing about whether retrying helps and
+	// nothing about which account to use, so it is relayed. A 529 is transient
+	// by definition and account-independent: waiting is the fix, and rotating is
+	// not, since every account faces the same exhausted upstream.
+	//
+	// Keeping it inside OutcomeServerError also made it invisible in the outcome
+	// breakdown, where an overload storm and a genuine upstream fault are the
+	// two things an operator most needs to tell apart.
+	//
+	// Appended after OutcomeBlocked; see the note above about why new kinds
+	// append rather than insert.
+	OutcomeOverloaded
 )
 
 func (k OutcomeKind) String() string {
@@ -154,6 +170,8 @@ func (k OutcomeKind) String() string {
 		return "client_disconnected"
 	case OutcomeBlocked:
 		return "blocked"
+	case OutcomeOverloaded:
+		return "overloaded"
 	}
 	return "unknown"
 }

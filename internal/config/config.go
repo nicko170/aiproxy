@@ -44,8 +44,8 @@ type Routing struct {
 	BlockedModels   []string `json:"blockedModels"`
 }
 
-// Retry holds two independent clocks, and conflating them is a defect that has
-// already shipped once.
+// Retry holds three independent clocks, and conflating them is a defect that
+// has already shipped once.
 //
 // BudgetMS bounds only time the PROXY adds before the first byte: retry backoff,
 // waiting on a paused account, inline absorption of a rate limit, credential
@@ -55,11 +55,19 @@ type Routing struct {
 // upstream's own work and must not draw the budget down. Time-to-first-token on
 // a large context with extended thinking is seconds; a budget of 1 000 applied
 // to it cancels healthy requests and answers 429.
+//
+// OverloadedBudgetMS bounds the total wait spent absorbing upstream overloads
+// (Anthropic's 529) for one request. Separate from BudgetMS because it competes
+// with nothing: when upstream is out of capacity there is no other account to
+// rotate to, so charging the wait to the shared allowance would leave a later
+// 401 or 429 unable to recover a request that a transient overload had already
+// paid for.
 type Retry struct {
-	BudgetMS          int `json:"budgetMs"`
-	InlineAbsorbMaxMS int `json:"inlineAbsorbMaxMs"`
-	BodyIdleMS        int `json:"bodyIdleMs"`
-	HeaderTimeoutMS   int `json:"headerTimeoutMs"`
+	BudgetMS           int `json:"budgetMs"`
+	InlineAbsorbMaxMS  int `json:"inlineAbsorbMaxMs"`
+	BodyIdleMS         int `json:"bodyIdleMs"`
+	HeaderTimeoutMS    int `json:"headerTimeoutMs"`
+	OverloadedBudgetMS int `json:"overloadedBudgetMs"`
 }
 
 type QuotaProbe struct {
@@ -187,10 +195,13 @@ type Config struct {
 // decides on outdated numbers.
 func Default() Config {
 	return Config{
-		Listen:     Listen{Addr: "127.0.0.1:3456", APIKey: newAPIKey()},
-		Accounts:   []Account{},
-		Routing:    Routing{SwitchThreshold: 0.98, SessionAffinity: true, BlockedModels: []string{}},
-		Retry:      Retry{BudgetMS: 10000, InlineAbsorbMaxMS: 5000, BodyIdleMS: 120000, HeaderTimeoutMS: 60000},
+		Listen:   Listen{Addr: "127.0.0.1:3456", APIKey: newAPIKey()},
+		Accounts: []Account{},
+		Routing:  Routing{SwitchThreshold: 0.98, SessionAffinity: true, BlockedModels: []string{}},
+		Retry: Retry{
+			BudgetMS: 10000, InlineAbsorbMaxMS: 5000, BodyIdleMS: 120000,
+			HeaderTimeoutMS: 60000, OverloadedBudgetMS: 30000,
+		},
 		QuotaProbe: QuotaProbe{IntervalSeconds: 300},
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},
