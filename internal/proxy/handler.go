@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/view"
 )
@@ -112,6 +113,9 @@ type HandlerOptions struct {
 	// aggregation logic of its own. A nil View is only safe when no test or
 	// caller exercises a control route.
 	View view.Source
+	// Privacy redacts request bodies and restores responses. Nil disables the
+	// whole path at zero cost.
+	Privacy *privacy.Filter
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
@@ -124,6 +128,11 @@ type HandlerOptions struct {
 func proxyHandler(o HandlerOptions) http.HandlerFunc {
 	if o.Attempter != nil {
 		o.Attempter.OnResult = o.OnResult
+		// Set here, not threaded through NewAttempter, for the same reason as
+		// OnResult above: HandlerOptions is finalized after the Attempter is
+		// constructed, and the attempter only ever needs to build a restorer
+		// from a table the request already carries.
+		o.Attempter.privacy = o.Privacy
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The reserved namespace is refused HERE, at the point of harm, rather
@@ -184,6 +193,39 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 					})
 				}
 				return
+			}
+		}
+
+		// Redact ONCE, here. Not inside the attempt loop: Attempter replays
+		// req.Body on every retry and RewriteBody rewrites it per attempt for
+		// model mapping, so redacting there would mint different placeholders on
+		// a retry — breaking the prompt cache and leaving the restore table
+		// describing a body that was never sent.
+		//
+		// After the blocked-model check, so routing decisions are made on the
+		// client's own values.
+		if o.Privacy != nil {
+			redacted, table, err := o.Privacy.Redact(r.Context(), req.Body)
+			switch {
+			case err == nil:
+				req.Body = redacted
+				req.Restore = table
+			case o.Privacy.OnScanFailure() == privacy.Closed:
+				o.Log.Error("privacy filter failed; refusing the request", "err", err)
+				// 503 when the model is simply not installed or would not load,
+				// 500 when a scan went wrong. The distinction is the difference
+				// between "run aiproxy privacy install" and "file a bug", and
+				// collapsing both into 500 sends the operator to the wrong one.
+				status, msg := http.StatusInternalServerError,
+					"aiproxy could not scan this request for sensitive data and is configured to fail closed."
+				if errors.Is(err, privacy.ErrModelUnavailable) {
+					status, msg = http.StatusServiceUnavailable,
+						"aiproxy's privacy model is not available. Run \"aiproxy privacy install\", or disable privacy.ner in config."
+				}
+				writeError(w, status, "api_error", msg)
+				return
+			default:
+				o.Log.Warn("privacy filter failed; sending unfiltered", "err", err)
 			}
 		}
 

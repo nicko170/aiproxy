@@ -2,6 +2,7 @@ package privacy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -17,6 +18,12 @@ const (
 	// Open sends the request unfiltered and records that it did.
 	Open
 )
+
+// ErrModelUnavailable reports that the NER model is not installed or failed to
+// load, as distinct from a scan that went wrong. The control path maps it to 503
+// and names the fix, because "install the model" and "this is a bug" are
+// different instructions and a single 500 gives the operator neither.
+var ErrModelUnavailable = errors.New("privacy: NER model unavailable")
 
 func ParseFailureMode(s string) (FailureMode, error) {
 	switch s {

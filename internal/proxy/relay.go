@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
@@ -42,6 +44,12 @@ type RelayOptions struct {
 	// Streaming is false, Relay retains up to maxUsageCapture bytes and parses
 	// once the body ends.
 	ParseBody func(body []byte) (*provider.UsageDelta, bool)
+	// Restore rewrites the response stream, substituting plaintext back for the
+	// placeholders the request carried. Nil — the default, and the only value
+	// when the privacy filter is disabled — leaves the write path below exactly
+	// as it was: chunks go straight to the client with no accumulation, which is
+	// what keeps the filter free when it is off.
+	Restore *privacy.Restorer
 }
 
 type readChunk struct {
@@ -98,6 +106,7 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 	var written int64
 	var pending []byte  // incomplete trailing SSE event
 	var captured []byte // non-streaming body retained for usage parsing
+	var events []byte   // held for the restoring path; see restoreChunk
 	idle := time.NewTimer(opts.BodyIdle)
 	defer idle.Stop()
 
@@ -115,6 +124,18 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 			}
 			if c.err != nil {
 				if errors.Is(c.err, io.EOF) {
+					if tail, ferr := flushRestore(&events, opts); ferr != nil {
+						return written, ferr
+					} else if len(tail) > 0 {
+						n, werr := w.Write(tail)
+						written += int64(n)
+						if flusher != nil {
+							flusher.Flush()
+						}
+						if werr != nil {
+							return written, werr
+						}
+					}
 					flushRemainingUsage(pending, opts)
 					flushCapturedBody(captured, opts)
 					return written, nil
@@ -122,7 +143,11 @@ func Relay(ctx context.Context, w http.ResponseWriter, body io.Reader, opts Rela
 				return written, c.err
 			}
 
-			n, err := w.Write(c.buf)
+			out, err := restoreChunk(&events, c.buf, opts)
+			if err != nil {
+				return written, err
+			}
+			n, err := w.Write(out)
 			written += int64(n)
 			if err != nil {
 				return written, err
@@ -189,4 +214,67 @@ func flushCapturedBody(captured []byte, opts RelayOptions) {
 	if d, ok := opts.ParseBody(captured); ok && opts.OnUsage != nil {
 		opts.OnUsage(d)
 	}
+}
+
+// maxRestoreBuffer bounds what the restoring path may hold. Streaming holds at
+// most one SSE event, which is small; a non-streaming body is held whole, and
+// this is the ceiling on that. A message response is orders of magnitude
+// smaller, so the cap exists to keep a pathological body from being held in
+// memory without limit rather than as a routine constraint.
+const maxRestoreBuffer = 32 << 20
+
+// restoreChunk transforms one chunk on its way to the client.
+//
+// With no restorer it returns buf unchanged and touches nothing — that branch is
+// the pre-filter behaviour, byte for byte.
+//
+// Streaming: complete SSE events are extracted and rewritten; an incomplete
+// trailing event is held in *events until its terminator arrives. That is one
+// event of added buffering, unavoidable because a JSON event cannot be rewritten
+// before it is whole, and bounded by the size of one event.
+//
+// Non-streaming: the whole body is accumulated and rewritten once at EOF, since
+// a response the client parses as one document has nothing to gain from
+// arriving in pieces.
+func restoreChunk(events *[]byte, buf []byte, opts RelayOptions) ([]byte, error) {
+	if opts.Restore == nil {
+		return buf, nil
+	}
+	if len(*events)+len(buf) > maxRestoreBuffer {
+		return nil, fmt.Errorf("proxy: response exceeds the %d-byte restore buffer", int64(maxRestoreBuffer))
+	}
+	*events = append(*events, buf...)
+	if !opts.Streaming {
+		return nil, nil // held until EOF
+	}
+	var out []byte
+	for {
+		i := bytes.Index(*events, sseTerminator)
+		if i < 0 {
+			return out, nil
+		}
+		event := (*events)[:i+len(sseTerminator)]
+		*events = (*events)[i+len(sseTerminator):]
+		rewritten, err := opts.Restore.Event(event)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rewritten...)
+	}
+}
+
+// flushRestore emits whatever the restoring path still holds at EOF: a trailing
+// partial SSE event, or the whole non-streaming body.
+func flushRestore(events *[]byte, opts RelayOptions) ([]byte, error) {
+	if opts.Restore == nil || len(*events) == 0 {
+		return nil, nil
+	}
+	held := *events
+	*events = nil
+	if !opts.Streaming {
+		return opts.Restore.Body(held)
+	}
+	// A stream that ended without a final terminator: rewrite what arrived
+	// rather than dropping it.
+	return opts.Restore.Event(held)
 }

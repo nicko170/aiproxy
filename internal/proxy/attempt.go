@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
@@ -108,6 +109,10 @@ type Request struct {
 	Body      []byte
 	Model     string
 	SessionID string
+	// Restore carries the placeholders this request's body was redacted with, so
+	// the relay can undo them in the response. Nil when the privacy filter is
+	// disabled, which leaves the relay's write path untouched.
+	Restore *privacy.Table
 }
 
 // Result is what happened, for logging and accounting.
@@ -144,6 +149,13 @@ type Attempter struct {
 	rt        http.RoundTripper
 	cfg       RetryConfig
 	log       *slog.Logger
+
+	// privacy builds the per-request restorer that undoes redaction in the
+	// response. Set by proxyHandler from HandlerOptions.Privacy, alongside
+	// OnResult below, rather than threaded through NewAttempter: the handler
+	// owns the filter's lifecycle and the attempter only ever needs to build a
+	// restorer from a table the request already carries.
+	privacy *privacy.Filter
 
 	// OnResult, when set, receives every completed attempt — including one that
 	// ends in panic(http.ErrAbortHandler) on a truncated relay. It is invoked
@@ -433,7 +445,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 
 		res.Status = upstreamRes.StatusCode
 		res.TTFBMS = time.Since(started).Milliseconds()
-		a.relay(ctx, w, upstreamRes, prov, &res)
+		a.relay(ctx, w, upstreamRes, prov, req, &res)
 		return res
 	}
 }
@@ -569,7 +581,7 @@ func (a *Attempter) send(ctx context.Context, prov provider.Provider, acct accou
 	return a.rt.RoundTrip(out)
 }
 
-func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRes *http.Response, prov provider.Provider, res *Result) {
+func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRes *http.Response, prov provider.Provider, req Request, res *Result) {
 	defer upstreamRes.Body.Close()
 
 	for k, vs := range upstreamRes.Header {
@@ -588,7 +600,7 @@ func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRe
 	// Carried onto the result so accounting records what the upstream actually
 	// did, rather than re-deriving it from the byte count downstream.
 	res.Stream = streaming
-	n, err := Relay(ctx, w, upstreamRes.Body, RelayOptions{
+	ropts := RelayOptions{
 		BodyIdle:   a.cfg.BodyIdle,
 		Streaming:  streaming,
 		ParseUsage: prov.ParseUsage,
@@ -599,7 +611,11 @@ func (a *Attempter) relay(ctx context.Context, w http.ResponseWriter, upstreamRe
 			}
 			acc.Observe(d)
 		},
-	})
+	}
+	if req.Restore != nil && a.privacy != nil {
+		ropts.Restore = a.privacy.Restorer(req.Restore)
+	}
+	n, err := Relay(ctx, w, upstreamRes.Body, ropts)
 	res.Bytes = n
 	totals := acc.Totals()
 	res.InputTokens = totals.InputTokens
