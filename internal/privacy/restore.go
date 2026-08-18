@@ -178,17 +178,19 @@ func (r *Restorer) block(idx int, deltaType, field string) *blockState {
 	if st, ok := r.blocks[idx]; ok {
 		return st
 	}
-	st := &blockState{
-		rw:        newRewriter(r.table, r.mode, r.onUnresolved),
-		deltaType: deltaType,
-		field:     field,
+	st := &blockState{deltaType: deltaType, field: field}
+	if deltaType == "input_json_delta" {
+		st.rw = newJSONRewriter(r.table, r.mode, r.onUnresolved)
+	} else {
+		st.rw = newRewriter(r.table, r.mode, r.onUnresolved)
 	}
 	r.blocks[idx] = st
 	return st
 }
 
-// rewrite is the hook Task 11 overrides for input_json_delta, which needs a
-// second level of escaping. Every other delta type is plain text.
+// rewrite feeds text through this block's rewriter. The escaping difference
+// between a text stream and a JSON-fragment stream is carried by the rewriter
+// chosen in block(), so there is exactly one place that decision is made.
 func (st *blockState) rewrite(text string) (string, error) {
 	return st.rw.Write(text)
 }

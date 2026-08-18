@@ -48,10 +48,22 @@ type rewriter struct {
 	mode         UnresolvedMode
 	onUnresolved func(string)
 	pending      []byte
+	// escape transforms a restored value before it is emitted. Identity for
+	// plain text; jsonInner for input_json_delta, whose fragments sit inside a
+	// JSON string literal of the tool-input document being assembled.
+	escape func(string) string
 }
 
 func newRewriter(table *Table, mode UnresolvedMode, onUnresolved func(string)) *rewriter {
 	return &rewriter{table: table, mode: mode, onUnresolved: onUnresolved}
+}
+
+// newJSONRewriter is newRewriter for a stream whose text is JSON string content
+// one level down — input_json_delta. See restore_json.go.
+func newJSONRewriter(table *Table, mode UnresolvedMode, onUnresolved func(string)) *rewriter {
+	w := newRewriter(table, mode, onUnresolved)
+	w.escape = jsonInner
+	return w
 }
 
 // Pending is the number of bytes currently withheld. Tests assert this is zero
@@ -77,6 +89,9 @@ func (w *rewriter) Write(s string) (string, error) {
 		// another placeholder therefore cannot cause a second substitution.
 		buf = buf[end:]
 		if value, found := w.table.Lookup(placeholder); found {
+			if w.escape != nil {
+				value = w.escape(value)
+			}
 			out.WriteString(value)
 			continue
 		}
