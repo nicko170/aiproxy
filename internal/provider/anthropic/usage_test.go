@@ -110,6 +110,12 @@ func TestQuotaReportsThrottling(t *testing.T) {
 	if !errors.Is(err, ErrQuotaThrottled) {
 		t.Fatalf("err = %v, want ErrQuotaThrottled", err)
 	}
+	// The prober (internal/prober) backs off on throttling without knowing
+	// which concrete provider it is talking to, so the sentinel it checks
+	// must live on the provider-agnostic seam, not only in this package.
+	if !errors.Is(err, provider.ErrQuotaThrottled) {
+		t.Fatalf("err = %v, want it to also satisfy provider.ErrQuotaThrottled", err)
+	}
 }
 
 // A display name with no identifiable model token must fail closed: it must

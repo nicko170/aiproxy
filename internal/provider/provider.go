@@ -14,6 +14,16 @@ import (
 // implement, such as Quota for an endpoint with no usage API.
 var ErrUnsupported = errors.New("unsupported by this provider")
 
+// ErrQuotaThrottled reports that a provider's zero-spend usage/quota endpoint
+// rate-limited us — distinct from a plain failure to read, and distinct from
+// ErrCredentialRejected: the credential is fine, but polling this endpoint
+// too hard gets it throttled in its own right (spec §6.2). It lives here,
+// not only on the concrete provider that first needed it, because
+// internal/prober backs off on it without importing any concrete provider;
+// a provider's own sentinel (e.g. anthropic.ErrQuotaThrottled) wraps this one
+// so callers can check either.
+var ErrQuotaThrottled = errors.New("usage endpoint throttled")
+
 // ErrCredentialRejected reports that the upstream REFUSED a credential, as
 // opposed to the proxy having failed to reach the upstream at all. Providers
 // wrap it around their own rejection errors.

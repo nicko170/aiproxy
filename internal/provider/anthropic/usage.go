@@ -3,7 +3,6 @@ package anthropic
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +16,12 @@ import (
 // ErrQuotaThrottled reports that the zero-spend usage endpoint rate-limited us.
 // It is distinct from a failure to read: the caller must back off rather than
 // retry, and must not treat previously observed quota as fresh.
-var ErrQuotaThrottled = errors.New("usage endpoint throttled")
+//
+// It wraps provider.ErrQuotaThrottled so internal/prober can back off on the
+// generic seam-level sentinel without importing this concrete provider (spec
+// aims the seam at "additional providers" later); errors.Is(err,
+// ErrQuotaThrottled) still works exactly as before for existing callers.
+var ErrQuotaThrottled = fmt.Errorf("%w: usage endpoint throttled", provider.ErrQuotaThrottled)
 
 const usageBeta = "oauth-2025-04-20"
 
