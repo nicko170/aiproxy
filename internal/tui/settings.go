@@ -137,6 +137,35 @@ func settingFields() []settingField {
 			get:  func(s view.Settings) string { return strconv.Itoa(s.UpdateCheckIntervalHours) },
 			set:  func(s *view.Settings, v string) error { return setInt(&s.UpdateCheckIntervalHours)(s, v) },
 		},
+		{
+			name: "privacyEnabled", boolean: true,
+			desc: "redact credentials and internal identifiers from request bodies before they leave this machine",
+			get: func(s view.Settings) string {
+				if s.PrivacyEnabled {
+					return "on"
+				}
+				return "off"
+			},
+			set: func(s *view.Settings, v string) error {
+				s.PrivacyEnabled = v == "on"
+				return nil
+			},
+		},
+		{
+			name: "privacyDenylist",
+			desc: "extra internal hostnames or identifiers to redact, comma-separated",
+			get:  func(s view.Settings) string { return strings.Join(s.PrivacyDenylist, ", ") },
+			set: func(s *view.Settings, v string) error {
+				var out []string
+				for _, p := range strings.Split(v, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						out = append(out, p)
+					}
+				}
+				s.PrivacyDenylist = out
+				return nil
+			},
+		},
 	}
 }
 

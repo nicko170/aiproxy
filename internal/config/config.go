@@ -87,6 +87,42 @@ type Update struct {
 	CheckIntervalHours int  `json:"checkIntervalHours"`
 }
 
+// PrivacyRules toggles the deterministic detectors. Both default on, because
+// they are the reason to enable the filter at all.
+type PrivacyRules struct {
+	BuiltinSecrets bool `json:"builtinSecrets"`
+	Entropy        bool `json:"entropy"`
+}
+
+// PrivacyNER configures the local NER model.
+//
+// Labels is empty by default and every entry is opt-in. private_url and
+// private_date in particular would be destructive in source code, where import
+// URLs, API endpoints, doc links, changelog dates, and licence years are
+// everywhere — redacting them corrupts the agent's context for almost no privacy
+// gain.
+type PrivacyNER struct {
+	Enabled      bool     `json:"enabled"`
+	Labels       []string `json:"labels"`
+	MaxScanBytes int      `json:"maxScanBytes"`
+}
+
+// Privacy configures the local privacy filter.
+//
+// Enabled defaults to FALSE. The filter rewrites request bodies, and that is not
+// a behaviour to acquire silently on upgrade — but once it is on, the
+// deterministic rules come with it.
+type Privacy struct {
+	Enabled                 bool         `json:"enabled"`
+	OnScanFailure           string       `json:"onScanFailure"`
+	OnUnresolvedPlaceholder string       `json:"onUnresolvedPlaceholder"`
+	Rules                   PrivacyRules `json:"rules"`
+	Denylist                []string     `json:"denylist"`
+	AllowlistExtra          []string     `json:"allowlistExtra"`
+	CacheEntries            int          `json:"cacheEntries"`
+	NER                     PrivacyNER   `json:"ner"`
+}
+
 type Config struct {
 	Listen     Listen     `json:"listen"`
 	Accounts   []Account  `json:"accounts"`
@@ -96,6 +132,7 @@ type Config struct {
 	Metrics    Metrics    `json:"metrics"`
 	MITM       MITM       `json:"mitm"`
 	Update     Update     `json:"update"`
+	Privacy    Privacy    `json:"privacy"`
 }
 
 // Default returns the configuration for a fresh install.
@@ -114,6 +151,16 @@ func Default() Config {
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},
 		Update:     Update{CheckEnabled: true, CheckIntervalHours: 24},
+		Privacy: Privacy{
+			Enabled:                 false,
+			OnScanFailure:           "closed",
+			OnUnresolvedPlaceholder: "passthrough",
+			Rules:                   PrivacyRules{BuiltinSecrets: true, Entropy: true},
+			Denylist:                []string{},
+			AllowlistExtra:          []string{},
+			CacheEntries:            50000,
+			NER:                     PrivacyNER{Enabled: false, Labels: []string{}, MaxScanBytes: 262144},
+		},
 	}
 }
 

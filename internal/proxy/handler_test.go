@@ -193,7 +193,7 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 	// TestRouterStatusReportsMetricsDropped) is reflected in what ServerStatus
 	// reports; view.Local captures the func at construction.
 	pb := prober.New(mgr, providers, time.Hour)
-	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped, pb, nil)
+	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped, pb, nil, nil)
 	h.view = vl
 	ho.View = vl
 

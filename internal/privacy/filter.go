@@ -51,6 +51,12 @@ type Options struct {
 	// filter reports it rather than acting on it, because only the caller can
 	// write an HTTP response.
 	OnScanFailure FailureMode
+	// ModelState reports the NER model's readiness, e.g. "loading" or "ready".
+	// Nil until a model is wired in (Task 18), in which case Filter.ModelState
+	// reports "off" — a filter running deterministic rules only is fully
+	// functional, and reporting "absent" would imply something is missing
+	// that is not.
+	ModelState func() string
 }
 
 // Filter is the one type internal/proxy needs. Everything else in this package
@@ -65,6 +71,7 @@ type Filter struct {
 	unresolved    UnresolvedMode
 	onScanFailure FailureMode
 	stats         *stats
+	modelState    func() string
 }
 
 func New(o Options) *Filter {
@@ -73,6 +80,7 @@ func New(o Options) *Filter {
 		unresolved:    o.Unresolved,
 		onScanFailure: o.OnScanFailure,
 		stats:         newStats(),
+		modelState:    o.ModelState,
 	}
 	cache := o.Cache
 	if cache != nil {
@@ -111,6 +119,16 @@ func (f *Filter) Restorer(t *Table) *Restorer {
 
 // Snapshot is the counters view.Status reports.
 func (f *Filter) Snapshot() Snapshot { return f.stats.snapshot() }
+
+// ModelState describes the NER model's readiness. Until a model is configured it
+// is "off" — a filter running deterministic rules only is fully functional, and
+// reporting "absent" would imply something is missing that is not.
+func (f *Filter) ModelState() string {
+	if f.modelState == nil {
+		return "off"
+	}
+	return f.modelState()
+}
 
 // countingCache records hit rate around any findingsCache.
 type countingCache struct {

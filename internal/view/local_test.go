@@ -92,7 +92,7 @@ func newHarnessWithProviders(t *testing.T, now func() time.Time, providers map[s
 	if now != nil {
 		opts = append(opts, withClock(now))
 	}
-	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, pb, nil, opts...)
+	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, pb, nil, nil, opts...)
 	return &testHarness{t: t, local: local, mgr: mgr, ms: ms, cs: cs, ing: ing, probe: pb, dropped: dropped}
 }
 
@@ -595,6 +595,10 @@ func TestUpdateSettingsReportsAppliedLiveAndNeedsRestartFields(t *testing.T) {
 		MetricsRetentionDays:      def.Metrics.RetentionDays,
 		UpdateCheckEnabled:        def.Update.CheckEnabled,
 		UpdateCheckIntervalHours:  def.Update.CheckIntervalHours,
+		PrivacyEnabled:            def.Privacy.Enabled,
+		PrivacyOnScanFailure:      def.Privacy.OnScanFailure,
+		PrivacyOnUnresolved:       def.Privacy.OnUnresolvedPlaceholder,
+		PrivacyDenylist:           def.Privacy.Denylist,
 	}
 	applied, err := h.local.UpdateSettings(context.Background(), s)
 	if err != nil {
@@ -629,6 +633,11 @@ func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
 		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
 		BlockedModels: []string{"*fable*", "*mythos*"}, QuotaProbeIntervalSeconds: 200,
 		MetricsRetentionDays: 45, UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
+		// The two privacy failure modes cannot round-trip as "": config.loadLocked
+		// treats an empty value as unset and fills in the documented default on
+		// every load, so a Settings read back after a write always carries the
+		// non-empty string even when this literal sent none.
+		PrivacyOnScanFailure: "closed", PrivacyOnUnresolved: "passthrough",
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
@@ -1229,5 +1238,58 @@ func TestUpdateSettingsAppliesCheckEnabledLive(t *testing.T) {
 	}
 	if st.Update.Available {
 		t.Error("a disabled check must stop offering an update")
+	}
+}
+
+func TestStatusReportsPrivacyDisabledWithoutAFilter(t *testing.T) {
+	local := newHarness(t).local
+	st, err := local.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Privacy.Enabled {
+		t.Error("Privacy.Enabled should be false with no filter attached")
+	}
+	if st.Privacy.ModelState != "off" {
+		t.Errorf("ModelState = %q, want off", st.Privacy.ModelState)
+	}
+}
+
+func TestPrivacySettingsRoundTrip(t *testing.T) {
+	local := newHarness(t).local
+	s, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.PrivacyEnabled {
+		t.Fatal("default should be disabled")
+	}
+	s.PrivacyEnabled = true
+	s.PrivacyDenylist = []string{"acme-prod.internal"}
+	applied, err := local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(applied.NeedsRestart, "privacyEnabled") {
+		t.Errorf("NeedsRestart = %v, want privacyEnabled", applied.NeedsRestart)
+	}
+	back, err := local.Settings(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.PrivacyEnabled || len(back.PrivacyDenylist) != 1 {
+		t.Errorf("settings did not persist: %+v", back)
+	}
+}
+
+func TestValidateRejectsAnUnknownFailureMode(t *testing.T) {
+	s := Settings{
+		SwitchThreshold: 0.9, RetryBudgetMS: 1000, HeaderTimeoutMS: 1000, BodyIdleMS: 1000,
+		QuotaProbeIntervalSeconds: 300, MetricsRetentionDays: 90,
+		UpdateCheckEnabled: true, UpdateCheckIntervalHours: 24,
+		PrivacyOnScanFailure: "maybe", PrivacyOnUnresolved: "passthrough",
+	}
+	if err := s.Validate(); err == nil {
+		t.Fatal("Validate accepted an unknown scan-failure mode")
 	}
 }

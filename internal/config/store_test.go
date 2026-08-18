@@ -204,3 +204,49 @@ func TestNonPositiveUpdateIntervalFallsBackToTheDefault(t *testing.T) {
 		t.Errorf("CheckIntervalHours = %d, want 24", cfg.Update.CheckIntervalHours)
 	}
 }
+
+func TestPrivacyDefaultsAreOffAndSafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Privacy.Enabled {
+		t.Error("the privacy filter must be off by default; it rewrites request bodies")
+	}
+	if cfg.Privacy.OnScanFailure != "closed" {
+		t.Errorf("OnScanFailure = %q, want closed", cfg.Privacy.OnScanFailure)
+	}
+	if cfg.Privacy.OnUnresolvedPlaceholder != "passthrough" {
+		t.Errorf("OnUnresolvedPlaceholder = %q, want passthrough", cfg.Privacy.OnUnresolvedPlaceholder)
+	}
+	if !cfg.Privacy.Rules.BuiltinSecrets || !cfg.Privacy.Rules.Entropy {
+		t.Error("enabling the filter should bring the deterministic rules with it")
+	}
+	if cfg.Privacy.NER.Enabled {
+		t.Error("the model must be off by default")
+	}
+	if len(cfg.Privacy.NER.Labels) != 0 {
+		t.Errorf("NER labels = %v, want none by default", cfg.Privacy.NER.Labels)
+	}
+	if cfg.Privacy.CacheEntries != 50000 {
+		t.Errorf("CacheEntries = %d, want 50000", cfg.Privacy.CacheEntries)
+	}
+	if cfg.Privacy.NER.MaxScanBytes != 262144 {
+		t.Errorf("MaxScanBytes = %d, want 262144", cfg.Privacy.NER.MaxScanBytes)
+	}
+}
+
+func TestPrivacyNonPositiveBoundsFallBackToDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"privacy":{"cacheEntries":0,"ner":{"maxScanBytes":-1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Privacy.CacheEntries <= 0 || cfg.Privacy.NER.MaxScanBytes <= 0 {
+		t.Errorf("bounds were not corrected on load: %+v", cfg.Privacy)
+	}
+}

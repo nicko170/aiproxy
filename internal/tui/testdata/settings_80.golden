@@ -15,8 +15,8 @@
     metricsRetentionDays        90 d                  saved · restart to apply
     updateCheckEnabled          on                    
     updateCheckIntervalHours    24 h                  
-
-
+    privacyEnabled              off                   
+    privacyDenylist             acme-prod.internal    
 
 
 

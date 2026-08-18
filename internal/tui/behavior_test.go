@@ -451,3 +451,27 @@ func TestUpdateHeaderDegradesWithoutBecomingAmbiguous(t *testing.T) {
 		}
 	}
 }
+
+func TestHeaderShowsRedactionCount(t *testing.T) {
+	m := fixtureModel(120, 28)
+	if strings.Contains(m.viewHeader(), "redacted") {
+		t.Fatal("header mentions redactions with the filter off")
+	}
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions: map[string]int64{"SECRET": 9, "EMAIL": 3},
+	}
+	if got := m.viewHeader(); !strings.Contains(got, "12 redacted") {
+		t.Errorf("header = %q, want a total of 12 redacted", got)
+	}
+}
+
+// Unresolved placeholders are the one privacy condition that means the agent
+// received something wrong, so they must read as a warning rather than a count.
+func TestHeaderWarnsOnUnresolvedPlaceholders(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{Enabled: true, ModelState: "ready", Unresolved: 2}
+	if got := m.viewHeader(); !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want it to surface unresolved placeholders", got)
+	}
+}

@@ -3,6 +3,8 @@ package view
 import (
 	"fmt"
 	"path"
+
+	"github.com/nicko170/aiproxy/internal/privacy"
 )
 
 // Validate rejects a negative or absurd value before UpdateSettings persists
@@ -37,6 +39,21 @@ func (s Settings) Validate() error {
 		if _, err := path.Match(pattern, ""); err != nil {
 			return fmt.Errorf("blockedModels pattern %q is not a valid glob: %w", pattern, err)
 		}
+	}
+	// Empty is accepted here as the documented default (closed /
+	// passthrough): config.loadLocked fills in a non-empty value on any real
+	// read-modify-write, so only a from-scratch Settings literal (as several
+	// in this package's own tests build) ever reaches Validate with "" — and
+	// that must not be rejected as if it were a typo of an unknown mode.
+	if s.PrivacyOnScanFailure != "" {
+		if _, err := privacy.ParseFailureMode(s.PrivacyOnScanFailure); err != nil {
+			return err
+		}
+	}
+	switch s.PrivacyOnUnresolved {
+	case "", "passthrough", "error":
+	default:
+		return fmt.Errorf("privacyOnUnresolved must be \"passthrough\" or \"error\", got %q", s.PrivacyOnUnresolved)
 	}
 	return nil
 }

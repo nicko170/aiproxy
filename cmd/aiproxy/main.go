@@ -18,6 +18,8 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/privacy"
+	"github.com/nicko170/aiproxy/internal/privacy/rules"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
@@ -202,6 +204,67 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 }
 
+// buildPrivacy assembles the privacy filter from config, or returns nil when it
+// is disabled — which is the default. Detector ORDER is significant: it is the
+// tiebreak privacy.Resolve uses for identical spans, so the deterministic rules
+// are registered before the model.
+func buildPrivacy(cfg config.Config) (*privacy.Filter, error) {
+	if !cfg.Privacy.Enabled {
+		return nil, nil
+	}
+	key, err := privacy.LoadOrCreateKey(privacy.KeyPath())
+	if err != nil {
+		return nil, err
+	}
+	scanFail, err := privacy.ParseFailureMode(cfg.Privacy.OnScanFailure)
+	if err != nil {
+		return nil, err
+	}
+	unresolved := privacy.Passthrough
+	if cfg.Privacy.OnUnresolvedPlaceholder == "error" {
+		unresolved = privacy.ErrorOut
+	}
+
+	// modelState reports the NER model's readiness once one is wired in
+	// (Task 18 assigns it from the NER detector); nil until then, which
+	// Filter.ModelState reports as "off".
+	var modelState func() string
+
+	var dets []privacy.Detector
+	if cfg.Privacy.Rules.BuiltinSecrets {
+		rd, err := rules.New(rules.Builtin(), cfg.Privacy.AllowlistExtra)
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, rd)
+	}
+	if len(cfg.Privacy.Denylist) > 0 {
+		dl, err := rules.NewDenylist(cfg.Privacy.Denylist)
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, dl)
+	}
+
+	// The salt carries everything that changes what a scan MEANS, so a toggle or
+	// a denylist edit invalidates the cache without any expiry logic.
+	salt := privacy.Salt(
+		"rules=v1",
+		fmt.Sprintf("builtin=%t", cfg.Privacy.Rules.BuiltinSecrets),
+		fmt.Sprintf("entropy=%t", cfg.Privacy.Rules.Entropy),
+		fmt.Sprintf("deny=%d", len(cfg.Privacy.Denylist)),
+		strings.Join(cfg.Privacy.NER.Labels, ","),
+	)
+	return privacy.New(privacy.Options{
+		Detectors:     dets,
+		Cache:         privacy.NewCache(cfg.Privacy.CacheEntries, salt),
+		Key:           key,
+		Unresolved:    unresolved,
+		OnScanFailure: scanFail,
+		ModelState:    modelState,
+	}), nil
+}
+
 // buildHandler wires config into a serving handler. Kept separate from run so
 // tests exercise the real composition without binding a port. The returned
 // *prober.Prober and *updater.Checker are separate from the handler because
@@ -291,11 +354,22 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			HeaderTimeout:   headerTimeout,
 		}, log)
 
+	pf, err := buildPrivacy(cfg)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("privacy filter: %w", err)
+	}
+	if pf != nil {
+		log.Info("privacy filter active",
+			"onScanFailure", cfg.Privacy.OnScanFailure,
+			"denylist", len(cfg.Privacy.Denylist),
+			"nerLabels", len(cfg.Privacy.NER.Labels))
+	}
+
 	// view.Local is the presentation seam (spec §3.1): the control API below
 	// reads through it rather than computing anything of its own, which is
 	// what lets a future view.HTTP (a detached daemon) replace it without
 	// internal/proxy's routes changing at all.
-	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd)
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd, pf)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
@@ -309,6 +383,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		PassthroughPrefixes: proxy.DefaultPassthroughPrefixes,
 		Dropped:             ing.Dropped,
 		View:                vl,
+		Privacy:             pf,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,

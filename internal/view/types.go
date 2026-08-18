@@ -32,6 +32,27 @@ type Status struct {
 	// it for free, with no second poll cycle and no new route — and the check's
 	// own cadence is decoupled from that poll entirely.
 	Update UpdateStatus `json:"update"`
+	// Privacy reports the local privacy filter, following the same precedent as
+	// Probe and Update: a fact about the running instance, rendered by the poll
+	// the TUI already makes.
+	Privacy PrivacyStatus `json:"privacy"`
+}
+
+// PrivacyStatus is the privacy filter's state and counters.
+type PrivacyStatus struct {
+	Enabled bool `json:"enabled"`
+	// ModelState is off, absent, downloading, loading, ready, or error.
+	ModelState    string `json:"modelState"`
+	DownloadedPct int    `json:"downloadedPct,omitempty"`
+	// Redactions counts distinct values replaced, per label, this session.
+	Redactions map[string]int64 `json:"redactions"`
+	// CacheHitRate is 0..1. A collapsed rate is the first symptom of a cache-key
+	// bug, which otherwise shows up only as unexplained latency.
+	CacheHitRate float64 `json:"cacheHitRate"`
+	// Unresolved counts placeholders that reached a client unresolved. It is the
+	// one counter here that means something went wrong rather than right.
+	Unresolved int64  `json:"unresolved"`
+	LastError  string `json:"lastError,omitempty"`
 }
 
 // UpdateStatus is what the running instance knows about newer releases.
@@ -209,6 +230,13 @@ type Settings struct {
 	// checker's ticker is built once at startup.
 	UpdateCheckEnabled       bool `json:"updateCheckEnabled"`
 	UpdateCheckIntervalHours int  `json:"updateCheckIntervalHours"`
+	// PrivacyEnabled and the two failure modes configure the local privacy
+	// filter. Enabled is restart-gated: the detector set, the cache salt, and the
+	// model session are all built once at startup.
+	PrivacyEnabled       bool     `json:"privacyEnabled"`
+	PrivacyOnScanFailure string   `json:"privacyOnScanFailure"`
+	PrivacyOnUnresolved  string   `json:"privacyOnUnresolved"`
+	PrivacyDenylist      []string `json:"privacyDenylist"`
 }
 
 // Applied reports which fields an UpdateSettings call actually put into

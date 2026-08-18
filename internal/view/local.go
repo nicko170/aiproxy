@@ -10,6 +10,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/updater"
@@ -32,6 +33,7 @@ type Local struct {
 	config  *config.Store
 	probe   *prober.Prober
 	updates *updater.Checker
+	privacy *privacy.Filter
 
 	listenAddr string
 	started    time.Time
@@ -90,7 +92,11 @@ func withClock(now func() time.Time) option {
 // ApplyUpdate installs through; it may be nil (a Local built without one
 // reports update checking as disabled rather than panicking, matching how pb
 // is handled).
-func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, pb *prober.Prober, upd *updater.Checker, opts ...option) *Local {
+//
+// pf is the local privacy filter ServerStatus reports on; it may be nil,
+// which is the default (privacy.enabled: false) — ServerStatus then reports
+// PrivacyStatus.ModelState as "off" rather than an empty "enabled" state.
+func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, pb *prober.Prober, upd *updater.Checker, pf *privacy.Filter, opts ...option) *Local {
 	if dropped == nil {
 		dropped = func() int64 { return 0 }
 	}
@@ -101,6 +107,7 @@ func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenA
 		config:     cs,
 		probe:      pb,
 		updates:    upd,
+		privacy:    pf,
 		listenAddr: listenAddr,
 		started:    now(),
 		dropped:    dropped,
@@ -142,7 +149,29 @@ func (l *Local) ServerStatus(ctx context.Context) (Status, error) {
 		EventsDropped:  l.hub.droppedCount(),
 		Probe:          l.probeStatus(),
 		Update:         l.updateStatus(),
+		Privacy:        l.privacyStatus(),
 	}, nil
+}
+
+// privacyStatus converts the filter's counters into the view shape. Like
+// probeStatus and updateStatus it performs no I/O — Snapshot reads counters
+// behind a mutex — so a status poll costs the same whether the filter is busy or
+// idle. A nil filter reports "off" rather than an empty "enabled" state.
+func (l *Local) privacyStatus() PrivacyStatus {
+	if l.privacy == nil {
+		return PrivacyStatus{ModelState: "off", Redactions: map[string]int64{}}
+	}
+	snap := l.privacy.Snapshot()
+	out := PrivacyStatus{
+		Enabled:    true,
+		ModelState: l.privacy.ModelState(),
+		Redactions: snap.Redactions,
+		Unresolved: snap.Unresolved,
+	}
+	if total := snap.CacheHits + snap.CacheMisses; total > 0 {
+		out.CacheHitRate = float64(snap.CacheHits) / float64(total)
+	}
+	return out
 }
 
 // updateStatus converts the checker's cached state into the view-level shape
@@ -398,6 +427,10 @@ func settingsFromConfig(c config.Config) Settings {
 		MetricsRetentionDays:      c.Metrics.RetentionDays,
 		UpdateCheckEnabled:        c.Update.CheckEnabled,
 		UpdateCheckIntervalHours:  c.Update.CheckIntervalHours,
+		PrivacyEnabled:            c.Privacy.Enabled,
+		PrivacyOnScanFailure:      c.Privacy.OnScanFailure,
+		PrivacyOnUnresolved:       c.Privacy.OnUnresolvedPlaceholder,
+		PrivacyDenylist:           c.Privacy.Denylist,
 	}
 }
 
@@ -414,6 +447,7 @@ var (
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
 		"updateCheckIntervalHours",
+		"privacyEnabled", "privacyOnScanFailure", "privacyOnUnresolved", "privacyDenylist",
 	}
 )
 
@@ -447,6 +481,19 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 	if err := s.Validate(); err != nil {
 		return Applied{}, err
 	}
+	// Empty is the documented default for both privacy failure modes (see
+	// Settings.Validate's doc comment). Normalizing it here — rather than
+	// leaving it to config.loadLocked's own guard, which fires only on a
+	// later disk read — keeps diffSettings honest: a caller that omits these
+	// fields entirely (an older client, or a control-API body built without
+	// them) must not be reported as having changed a setting it never
+	// mentioned.
+	if s.PrivacyOnScanFailure == "" {
+		s.PrivacyOnScanFailure = config.Default().Privacy.OnScanFailure
+	}
+	if s.PrivacyOnUnresolved == "" {
+		s.PrivacyOnUnresolved = config.Default().Privacy.OnUnresolvedPlaceholder
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -467,6 +514,10 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		c.Metrics.RetentionDays = s.MetricsRetentionDays
 		c.Update.CheckEnabled = s.UpdateCheckEnabled
 		c.Update.CheckIntervalHours = s.UpdateCheckIntervalHours
+		c.Privacy.Enabled = s.PrivacyEnabled
+		c.Privacy.OnScanFailure = s.PrivacyOnScanFailure
+		c.Privacy.OnUnresolvedPlaceholder = s.PrivacyOnUnresolved
+		c.Privacy.Denylist = s.PrivacyDenylist
 		return nil
 	}); err != nil {
 		return Applied{}, err
@@ -500,6 +551,10 @@ func diffSettings(before, after Settings) Applied {
 		"metricsRetentionDays":      before.MetricsRetentionDays != after.MetricsRetentionDays,
 		"updateCheckEnabled":        before.UpdateCheckEnabled != after.UpdateCheckEnabled,
 		"updateCheckIntervalHours":  before.UpdateCheckIntervalHours != after.UpdateCheckIntervalHours,
+		"privacyEnabled":            before.PrivacyEnabled != after.PrivacyEnabled,
+		"privacyOnScanFailure":      before.PrivacyOnScanFailure != after.PrivacyOnScanFailure,
+		"privacyOnUnresolved":       before.PrivacyOnUnresolved != after.PrivacyOnUnresolved,
+		"privacyDenylist":           !stringSlicesEqual(before.PrivacyDenylist, after.PrivacyDenylist),
 	}
 	for _, name := range liveSettingsFields {
 		if changed[name] {
