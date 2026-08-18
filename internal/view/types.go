@@ -26,6 +26,47 @@ type Status struct {
 	// Probe reports the background quota prober's health (spec §6.2): a
 	// throttled probe must be visible in the UI, not silently stale.
 	Probe ProbeStatus `json:"probe"`
+	// Update reports whether a newer release exists, read from the background
+	// checker's cache. It is never a live network call: this rides on Status
+	// for the same reason Probe does — the TUI's existing status poll renders
+	// it for free, with no second poll cycle and no new route — and the check's
+	// own cadence is decoupled from that poll entirely.
+	Update UpdateStatus `json:"update"`
+}
+
+// UpdateStatus is what the running instance knows about newer releases.
+// Disabled and DevBuild are distinct states from "nothing available": a UI
+// that cannot tell them apart ends up saying "up to date" to someone whose
+// check is switched off.
+type UpdateStatus struct {
+	CurrentVersion string `json:"currentVersion"`
+	LatestVersion  string `json:"latestVersion,omitempty"`
+	Available      bool   `json:"available"`
+	ReleaseURL     string `json:"releaseUrl,omitempty"`
+	// CheckedAt is unix ms of the last completed check, 0 if none.
+	CheckedAt int64 `json:"checkedAt,omitempty"`
+	// CheckError is the last check's failure. It does not clear LatestVersion
+	// or Available: a transient network failure must not make an available
+	// update disappear from the UI.
+	CheckError string `json:"checkError,omitempty"`
+	Disabled   bool   `json:"disabled"`
+	DevBuild   bool   `json:"devBuild"`
+}
+
+// UpdateResult is what an ApplyUpdate call did.
+//
+// Updated is false, with a nil error, for the two nothing-to-do outcomes —
+// already on the latest release, and no releases published. Those are states,
+// not failures, and a UI must be able to render them without reading an error
+// string.
+type UpdateResult struct {
+	Updated         bool   `json:"updated"`
+	PreviousVersion string `json:"previousVersion,omitempty"`
+	Version         string `json:"version,omitempty"`
+	Path            string `json:"path,omitempty"`
+	// Message is what the TUI flashes and the CLI prints — the one place
+	// "restart to apply" is worded, so both say it identically.
+	Message string `json:"message"`
 }
 
 // AccountProbeStatus is one account's quota-probe health.

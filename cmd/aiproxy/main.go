@@ -269,7 +269,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// reads through it rather than computing anything of its own, which is
 	// what lets a future view.HTTP (a detached daemon) replace it without
 	// internal/proxy's routes changing at all.
-	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb)
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, nil)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,

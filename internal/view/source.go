@@ -95,4 +95,14 @@ type Source interface {
 	// internal/prober). A cycle already running — the background loop's or
 	// another ProbeNow's — is joined rather than duplicated.
 	ProbeNow(ctx context.Context) error
+
+	// ApplyUpdate downloads, verifies, and installs the latest release over
+	// the running binary, and reports what it did. It deliberately does not
+	// restart anything: the running process keeps its open inode and serves
+	// the old code until the operator quits it, so the caller shows
+	// UpdateResult.Message ("restart to apply") rather than acting on it.
+	//
+	// Availability is NOT read here — it rides on ServerStatus's Update field,
+	// off a background cache, so no UI ever blocks a frame on github.com.
+	ApplyUpdate(ctx context.Context) (UpdateResult, error)
 }
