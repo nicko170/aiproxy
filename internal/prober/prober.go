@@ -89,8 +89,10 @@ type Prober struct {
 
 	baseBackoff, maxBackoff time.Duration
 
-	stop    chan struct{}
-	stopped chan struct{}
+	stop      chan struct{}
+	stopped   chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
 
 	mu              sync.Mutex
 	running         bool
@@ -127,30 +129,59 @@ func New(mgr *account.Manager, providers map[string]provider.Provider, interval 
 // Start begins the background loop, if configured with a positive interval.
 // It always spawns its own goroutine (even when disabled) so Stop is always
 // safe to call afterward, mirroring metrics.Roller's Start/Stop convention.
+//
+// Guarded by startOnce: a duplicate Start call is a no-op rather than
+// spawning a second loop racing the first one's ticks against the same
+// account state. metrics.Roller has the identical double-call hazard but
+// documents the "call it once" contract instead of enforcing it (see its
+// Start doc comment for why); this package chose sync.Once so the failure
+// mode of a second call is silence, not a second competing goroutine.
 func (p *Prober) Start() {
-	go func() {
-		defer close(p.stopped)
-		if p.interval <= 0 {
-			<-p.stop
-			return
-		}
-		t := time.NewTicker(p.interval)
-		defer t.Stop()
-		for {
-			select {
-			case <-p.stop:
+	p.startOnce.Do(func() {
+		go func() {
+			defer close(p.stopped)
+			// stopCtx is cancelled the instant p.stop closes, and is what
+			// every cycle this loop runs is given instead of
+			// context.Background() — see runCycle/probeAll's ctx parameter
+			// and Stop's doc comment for why: without this, Stop had to wait
+			// for whatever Quota call happened to be in flight to finish on
+			// its own, which could stall process shutdown for however long
+			// that call takes (its own timeout is per-account, not
+			// per-cycle).
+			stopCtx, cancelStopCtx := context.WithCancel(context.Background())
+			defer cancelStopCtx()
+			go func() {
+				<-p.stop
+				cancelStopCtx()
+			}()
+
+			if p.interval <= 0 {
+				<-p.stop
 				return
-			case <-t.C:
-				p.runCycle(context.Background())
 			}
-		}
-	}()
+			t := time.NewTicker(p.interval)
+			defer t.Stop()
+			for {
+				select {
+				case <-p.stop:
+					return
+				case <-t.C:
+					p.runCycle(stopCtx)
+				}
+			}
+		}()
+	})
 }
 
 // Stop ends the background loop and waits for it to exit. Must be paired
 // with a prior Start, exactly like metrics.Roller.
+//
+// Guarded by stopOnce so a duplicate Stop call cannot panic by closing
+// p.stop twice; every call, duplicate or not, still blocks until the loop
+// has actually exited (reading from an already-closed p.stopped returns
+// immediately, so this is safe to call any number of times).
 func (p *Prober) Stop() {
-	close(p.stop)
+	p.stopOnce.Do(func() { close(p.stop) })
 	<-p.stopped
 }
 
@@ -222,7 +253,10 @@ func (p *Prober) runCycle(ctx context.Context) error {
 func (p *Prober) probeAll(ctx context.Context) []error {
 	now := p.now()
 	var errs []error
-	for _, a := range p.mgr.All() {
+	live := p.mgr.All()
+	current := make(map[string]bool, len(live))
+	for _, a := range live {
+		current[a.ID] = true
 		// API-key accounts have no usage endpoint at all (spec §4.4); skip
 		// them without even asking the provider, so this never logs a
 		// spurious error every cycle for an account that can never answer.
@@ -260,7 +294,24 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 		p.recordSuccess(a.ID, now)
 		p.mgr.UpdateQuota(a.ID, q.Buckets)
 	}
+	// An account removed from mgr between cycles otherwise stays in
+	// p.accounts (and so in Status().Accounts) forever — a ghost entry for
+	// something that no longer exists. Prune against the account set this
+	// cycle actually saw.
+	p.pruneAccounts(current)
 	return errs
+}
+
+// pruneAccounts drops every entry in p.accounts whose id is not in current,
+// so Status().Accounts never outlives the account it describes.
+func (p *Prober) pruneAccounts(current map[string]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for id := range p.accounts {
+		if !current[id] {
+			delete(p.accounts, id)
+		}
+	}
 }
 
 func (p *Prober) eligible(id string, now time.Time) bool {

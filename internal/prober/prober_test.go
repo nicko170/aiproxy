@@ -432,3 +432,83 @@ func TestStopImmediatelyAfterStartDoesNotHang(t *testing.T) {
 		t.Fatal("Start/Stop hung")
 	}
 }
+
+// I1: Stop must not wait for an in-flight cycle to run to completion on its
+// own. Before the fix, the background loop always called runCycle with
+// context.Background(), so a cycle blocked on a slow/hung Quota call (a real
+// failure mode: the control-plane client's own timeout is per-account, not
+// per-cycle) stalled Stop — and so process shutdown — for however long that
+// call happened to take. This blocks Quota deliberately and asserts Stop
+// still returns promptly.
+func TestStopReturnsPromptlyWhileACycleIsBlockedOnQuota(t *testing.T) {
+	block := make(chan struct{}) // deliberately never closed
+	started := make(chan struct{}, 1)
+	fp := &fakeProvider{results: []quotaResult{quotaOK()}, block: block, started: started}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, 10*time.Millisecond)
+
+	p.Start()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background loop never started its Quota call")
+	}
+
+	stopDone := make(chan struct{})
+	go func() { p.Stop(); close(stopDone) }()
+
+	select {
+	case <-stopDone:
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked on the in-flight cycle instead of cancelling it")
+	}
+}
+
+// Minor: Start/Stop must be safe to call more than once — Roller has the
+// same contract (this package makes both idempotent via sync.Once rather
+// than merely documenting "call once", so a duplicate call is silent instead
+// of panicking on a double close or racing a second competing loop).
+func TestStartAndStopAreSafeToCallTwice(t *testing.T) {
+	fp := &fakeProvider{}
+	mgr := newMgr(t, fp)
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	done := make(chan struct{})
+	go func() {
+		p.Start()
+		p.Start()
+		p.Stop()
+		p.Stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a duplicate Start or Stop call hung or panicked")
+	}
+}
+
+// Minor: an account removed from the live Manager must eventually disappear
+// from Status().Accounts too, not accumulate as a ghost entry forever.
+func TestStatusPrunesAccountsNoLongerInTheManager(t *testing.T) {
+	fp := &fakeProvider{results: []quotaResult{quotaOK()}}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if _, ok := p.Status().Accounts["a"]; !ok {
+		t.Fatal("account a should be recorded in Status() after a probe")
+	}
+
+	if err := mgr.Remove("a"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if _, ok := p.Status().Accounts["a"]; ok {
+		t.Error("Status().Accounts still has account \"a\" after it was removed from the Manager")
+	}
+}
