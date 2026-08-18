@@ -2,6 +2,7 @@ package rules
 
 import (
 	"context"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -64,28 +65,47 @@ func TestDenylistMatchesShortEntries(t *testing.T) {
 	}
 }
 
-// ...whereas the rule detector skips short strings entirely, because no
-// credential format fits in one and most strings in a request are protocol
-// values.
+// The guard is only observable through a rule that WOULD match below the
+// minimum, so this builds one rather than relying on Builtin() — every builtin
+// rule needs at least 8 bytes to match anyway, so a test using them passes
+// whether or not the guard exists.
 func TestRulesSkipStringsBelowTheMinimum(t *testing.T) {
-	d, err := New(Builtin(), nil)
+	short := []Rule{{
+		Name: "test-short", Label: privacy.LabelSecret,
+		Re: regexp.MustCompile(`(abc)`), Group: 1,
+	}}
+	d, err := New(short, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Shorter than privacy.MinScanBytes, and contrived to match nothing anyway;
-	// the assertion is that Scan returns early rather than that it finds nothing.
-	got, err := d.Scan(context.Background(), "sk-ant-")
+	// 3 bytes, under privacy.MinScanBytes: the guard must suppress it.
+	got, err := d.Scan(context.Background(), "abc")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Errorf("findings on a sub-minimum string: %+v", got)
+		t.Errorf("scanned a %d-byte string: %+v", len("abc"), got)
+	}
+	// The same rule on a long-enough string MUST fire, or the test above would
+	// pass for the wrong reason — a rule that never matches anything.
+	got, err = d.Scan(context.Background(), "xxxxx abc xxxxx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("the rule does not match even above the minimum: %+v", got)
 	}
 }
 
 func TestNewDenylistRejectsABadPattern(t *testing.T) {
 	if _, err := NewDenylist([]string{"/(unclosed/"}); err == nil {
 		t.Fatal("NewDenylist accepted an invalid regex; it must fail at construction")
+	}
+}
+
+func TestNewDenylistRejectsEmptyPattern(t *testing.T) {
+	if _, err := NewDenylist([]string{"//"}); err == nil {
+		t.Fatal("NewDenylist accepted an empty regex pattern; it must fail at construction")
 	}
 }
 

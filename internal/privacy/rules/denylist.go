@@ -30,7 +30,11 @@ func NewDenylist(entries []string) (*Denylist, error) {
 			continue
 		}
 		if len(e) >= 2 && strings.HasPrefix(e, "/") && strings.HasSuffix(e, "/") {
-			re, err := regexp.Compile(e[1 : len(e)-1])
+			pattern := e[1 : len(e)-1]
+			if pattern == "" {
+				return nil, fmt.Errorf("privacy: denylist pattern %s is empty", e)
+			}
+			re, err := regexp.Compile(pattern)
 			if err != nil {
 				return nil, fmt.Errorf("privacy: denylist pattern %s: %w", e, err)
 			}
