@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+  filtered: account nick@example.com (Personal) paused · 3 n
+
+  time      model                  account             st 
+  14:22:57  claude-fable-5         nick@example.com …  200
+  14:23:44  claude-haiku-4         nick@example.com …  200
+  14:25:18  claude-fable-5         nick@example.com …  200
+  14:26:05  claude-haiku-4         nick@example.com …  200
+  14:27:39  claude-fable-5         nick@example.com …  200
+  14:28:26  claude-haiku-4         nick@example.com …  200
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  space resume  ·  j/k scroll  ·  ? help  ·  q quit         

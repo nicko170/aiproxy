@@ -1,0 +1,28 @@
+x aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+╭───────────────────────────────────────────────────────────
+│                                                           
+│   no accounts yet                                         
+│                                                           
+│   aiproxy rotates requests across Anthropic accounts as ea
+│   one's quota burns down. Add the first account:          
+│                                                           
+│     l  log in with Anthropic                              
+│     4  open accounts to import from Claude Code           
+│                                                           
+│   then point your client at ANTHROPIC_BASE_URL=http://127.
+│                                                           
+╰───────────────────────────────────────────────────────────
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+
+  l login  ·  p probe  ·  o dashboard  ·  ? help  ·  q quit 

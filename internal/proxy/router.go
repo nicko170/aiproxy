@@ -19,6 +19,10 @@ func NewRouter(o HandlerOptions) http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
 
+	// One registry per router: the three login routes below all close over
+	// it (see login_sessions.go).
+	loginSessions := newLoginSessionRegistry()
+
 	r.Route(ReservedPrefix, func(cp chi.Router) {
 		// Spec §9: every method on view.Source has exactly one route here,
 		// enforced by TestEveryViewSourceMethodHasAControlRoute. Each handler is
@@ -35,6 +39,18 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Delete("/api/v1/accounts/{id}", removeAccountHandler(o))
 		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))
+		cp.Post("/api/v1/probe", probeNowHandler(o))
+		cp.Post("/api/v1/accounts/import", importCredentialsHandler(o))
+
+		// Login is the one view.Source method served by more than a single
+		// 1:1 route: "begin" is its mapped route (view.Source.Login), while
+		// submit-code and poll exist only here, synthesizing the pollable
+		// shape a raw provider.LoginSession's channel cannot take across
+		// HTTP (see login_sessions.go). TestEveryViewSourceMethodHasAControlRoute
+		// only requires Login's own route to exist, not these two.
+		cp.Post("/api/v1/accounts/login", loginBeginHandler(o, loginSessions))
+		cp.Post("/api/v1/accounts/login/{sessionId}/code", loginSubmitCodeHandler(o, loginSessions))
+		cp.Get("/api/v1/accounts/login/{sessionId}", loginPollHandler(o, loginSessions))
 
 		// Anything else under the reserved prefix is a 404, never a proxied
 		// request: a future control route must not be answerable by the upstream.

@@ -141,6 +141,12 @@ func isModelScoped(name string) bool { return modelScope.MatchString(name) }
 // Only genuine quota windows become buckets, and only when at least one field
 // carried a usable value: everything else in this header namespace is metadata
 // that must never be presented to account selection as an allowance.
+//
+// The utilization field here is a 0..1 FRACTION, not a percentage — see
+// scale.go for the live evidence. This must not be divided by 100: that is
+// bucketValue's conversion (usage.go), for the JSON endpoint's percentage,
+// and applying it here silently made every observed utilization 100x too
+// small.
 func parseBuckets(h http.Header) []provider.QuotaBucket {
 	byName := map[string]*provider.QuotaBucket{}
 	// usable records that a window contributed at least one field we could
@@ -148,6 +154,12 @@ func parseBuckets(h http.Header) []provider.QuotaBucket {
 	// header would mint a phantom window with no status, no utilization and
 	// no reset, which selection would then have to reason about.
 	usable := map[string]bool{}
+	// suspect records a window whose utilization header was out of range for
+	// the 0..1 fraction scale (normalizeUtilization, scale.go). Applied after
+	// the loop below, not inline, because http.Header iteration order is
+	// unspecified — a "status: allowed" header processed after this one must
+	// not silently undo the fail-closed marking.
+	suspect := map[string]bool{}
 	order := []string{}
 
 	for key := range h {
@@ -185,9 +197,14 @@ func parseBuckets(h http.Header) []provider.QuotaBucket {
 				usable[name] = true
 			}
 		case "utilization":
-			// Reported as a percentage; stored as a 0..1 fraction.
 			if f, err := strconv.ParseFloat(value, 64); err == nil {
-				b.Utilization = f / 100
+				if frac, ok := normalizeUtilization(f, fractionScale); ok {
+					b.Utilization = frac
+				} else {
+					// Out of range for a 0..1 header: fail closed rather
+					// than store a fabricated fraction — see scale.go.
+					suspect[name] = true
+				}
 				usable[name] = true
 			}
 		case "reset":
@@ -203,7 +220,15 @@ func parseBuckets(h http.Header) []provider.QuotaBucket {
 		if !usable[name] {
 			continue
 		}
-		out = append(out, *byName[name])
+		b := *byName[name]
+		if suspect[name] {
+			// An out-of-range utilization means we no longer trust this
+			// source's scale for this window. Mark it rejected — the same
+			// verdict eligibleLocked already gives an upstream "rejected" —
+			// rather than let a fabricated 0..1 number decide selection.
+			b.Status = "rejected"
+		}
+		out = append(out, b)
 	}
 	return out
 }

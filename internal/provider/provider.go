@@ -14,6 +14,16 @@ import (
 // implement, such as Quota for an endpoint with no usage API.
 var ErrUnsupported = errors.New("unsupported by this provider")
 
+// ErrQuotaThrottled reports that a provider's zero-spend usage/quota endpoint
+// rate-limited us — distinct from a plain failure to read, and distinct from
+// ErrCredentialRejected: the credential is fine, but polling this endpoint
+// too hard gets it throttled in its own right (spec §6.2). It lives here,
+// not only on the concrete provider that first needed it, because
+// internal/prober backs off on it without importing any concrete provider;
+// a provider's own sentinel (e.g. anthropic.ErrQuotaThrottled) wraps this one
+// so callers can check either.
+var ErrQuotaThrottled = errors.New("usage endpoint throttled")
+
 // ErrCredentialRejected reports that the upstream REFUSED a credential, as
 // opposed to the proxy having failed to reach the upstream at all. Providers
 // wrap it around their own rejection errors.
@@ -183,6 +193,57 @@ type Account struct {
 	ModelMap    map[string]string // request model -> upstream model
 }
 
+// LoginSession is a non-blocking, inspectable OAuth login flow in progress
+// (spec §6.1). It is not JSON-serializable by design — Done is a channel and
+// Cancel and SubmitCode are funcs — because a TUI drives it directly through
+// view.Source.Login rather than over the wire; the control API instead keeps
+// one of these server-side per session and exposes the poll shape spec §9
+// asks for (begin / submit-code / poll), since a raw channel cannot cross
+// HTTP. See LoginResult's doc comment for why Done never carries a
+// credential.
+type LoginSession struct {
+	// URL is the provider's authorize URL, complete with PKCE challenge,
+	// state, and redirect_uri. The caller shows it and may open it in a
+	// browser; Login itself never does either (see Provider.Login's doc
+	// comment) — a library that shells out to open a browser is untestable.
+	URL string
+	// Done receives exactly one LoginResult: on a verified callback, a
+	// submitted code, a timeout, or a Cancel. It is deliberately never
+	// closed after that single send — a second receive on a closed buffered
+	// channel would return the zero LoginResult (Err == nil, an empty
+	// Profile) with ok == false, indistinguishable by value alone from a
+	// successful login. Only "v, ok := <-ch" is a safe read; a bare
+	// "v := <-ch" after the first receive blocks forever instead of lying.
+	Done <-chan LoginResult
+	// Cancel abandons the flow: the loopback listener and every goroutine
+	// Login started are torn down, and Done still receives exactly one
+	// LoginResult (a cancellation error), never zero and never two.
+	Cancel func()
+	// SubmitCode accepts a pasted authorization code as an alternative to the
+	// browser completing the loopback callback — the fallback that matters
+	// the first time this runs over SSH, where no browser can reach the
+	// listener at all (spec §6.1). The provider's real authorize response
+	// page encodes the code as "code#state"; a bare code with no "#" is
+	// accepted too, without a state check, since there is then nothing to
+	// check it against. Calling it after the session has already completed
+	// returns an error rather than silently doing nothing or sending a
+	// second result on Done.
+	SubmitCode func(code string) error
+}
+
+// LoginResult is delivered exactly once on LoginSession.Done. Profile is the
+// only credential-adjacent thing it ever carries — deliberately: whatever
+// exchanged the authorization code for a token persists that credential
+// itself (see anthropic.Anthropic.OnLoginSuccess) before this is ever sent,
+// and the credential never appears in this type, a log line, or a
+// control-API response. Err is non-nil for a state mismatch, a timeout, a
+// cancellation, an exchange failure, or a failed persist; Profile is the
+// zero value whenever Err is set.
+type LoginResult struct {
+	Profile Profile
+	Err     error
+}
+
 // Provider adapts one upstream API to the proxy core.
 type Provider interface {
 	Name() string
@@ -190,6 +251,12 @@ type Provider interface {
 	Refresh(ctx context.Context, c Credential) (Credential, error)
 	Profile(ctx context.Context, c Credential) (Profile, error)
 	Quota(ctx context.Context, c Credential) (Quota, error)
+	// Login starts a PKCE OAuth flow: a loopback callback listener on an
+	// ephemeral port, and an authorize URL carrying its challenge (spec
+	// §6.1). It returns immediately; the flow completes asynchronously on
+	// LoginSession.Done. A provider with no interactive login (none in v1)
+	// may return ErrUnsupported.
+	Login(ctx context.Context) (LoginSession, error)
 
 	Endpoint(a Account) *url.URL
 	Authorize(r *http.Request, c Credential)

@@ -3,6 +3,7 @@ package account
 import (
 	"testing"
 
+	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
@@ -146,5 +147,89 @@ func TestSetSessionAffinityTakesEffectImmediately(t *testing.T) {
 	}
 	if got.ID != "a" {
 		t.Errorf("selected %q, want a (lowest priority; affinity is disabled)", got.ID)
+	}
+}
+
+// Add is what lets ImportCredentials and a successful Login serve traffic
+// without a restart (spec §6.1, §6.3): the account must be immediately
+// selectable, not merely present in All().
+func TestAddRegistersANewAccountLiveWithoutRestart(t *testing.T) {
+	m := mgr(t, acct("a", 5))
+
+	if err := m.Add(acct("b", 0)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	got, ok := m.Get("b")
+	if !ok {
+		t.Fatal("newly added account should be gettable")
+	}
+	if got.Label != "b" {
+		t.Errorf("got = %+v", got)
+	}
+
+	sel, err := m.Select(SelectRequest{Model: "claude-sonnet"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if sel.ID != "b" {
+		t.Errorf("selected %q, want b (lower priority, added live)", sel.ID)
+	}
+}
+
+// A duplicate id must be rejected rather than silently overwriting the
+// existing account's runtime state (quota, in-flight count, errors) out from
+// under it.
+func TestAddDuplicateIDReturnsErrorAndLeavesExistingAccountUntouched(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+	m.UpdateQuota("a", []provider.QuotaBucket{{Name: "5h", Utilization: 0.7}})
+
+	if err := m.Add(acct("a", 99)); err == nil {
+		t.Error("want an error adding a duplicate account id")
+	}
+
+	got, ok := m.Get("a")
+	if !ok {
+		t.Fatal("original account should still exist")
+	}
+	if got.Priority != 0 {
+		t.Errorf("Priority = %d, want unchanged 0", got.Priority)
+	}
+	if got.Buckets["5h"].Utilization != 0.7 {
+		t.Errorf("Buckets = %+v, want the original quota preserved", got.Buckets)
+	}
+}
+
+func TestProviderReturnsTheRegisteredProviderByName(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+
+	p, ok := m.Provider("stub")
+	if !ok || p == nil {
+		t.Fatalf("Provider(%q) ok=%v p=%v, want the registered stub", "stub", ok, p)
+	}
+	if p.Name() != "stub" {
+		t.Errorf("Name() = %q, want stub", p.Name())
+	}
+}
+
+func TestProviderUnknownNameReturnsFalse(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+	if _, ok := m.Provider("does-not-exist"); ok {
+		t.Error("want ok=false for an unregistered provider name")
+	}
+}
+
+// A stray reference to internal/config here (rather than only in
+// select_test.go's acct helper) is deliberate: Add takes a config.Account
+// directly, the same shape ImportCredentials and Login persist through the
+// config store, so this test constructs one without going through acct's
+// stub-provider convenience wrapper to prove that shape round-trips too.
+func TestAddAcceptsAConfigAccountDirectly(t *testing.T) {
+	m := mgr(t)
+	if err := m.Add(config.Account{ID: "x", Provider: "stub", Label: "x", Credential: oauthCred()}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if _, ok := m.Get("x"); !ok {
+		t.Fatal("account should be present after Add")
 	}
 }

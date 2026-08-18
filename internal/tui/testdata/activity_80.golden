@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  up 4h12m  ·  2 in flight                    
+  1 overview   2 activity   3 usage   4 accounts   5 settings                   
+────────────────────────────────────────────────────────────────────────────────
+  live feed                                                                     
+
+  time      model                  account             st       dur     ttfb
+  14:22:57  claude-fable-5         nick@example.com …  200    1.20s    240ms
+  14:23:44  claude-haiku-4         nick@example.com …  200    1.51s    275ms
+  14:24:31  claude-fable-5         ops@example.com (…  429    1.82s    310ms
+  14:25:18  claude-fable-5         nick@example.com …  200    2.13s    345ms
+  14:26:05  claude-haiku-4         nick@example.com …  200    2.44s    380ms
+  14:26:52  claude-fable-5         ops@example.com (…  429    2.75s    415ms
+  14:27:39  claude-fable-5         nick@example.com …  200    3.06s    450ms
+  14:28:26  claude-haiku-4         nick@example.com …  200    3.37s    485ms
+  14:29:13  claude-fable-5         ops@example.com (…  429    3.68s    520ms
+
+
+
+
+
+
+
+
+
+
+
+
+  space pause  ·  j/k scroll  ·  a/m/c filter  ·  ? help  ·  q quit             

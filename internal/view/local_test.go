@@ -1,10 +1,14 @@
 package view
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -16,7 +20,10 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
+	"github.com/nicko170/aiproxy/internal/provider/anthropic"
+	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
 // testHarness wires a Local over real (in-memory / temp-file) services, the
@@ -29,6 +36,7 @@ type testHarness struct {
 	ms      *metrics.Store
 	cs      *config.Store
 	ing     *metrics.Ingester
+	probe   *prober.Prober
 	dropped func() int64
 }
 
@@ -41,6 +49,15 @@ func newHarness(t *testing.T, accts ...config.Account) *testHarness {
 // need to control what ServerStatus sees as "now" (uptime, the p95 TTFB
 // window). now may be nil, in which case Local uses the real wall clock.
 func newHarnessWithClock(t *testing.T, now func() time.Time, accts ...config.Account) *testHarness {
+	t.Helper()
+	return newHarnessWithProviders(t, now, map[string]provider.Provider{"stub": stubProvider{}}, accts...)
+}
+
+// newHarnessWithProviders is the general form every other harness
+// constructor delegates to: it lets a test (e.g. Login's) register an extra
+// controllable provider.Provider alongside "stub" without every other test
+// in this file having to know about it.
+func newHarnessWithProviders(t *testing.T, now func() time.Time, providers map[string]provider.Provider, accts ...config.Account) *testHarness {
 	t.Helper()
 	ms, err := metrics.OpenMemory()
 	if err != nil {
@@ -56,7 +73,7 @@ func newHarnessWithClock(t *testing.T, now func() time.Time, accts ...config.Acc
 		t.Fatalf("seed config: %v", err)
 	}
 
-	mgr := account.New(accts, map[string]provider.Provider{"stub": stubProvider{}}, account.Options{
+	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
 		SessionAffinity: true,
 		Persist:         func(string, provider.Credential) error { return nil },
@@ -67,12 +84,14 @@ func newHarnessWithClock(t *testing.T, now func() time.Time, accts ...config.Acc
 
 	dropped := func() int64 { return ing.Dropped() }
 
+	pb := prober.New(mgr, providers, time.Hour)
+
 	var opts []option
 	if now != nil {
 		opts = append(opts, withClock(now))
 	}
-	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, opts...)
-	return &testHarness{t: t, local: local, mgr: mgr, ms: ms, cs: cs, ing: ing, dropped: dropped}
+	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, pb, opts...)
+	return &testHarness{t: t, local: local, mgr: mgr, ms: ms, cs: cs, ing: ing, probe: pb, dropped: dropped}
 }
 
 // noWaiter satisfies account.Waiter without ever actually waiting; it is only
@@ -97,6 +116,9 @@ func (stubProvider) Profile(context.Context, provider.Credential) (provider.Prof
 func (stubProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
 	return provider.Quota{}, provider.ErrUnsupported
 }
+func (stubProvider) Login(context.Context) (provider.LoginSession, error) {
+	return provider.LoginSession{}, provider.ErrUnsupported
+}
 func (stubProvider) Endpoint(provider.Account) *url.URL {
 	u, _ := url.Parse("https://upstream.invalid")
 	return u
@@ -106,6 +128,21 @@ func (stubProvider) RewriteBody(b []byte, _ provider.Account) ([]byte, error) { 
 func (stubProvider) ClassifyResponse(*http.Response) provider.Outcome         { return provider.Outcome{} }
 func (stubProvider) ParseUsage([]byte) (*provider.UsageDelta, bool)           { return nil, false }
 func (stubProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)       { return nil, false }
+
+// loginableProvider is a stubProvider that answers Login with a canned,
+// test-controlled session, so Local.Login's own job — looking up the named
+// provider and handing its session straight back — can be exercised without
+// a real PKCE/HTTP flow (already covered at the anthropic package level).
+type loginableProvider struct {
+	stubProvider
+	session provider.LoginSession
+	err     error
+}
+
+func (loginableProvider) Name() string { return "loginable" }
+func (l loginableProvider) Login(context.Context) (provider.LoginSession, error) {
+	return l.session, l.err
+}
 
 func acctCfg(id string, priority int) config.Account {
 	return config.Account{
@@ -663,5 +700,321 @@ func TestSubscribeReceivesPublishedEvents(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("subscriber never received the published event")
+	}
+}
+
+// Login is a thin lookup-and-passthrough: it must find the named provider
+// and hand its session straight back, unaltered.
+func TestLoginReturnsTheNamedProvidersSession(t *testing.T) {
+	want := provider.LoginSession{URL: "https://example.invalid/authorize?state=xyz"}
+	providers := map[string]provider.Provider{
+		"stub":      stubProvider{},
+		"loginable": loginableProvider{session: want},
+	}
+	h := newHarnessWithProviders(t, nil, providers)
+
+	got, err := h.local.Login(context.Background(), "loginable")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if got.URL != want.URL {
+		t.Errorf("URL = %q, want %q", got.URL, want.URL)
+	}
+}
+
+// The absent case: a provider name nothing registered must be a clear
+// error, not a nil session silently returned.
+func TestLoginUnknownProviderNameReturnsError(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.local.Login(context.Background(), "does-not-exist"); err == nil {
+		t.Error("want an error for an unregistered provider name")
+	}
+}
+
+// Login must surface whatever error the provider itself returns (e.g. a
+// provider with no interactive login at all).
+func TestLoginPropagatesTheProvidersOwnError(t *testing.T) {
+	providers := map[string]provider.Provider{
+		"stub":      stubProvider{},
+		"loginable": loginableProvider{err: provider.ErrUnsupported},
+	}
+	h := newHarnessWithProviders(t, nil, providers)
+
+	if _, err := h.local.Login(context.Background(), "loginable"); !errors.Is(err, provider.ErrUnsupported) {
+		t.Errorf("err = %v, want provider.ErrUnsupported", err)
+	}
+}
+
+// The single most likely place to leak a credential is this flow. This runs
+// a genuine login end to end — a real anthropic.Provider, a fake token
+// endpoint that hands back a known sentinel access/refresh token, a real
+// loopback callback — through Local.Login exactly as production drives it,
+// and checks the actual bytes of everything this layer produces: the
+// LoginSession (its URL), the LoginResult, and anything logged during the
+// flow. (The remaining leg — that the sentinel never reaches a control-API
+// poll response — is exercised with the same rigor, real secrets included,
+// by internal/proxy's TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial;
+// view has no HTTP layer of its own to poll.)
+//
+// Before this fix, `secret` was never placed into any real input — the
+// session and result here were hand-built stubs — so the strings.Contains
+// half of this test was inert and could not have failed no matter what
+// leaked; only the reflection field-name check below had any teeth.
+func TestLoginSessionNeverCarriesCredentialMaterial(t *testing.T) {
+	const secret = "sk-ant-super-secret-value"
+	up := testutil.NewFakeUpstream(t,
+		testutil.Script{Status: 200, Body: `{"access_token":"` + secret + `","refresh_token":"rt-` + secret + `","expires_in":3600}`},
+		testutil.Script{Status: 200, Body: `{"account":{"uuid":"acct-1","email":"a@example.com",
+			"display_name":"A"},"organization":{"uuid":"org-1","name":"Acme"}}`},
+	)
+	real := anthropic.New(http.DefaultClient)
+	real.TokenEndpointOverride = up.URL()
+	real.BaseURLOverride = up.URL()
+	real.LoginTimeoutOverride = 5 * time.Second
+
+	// Captures anything logged anywhere through the default logger for the
+	// duration of the flow; nothing in this path logs today, but a future
+	// regression that adds a log call anywhere Login's real code runs
+	// through must be caught here, not just by the code that writes it.
+	var logBuf bytes.Buffer
+	prevLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logBuf, nil)))
+	defer slog.SetDefault(prevLogger)
+
+	providers := map[string]provider.Provider{
+		"stub":      stubProvider{},
+		"anthropic": real,
+	}
+	h := newHarnessWithProviders(t, nil, providers)
+
+	sess, err := h.local.Login(context.Background(), "anthropic")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	u, err := url.Parse(sess.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	state := u.Query().Get("state")
+	redirectURI := u.Query().Get("redirect_uri")
+	if state == "" || redirectURI == "" {
+		t.Fatalf("authorize URL missing state/redirect_uri: %s", sess.URL)
+	}
+
+	cbRes, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	cbRes.Body.Close()
+
+	var result provider.LoginResult
+	select {
+	case res, ok := <-sess.Done:
+		if !ok {
+			t.Fatal("Done closed with no value sent")
+		}
+		result = res
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LoginResult")
+	}
+	if result.Err != nil {
+		t.Fatalf("LoginResult.Err = %v, want nil", result.Err)
+	}
+	if result.Profile.Email != "a@example.com" {
+		t.Errorf("Profile = %+v, want the real exchange's profile", result.Profile)
+	}
+
+	raw, err := json.Marshal(result)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	blob := string(raw) + " " + sess.URL + " " + logBuf.String()
+	for _, leak := range []string{secret, "rt-" + secret} {
+		if strings.Contains(blob, leak) {
+			t.Errorf("credential material %q leaked into %q", leak, blob)
+		}
+	}
+	// LoginResult's own shape enforces this at compile time (Profile, Err —
+	// no credential field exists to leak), but assert it structurally too so
+	// a future field addition to the type is caught here rather than only by
+	// code review.
+	rt := reflect.TypeOf(result)
+	for i := 0; i < rt.NumField(); i++ {
+		name := rt.Field(i).Name
+		if name != "Profile" && name != "Err" {
+			t.Errorf("LoginResult gained an unexpected field %q; verify it cannot carry credential material", name)
+		}
+	}
+}
+
+func TestProbeNowTriggersTheProberAndReturnsItsError(t *testing.T) {
+	fp := &fakeQuotaProvider{err: errors.New("boom")}
+	providers := map[string]provider.Provider{"stub": fp}
+	h := newHarnessWithProviders(t, nil, providers, acctCfgWithProvider("a", "stub"))
+
+	err := h.local.ProbeNow(context.Background())
+	if err == nil {
+		t.Fatal("want the prober's error surfaced")
+	}
+	if fp.calls != 1 {
+		t.Errorf("Quota called %d times, want exactly 1", fp.calls)
+	}
+}
+
+func TestProbeNowOnSuccessUpdatesAccountQuota(t *testing.T) {
+	fp := &fakeQuotaProvider{buckets: []provider.QuotaBucket{{Name: "5h", Utilization: 0.3}}}
+	providers := map[string]provider.Provider{"stub": fp}
+	h := newHarnessWithProviders(t, nil, providers, acctCfgWithProvider("a", "stub"))
+
+	if err := h.local.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	got, _ := h.mgr.Get("a")
+	if got.Buckets["5h"].Utilization != 0.3 {
+		t.Errorf("Buckets = %+v, want 5h=0.3", got.Buckets)
+	}
+}
+
+// fakeQuotaProvider is a stubProvider whose Quota is controllable, for
+// exercising Local.ProbeNow without a real prober cycle's full generality
+// (already covered in internal/prober's own tests).
+type fakeQuotaProvider struct {
+	stubProvider
+	buckets []provider.QuotaBucket
+	err     error
+	calls   int
+}
+
+func (f *fakeQuotaProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
+	f.calls++
+	if f.err != nil {
+		return provider.Quota{}, f.err
+	}
+	return provider.Quota{Buckets: f.buckets}, nil
+}
+
+func acctCfgWithProvider(id, providerName string) config.Account {
+	return config.Account{
+		ID: id, Provider: providerName, Label: id,
+		Credential: provider.Credential{Type: provider.CredentialOAuth, AccessToken: "at"},
+	}
+}
+
+// writeFileT writes body to dir/name, creating parent directories as needed.
+func writeFileT(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestImportCredentialsAddsAccountsToManagerWithoutRestart(t *testing.T) {
+	h := newHarness(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	writeFileT(t, config.LegacyPath(), `{"accounts":[
+		{"name":"a@example.com (Acme)","type":"oauth","accessToken":"at-1","refreshToken":"rt-1",
+		 "accountUuid":"uuid-1"}
+	]}`)
+
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
+	if err != nil {
+		t.Fatalf("ImportCredentials: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("added = %d, want 1", added)
+	}
+
+	all := h.mgr.All()
+	if len(all) != 1 || all[0].Label != "a@example.com (Acme)" {
+		t.Errorf("manager accounts = %+v, want the imported account live", all)
+	}
+	cfg, err := h.cs.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Accounts) != 1 {
+		t.Errorf("persisted accounts = %+v, want 1", cfg.Accounts)
+	}
+}
+
+// Importing the same source twice must not duplicate accounts: dedupe on
+// the credential's account uuid.
+func TestImportCredentialsTwiceDedupesOnAccountUUID(t *testing.T) {
+	h := newHarness(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir)
+	writeFileT(t, config.LegacyPath(), `{"accounts":[
+		{"name":"a@example.com","type":"oauth","accessToken":"at-1","refreshToken":"rt-1",
+		 "accountUuid":"uuid-1"}
+	]}`)
+
+	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy); err != nil {
+		t.Fatalf("first ImportCredentials: %v", err)
+	}
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
+	if err != nil {
+		t.Fatalf("second ImportCredentials: %v", err)
+	}
+	if added != 0 {
+		t.Errorf("second import added = %d, want 0 (already present)", added)
+	}
+	if len(h.mgr.All()) != 1 {
+		t.Errorf("manager accounts = %+v, want exactly 1 (no duplicate)", h.mgr.All())
+	}
+}
+
+// The claude-code source carries no account uuid at all, so dedupe must
+// fall back to the label — the case a suite that only tests the uuid path
+// would miss.
+func TestImportCredentialsTwiceDedupesOnLabelWhenNoUUID(t *testing.T) {
+	h := newHarness(t)
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	writeFileT(t, config.ClaudeCodePath(),
+		`{"claudeAiOauth":{"accessToken":"at-9","refreshToken":"rt-9","subscriptionType":"max"}}`)
+
+	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSourceClaudeCode); err != nil {
+		t.Fatalf("first ImportCredentials: %v", err)
+	}
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceClaudeCode)
+	if err != nil {
+		t.Fatalf("second ImportCredentials: %v", err)
+	}
+	if added != 0 {
+		t.Errorf("second import added = %d, want 0 (deduped on label)", added)
+	}
+	if len(h.mgr.All()) != 1 {
+		t.Errorf("manager accounts = %+v, want exactly 1", h.mgr.All())
+	}
+}
+
+// The absent case: no source file at all must be a clear error and add
+// nothing, not a panic or a silent zero.
+func TestImportCredentialsMissingFileReturnsErrorAndAddsNothing(t *testing.T) {
+	h := newHarness(t)
+	dir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", dir) // no teamclaude.json written here
+
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
+	if err == nil {
+		t.Error("want an error when the source file does not exist")
+	}
+	if added != 0 {
+		t.Errorf("added = %d, want 0", added)
+	}
+	if len(h.mgr.All()) != 0 {
+		t.Error("manager should have gained no accounts")
+	}
+}
+
+func TestImportCredentialsUnknownSourceReturnsError(t *testing.T) {
+	h := newHarness(t)
+	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSource("bogus")); err == nil {
+		t.Error("want an error for an unknown import source")
 	}
 }

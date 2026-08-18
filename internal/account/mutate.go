@@ -1,6 +1,11 @@
 package account
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/provider"
+)
 
 // SetEnabled toggles whether an account participates in selection. The
 // account continues to exist and hold its accumulated state (quota, errors);
@@ -53,6 +58,73 @@ func (m *Manager) Remove(id string) error {
 		}
 	}
 	return nil
+}
+
+// Add registers a brand-new account into the live registry without a
+// restart — the mirror image of Remove. ImportCredentials and a successful
+// Login both persist through config.Store first and then call this, exactly
+// like every other Local mutation (persist, then apply; see
+// view.Local.mu's doc comment): a failed persist must never leave an account
+// live that a restart would not reproduce.
+//
+// A duplicate id is rejected rather than silently overwriting the existing
+// account's accumulated runtime state (quota history, in-flight count,
+// errors) — ids are assigned once and never reused (spec §6.2), so a
+// collision here means a caller reused one, not that this is an update.
+func (m *Manager) Add(c config.Account) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.byID[c.ID]; exists {
+		return fmt.Errorf("account %q already exists", c.ID)
+	}
+	a := fromConfig(c)
+	m.accounts = append(m.accounts, a)
+	m.byID[a.ID] = a
+	return nil
+}
+
+// UpdateCredential replaces a live account's credential and identity in
+// place: same ID, same accumulated runtime state (priority, quota history,
+// in-flight count), fresh Credential/AccountUUID/OrgName/Plan/Label.
+//
+// A re-login for an account already configured (cmd/aiproxy's
+// onLoginSuccess, when its dedupe finds an existing entry) is the only
+// caller. config.Store already holds the fresh copy on disk by the time
+// this runs (persist, then apply). Without it, the live in-memory account
+// would go on holding the very credential the user just replaced — which
+// matters most exactly when it matters most: the account's refresh token
+// had expired and stopped working, the user re-ran the login flow to fix
+// it, and the fix would otherwise not take effect until a restart.
+//
+// A successful re-login also clears StatusErrored/LastError: that is
+// precisely the state a re-login exists to fix, and it is not a state
+// EnsureFresh can clear on its own for an account stuck on a dead refresh
+// token (see EnsureFresh's force-bypass comment) — only a successful
+// refresh clears it, and a dead refresh token can never produce one.
+func (m *Manager) UpdateCredential(id string, cred provider.Credential, identity config.Identity, label string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.byID[id]
+	if a == nil {
+		return fmt.Errorf("unknown account %q", id)
+	}
+	a.Credential = cred
+	a.AccountUUID = identity.AccountUUID
+	a.OrgName = identity.OrgName
+	a.Plan = identity.Plan
+	a.Label = label
+	a.Status = StatusActive
+	a.LastError = ""
+	return nil
+}
+
+// Provider returns the registered provider.Provider for a name (e.g.
+// "anthropic"), so a caller above Manager — view.Local's Login, specifically
+// — can drive a provider-level operation like Login without Manager having
+// to expose its whole provider registry or import anything above itself.
+func (m *Manager) Provider(name string) (provider.Provider, bool) {
+	p, ok := m.providers[name]
+	return p, ok
 }
 
 // SetSwitchThreshold changes the utilization above which an account is

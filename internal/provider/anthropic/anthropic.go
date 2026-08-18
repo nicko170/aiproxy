@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/provider"
 )
@@ -26,6 +27,24 @@ type Anthropic struct {
 	TokenEndpointOverride string
 	// BaseURLOverride redirects profile/usage reads in tests.
 	BaseURLOverride string
+	// LoginTimeoutOverride redirects Login's end-to-end timeout in tests
+	// (loginTimeout, 2 minutes, otherwise). Zero takes the default.
+	LoginTimeoutOverride time.Duration
+	// OnLoginSuccess is called once, synchronously, when Login's code
+	// exchange and Profile lookup both succeed, and before the resulting
+	// LoginResult (which never carries a credential; see its doc comment) is
+	// ever sent on Done. cmd/aiproxy sets this to persist the account
+	// through config.Store and add it to the live account.Manager (spec
+	// §6.1: "the account serves traffic without a restart") — Anthropic
+	// itself has no store or manager to do that with. A nil hook (only in
+	// tests that do not need persistence) means Login completes without
+	// persisting anything.
+	//
+	// Returning an error here becomes LoginResult.Err, e.g. a config-store
+	// write failure; the exchanged credential still cannot leak through that
+	// error, since only the error's text (never the Credential value) is
+	// used.
+	OnLoginSuccess func(ctx context.Context, cred provider.Credential, profile provider.Profile) error
 }
 
 func New(hc *http.Client) *Anthropic {

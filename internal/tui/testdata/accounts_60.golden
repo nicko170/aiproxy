@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+   pri  account                       state                 
+ ▸ p1   nick@example.com (Personal)   ready                 
+   p2   ops@example.com (Ops)         rate-limited · back i…
+
+  ────────────────────────────────────────────────────────
+  nick@example.com (Personal)  ·  anthropic  ·  id a1
+  probed 3m ago
+  5h        ··▁·▂·▃·▄·▅·▆·▇·█·█···▁·▂·▃·▄·▅·▆·▇·█·█···▁·▂·▃·
+  7d        ··▁·▁·▂·▂·▂·▃·▃·▃·▄·▄·▄·▅·▅·▅·▆·▆·▆·▇·▇·▇·█·█·█·
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  l login  ·  i import  ·  ? help  ·  q quit                

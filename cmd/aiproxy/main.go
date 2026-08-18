@@ -18,9 +18,11 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/proxy"
+	"github.com/nicko170/aiproxy/internal/tui"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -31,7 +33,7 @@ func main() {
 	var (
 		configPath = flag.String("config", "", "path to config.json (default: XDG config dir)")
 		addr       = flag.String("addr", "", "listen address (overrides config)")
-		headless   = flag.Bool("headless", true, "run without a TUI (the only mode in this build)")
+		headless   = flag.Bool("headless", false, "run without the TUI, logging to stderr")
 		logLevel   = flag.String("log-level", "info", "debug, info, warn, or error")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
@@ -42,22 +44,38 @@ func main() {
 		return
 	}
 
+	// Under the TUI, slog feeds a ring buffer the Activity screen renders
+	// (spec §8): a full-screen program and stderr text cannot share a
+	// terminal without corrupting each other.
+	var logs *tui.LogRing
 	log := newLogger(*logLevel)
-	if err := run(*configPath, *addr, *headless, log); err != nil {
+	if !*headless {
+		logs = tui.NewLogRing(500)
+		log = slog.New(logs.Handler(parseLevel(*logLevel)))
+	}
+	if err := run(*configPath, *addr, *headless, log, logs); err != nil {
 		log.Error("fatal", "err", err)
+		if !*headless {
+			// The ring died with the TUI; say it where it can still be read.
+			fmt.Fprintln(os.Stderr, "aiproxy:", err)
+		}
 		os.Exit(1)
 	}
 }
 
-func newLogger(level string) *slog.Logger {
+func parseLevel(level string) slog.Level {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {
-		l = slog.LevelInfo
+		return slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
+	return l
 }
 
-func run(configPath, addrOverride string, headless bool, log *slog.Logger) error {
+func newLogger(level string) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(level)}))
+}
+
+func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs *tui.LogRing) error {
 	if configPath == "" {
 		configPath = config.Path()
 	}
@@ -92,10 +110,15 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 	pruner.Start()
 	defer pruner.Stop()
 
-	handler, err := buildHandler(cfg, store, log, ing)
+	handler, pb, vl, err := buildHandler(cfg, store, log, ing)
 	if err != nil {
 		return err
 	}
+	// The background loop is a no-op when quotaProbe.intervalSeconds is 0
+	// (see prober.New's doc comment); ProbeNow still works either way, so
+	// Start/Stop are unconditional exactly like the roller and pruner above.
+	pb.Start()
+	defer pb.Stop()
 
 	ln, err := listen(cfg.Listen.Addr)
 	if err != nil {
@@ -123,26 +146,61 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 		}
 	}()
 
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
+	shutdown := func() error {
 		log.Info("shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutCtx)
 	}
+
+	if headless {
+		select {
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return shutdown()
+		}
+	}
+
+	// TUI mode: the program owns the terminal until quit; quitting the TUI
+	// shuts the proxy down with it.
+	tuiErr := make(chan error, 1)
+	go func() {
+		tuiErr <- tui.Run(ctx, vl, version, logs)
+	}()
+	select {
+	case err := <-errCh:
+		stop() // unwinds the TUI via its context before the terminal is gone
+		<-tuiErr
+		return err
+	case <-ctx.Done():
+		<-tuiErr
+		return shutdown()
+	case err := <-tuiErr:
+		if err != nil {
+			err = fmt.Errorf("tui: %w (use --headless when not attached to a terminal)", err)
+		}
+		if serr := shutdown(); serr != nil && err == nil {
+			err = serr
+		}
+		return err
+	}
 }
 
 // buildHandler wires config into a serving handler. Kept separate from run so
-// tests exercise the real composition without binding a port.
-func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, error) {
+// tests exercise the real composition without binding a port. The returned
+// *prober.Prober is separate from the handler because its background loop
+// has its own lifecycle (Start/Stop), exactly like the roller and pruner run
+// constructs alongside it; a caller that only wants the handler (most tests)
+// is free to ignore it.
+func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, error) {
 	upstreamClient := &http.Client{
 		Transport: proxy.NewTransport(proxy.TransportOptions{}),
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
 	}
+	anthropicProvider := anthropic.New(upstreamClient)
 	providers := map[string]provider.Provider{
-		"anthropic": anthropic.New(upstreamClient),
+		"anthropic": anthropicProvider,
 	}
 
 	mgr := account.New(cfg.Accounts, providers, account.Options{
@@ -174,6 +232,20 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		},
 	})
 
+	// OnLoginSuccess is the only place a PKCE login's exchanged credential
+	// exists after the exchange — set here, after mgr and store both exist,
+	// so a successful login persists and goes live without a restart (spec
+	// §6.1). See accounts.go's onLoginSuccess for the full "persist, then
+	// apply" + re-login-dedupe story.
+	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr)
+
+	// The quota prober (spec §6.2): interval 0 disables only its background
+	// loop (see prober.New's doc comment), never ProbeNow. Constructed here,
+	// alongside mgr and providers, but started/stopped by run() — its
+	// lifecycle matches the roller and pruner's, not the handler's.
+	pb := prober.New(mgr, providers, time.Duration(cfg.QuotaProbe.IntervalSeconds)*time.Second,
+		prober.WithLogger(log))
+
 	// The attempt loop enforces retry.headerTimeoutMs itself (see sendWithin in
 	// internal/proxy/attempt.go); the transport's own ResponseHeaderTimeout must
 	// be derived from that same value rather than left at its package default, or
@@ -196,7 +268,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// reads through it rather than computing anything of its own, which is
 	// what lets a future view.HTTP (a detached daemon) replace it without
 	// internal/proxy's routes changing at all.
-	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped)
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
@@ -245,7 +317,24 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
 			})
 		},
-	}), nil
+	}), pb, vl, nil
+}
+
+// loginLabel matches spec §6.2's persisted account label convention —
+// "person@example.com (Org)" — degrading gracefully when a profile is
+// missing one half, so a successful login always gets a usable label rather
+// than an empty string.
+func loginLabel(p provider.Profile) string {
+	switch {
+	case p.Email != "" && p.OrgName != "":
+		return fmt.Sprintf("%s (%s)", p.Email, p.OrgName)
+	case p.Email != "":
+		return p.Email
+	case p.DisplayName != "":
+		return p.DisplayName
+	default:
+		return "logged-in account"
+	}
 }
 
 // endpointOf strips the query string so /v1/messages?beta=true and

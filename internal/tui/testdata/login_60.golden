@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+╭───────────────────────────────────────────────────────────
+│                                                           
+│   log in with Anthropic                                   
+│                                                           
+│   1. open this url (ctrl+o opens it — or select and copy t
+│      https://claude.ai/oauth/authorize?client_id=         
+│      9d1c250a-e61b-44d9-88ed-5944d1962f5e&code_ch         
+│      allenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJ         
+│      Sstw-cM&code_challenge_method=S256&redirect_         
+│      uri=http%3A%2F%2F127.0.0.1%2F54231%2Fcallbac         
+│      k&response_type=code&scope=org%3Acreate_api_         
+│      key%20user%3Aprofile%20user%3Ainference&stat         
+│      e=abcdefghijklmnopqrstuvwxyzABCDEF12345678           
+│                                                           
+│   2. approve access in the browser                        
+│                                                           
+│   3. if the browser cannot reach this machine, paste the c
+│      paste the code here                                  
+│                                                           
+│   waiting for the browser or a pasted code…               
+│                                                           
+╰───────────────────────────────────────────────────────────
+                                                            
+
+  enter submit code  ·  ? help  ·  q quit                   
