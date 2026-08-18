@@ -87,3 +87,13 @@ func (t *Table) Len() int { return len(t.byPlaceholder) }
 func (t *Table) forceForTest(placeholder, value string) {
 	t.byPlaceholder[placeholder] = value
 }
+
+// labels is every label minted into this table, one entry per distinct value, so
+// Filter can count redactions per label without exposing the mapping itself.
+func (t *Table) labels() []Label {
+	out := make([]Label, 0, len(t.byValue))
+	for vk := range t.byValue {
+		out = append(out, vk.label)
+	}
+	return out
+}
