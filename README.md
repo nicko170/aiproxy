@@ -175,16 +175,50 @@ restriction and work on every platform.
 
 ### Cost and limits
 
-Running the model costs time: measured on darwin/arm64 CPU, roughly 0.5 ms
-per token and about 4 bytes per token, so a 4 KB string takes on the order of
-520 ms to scan. That is why `ner.maxScanBytes` defaults to 4096 — before the
-cap existed, a 16 KB string took 2.84 s, serialized behind a mutex on every
-other request using the model at the time. A string longer than the cap is
-scanned by the model only up to the cap, and the truncation is logged, never
-silent, so it isn't mistaken for a full scan. This only affects the model
-tier: **the deterministic rules have no cap and always scan the whole
-string**, so a credential or a denylisted value anywhere in a large file is
-still caught.
+Running the model costs real time. Measured on an Apple M3 Pro (darwin/arm64,
+CPU), with the benchmarks at the end of this section:
+
+| Input | Tokens | Latency | Throughput |
+|---|---|---|---|
+| 512 B | 166 | 126 ms | 1,321 tok/s |
+| 2 KB | 663 | 281 ms | 2,356 tok/s |
+| 4 KB | 1,325 | 589 ms | 2,249 tok/s |
+| 16 KB | 5,313 | 3.42 s | 1,553 tok/s |
+
+Three things in that curve matter more than the headline number. There is a
+**fixed cost of roughly 30–55 ms per scan**, so a short string is dominated by
+setup rather than inference — which is much of why the cache earns its keep.
+Throughput **peaks around 2,000 tokens and falls after**, because past one
+2,048-token window the 25% overlap re-processes tokens: 16 KB pays about a 50%
+tax. And **concurrency buys nothing** — inference is serialized, so twelve
+cores deliver one core's throughput, and ~2,300 tok/s is the ceiling for the
+whole process, not per request.
+
+That last point is the one to size against: at 4 KB per newly-seen string,
+that is under two fresh scans a second for the entire proxy. Resent
+conversation history is served from the cache and costs nothing, so steady
+state is far better than that — but a burst of new conversations queues.
+
+By comparison the deterministic rules scan the same 4 KB in **0.91 ms**, about
+650× faster, and have **no cap** — so a credential or denylisted value anywhere
+in a large file is still caught. Tokenization is not the cost either: it runs
+at 1.4M tok/s, under 0.2% of a scan, so a slow scan is always inference.
+
+This is why `ner.maxScanBytes` defaults to 4096. A string longer than the cap
+is scanned by the model only up to the cap, and the truncation is logged, never
+silent, so it isn't mistaken for a full scan.
+
+Numbers taken on one machine are worth exactly that, so the benchmarks are
+committed — measure your own silicon:
+
+```sh
+AIPROXY_MODEL_DIR=~/.config/aiproxy/models/privacy-filter \
+  go test ./internal/privacy/ner -run '^$' -bench . -benchtime 10x
+go test ./internal/privacy/rules -run '^$' -bench . -benchtime 200x
+```
+
+They skip without `AIPROXY_MODEL_DIR`, so an ordinary `go test ./...` still
+needs no download.
 
 ### Failure modes
 
@@ -198,16 +232,21 @@ Setting it to `open` sends the request unfiltered and records that it happened.
 Either way it is recorded, and that recording is the point: the header shows
 `⊘ filter error` while a scan is failing, and `⊘ 3 unfiltered` for as long as
 the session has sent anything upstream unscanned. Both outrank the redaction
-count in the header, because a count is reassurance and you should never be
-shown reassurance in place of a fault.
+count, because a count is reassurance and you should never be shown reassurance
+in place of a fault.
+
+One thing outranks both of those: `⊘ 2 unresolved`, a placeholder that came
+back from upstream with no entry in this request's restore table. A filter
+error tells you a scan didn't happen; an unresolved placeholder means one did,
+and the reversal it promised didn't hold — so it wins the header outright.
 
 `scanTimeoutMS` (default 10000) bounds the whole request's scan. It is the only
 ceiling on the latency the filter adds — scanning happens before the retry loop,
 so `retry.budgetMS` doesn't cover it, and `ner.maxScanBytes` bounds one string
 rather than one request. With the model tier off (the default) the rules are
-microseconds and this never fires. With it on, 10 s is roughly nineteen
-freshly-seen 4 KB strings; past that the scan expires and `onScanFailure`
-decides what happens. Raise it if you'd rather wait than refuse. There's no
+microseconds and this never fires. With it on, 10 s is roughly seventeen
+freshly-seen 4 KB strings at the measured 589 ms each; past that the scan
+expires and `onScanFailure` decides what happens. Raise it if you'd rather wait than refuse. There's no
 "unbounded" value: a 0 is read as unset and replaced by the default.
 
 `onUnresolvedPlaceholder` (default `passthrough`) governs the response side:
