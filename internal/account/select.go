@@ -3,6 +3,7 @@ package account
 import (
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -117,17 +118,12 @@ func (m *Manager) Select(req SelectRequest) (Account, error) {
 		if ai.Priority != aj.Priority {
 			return ai.Priority < aj.Priority
 		}
-		// Spend the allowance that expires soonest first; an unknown reset sorts
-		// last so a known-expiring account is preferred over an unknown one.
-		ri, rj := soonestReset(ai, req.Model), soonestReset(aj, req.Model)
+		// Spend the allowance closest to being wasted. A score of 0 means
+		// nothing could be scored, so an account we know nothing about sorts
+		// last rather than first — descending order gives that for free.
+		ri, rj := expiringAllowance(ai, req.Model, nowMS), expiringAllowance(aj, req.Model, nowMS)
 		if ri != rj {
-			if ri == 0 {
-				return false
-			}
-			if rj == 0 {
-				return true
-			}
-			return ri < rj
+			return ri > rj
 		}
 		return ai.ID < aj.ID // deterministic
 	})
@@ -165,16 +161,74 @@ func hasCredential(a *Account) bool {
 	return a.Credential.AccessToken != "" || a.Credential.RefreshToken != "" || a.Credential.APIKey != ""
 }
 
-// soonestReset is the nearest future reset among buckets binding this model.
-func soonestReset(a *Account, model string) int64 {
-	var best int64
+// expiringAllowance scores how much unused allowance an account is on track to
+// waste, so selection spends the capacity that is about to vanish first.
+//
+// For one window the quantity that matters is a rate: to avoid wasting headroom
+// H before the window resets in T hours, you must spend H/T per hour. The
+// account facing the highest required burn rate is the one closest to losing
+// capacity, so the score is the largest such rate across the windows binding
+// this model.
+//
+// Headroom is weighted by the window's own length. Utilization is a fraction of
+// that window's limit, and the limits are not the same size — losing 90% of a
+// weekly allowance is a far bigger loss than 90% of a five-hour one. Taking the
+// bare minimum reset across buckets, as this function used to, made the 5h
+// window dominate the key (it nearly always resets sooner) and left an expiring
+// weekly window invisible.
+//
+// The upstream never reports absolute limits, so window duration stands in for
+// relative capacity. That is an approximation, and it deliberately errs toward
+// draining long windows — which is the intent: a weekly allowance wasted is gone
+// for a week, while a 5h allowance regenerates before the day is out.
+//
+// Returns 0 when nothing can be scored — no buckets, unknown resets, resets
+// already in the past, or no headroom left.
+func expiringAllowance(a *Account, model string, nowMS int64) float64 {
+	var best float64
 	for name, b := range a.Buckets {
 		if !BucketAppliesTo(name, model) || b.ResetsAt == 0 {
 			continue
 		}
-		if best == 0 || b.ResetsAt < best {
-			best = b.ResetsAt
+		hoursLeft := float64(b.ResetsAt-nowMS) / float64(time.Hour/time.Millisecond)
+		if hoursLeft <= 0 {
+			// Stale or just reset. Not an infinitely urgent window: dividing by
+			// a non-positive remainder would score it above every real
+			// candidate and pin selection to the oldest reading we hold.
+			continue
+		}
+		headroom := 1 - b.Utilization
+		if headroom <= 0 {
+			continue
+		}
+		if rate := headroom * windowHours(name) / hoursLeft; rate > best {
+			best = rate
 		}
 	}
 	return best
+}
+
+// windowHours is the length of a named quota window ("5h", "7d", "7d_oi"),
+// standing in for how much allowance it holds. An unrecognised shape weighs 1,
+// which keeps it in the ranking without letting it dominate one.
+func windowHours(name string) float64 {
+	if i := strings.Index(name, "_"); i > 0 {
+		name = name[:i] // "7d_oi" -> "7d"
+	}
+	if len(name) < 2 {
+		return 1
+	}
+	n, err := strconv.Atoi(name[:len(name)-1])
+	if err != nil || n <= 0 {
+		return 1
+	}
+	switch name[len(name)-1] {
+	case 'h':
+		return float64(n)
+	case 'd':
+		return float64(n) * 24
+	case 'w':
+		return float64(n) * 24 * 7
+	}
+	return 1
 }

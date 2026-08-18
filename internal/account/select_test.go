@@ -172,6 +172,118 @@ func TestSelectPrefersKnownResetOverUnknown(t *testing.T) {
 	}
 }
 
+// The case the old min-across-buckets key could not see. Every account carries
+// both a 5h and a 7d window, and the 5h almost always resets sooner, so taking
+// the minimum made the sort key effectively "whose 5h resets first" and an
+// expiring WEEKLY window invisible.
+//
+// Here "weekly" is about to lose nearly a full weekly allowance in three hours;
+// "fivehour" loses half a 5h allowance in thirty minutes and regenerates it
+// five hours later. The weekly loss is the larger one and must win.
+func TestSelectPrefersAnExpiringWeeklyOverAnImminentFiveHour(t *testing.T) {
+	m := mgr(t, acct("fivehour", 0), acct("weekly", 0))
+	now := time.Now()
+	m.UpdateQuota("fivehour", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.5, ResetsAt: now.Add(30 * time.Minute).UnixMilli()},
+		{Name: "7d", Utilization: 0.5, ResetsAt: now.Add(6 * 24 * time.Hour).UnixMilli()},
+	})
+	m.UpdateQuota("weekly", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.5, ResetsAt: now.Add(45 * time.Minute).UnixMilli()},
+		{Name: "7d", Utilization: 0.1, ResetsAt: now.Add(3 * time.Hour).UnixMilli()},
+	})
+
+	got, _ := m.Select(SelectRequest{})
+	if got.ID != "weekly" {
+		t.Errorf("selected %q, want weekly — a nearly-unused weekly window expiring in 3h "+
+			"is a bigger loss than half a 5h window expiring in 30m", got.ID)
+	}
+}
+
+// An imminent reset on a window with nothing left in it is not an opportunity.
+// Ranking on reset time alone would send traffic to an account that can only
+// answer with a 429 and a rotation.
+func TestSelectIgnoresAnExpiringWindowWithNoHeadroomLeft(t *testing.T) {
+	m := mgr(t, acct("spent", 0), acct("roomy", 0))
+	now := time.Now()
+	m.UpdateQuota("spent", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.97, ResetsAt: now.Add(30 * time.Minute).UnixMilli()},
+	})
+	m.UpdateQuota("roomy", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.2, ResetsAt: now.Add(4 * time.Hour).UnixMilli()},
+	})
+
+	got, _ := m.Select(SelectRequest{})
+	if got.ID != "roomy" {
+		t.Errorf("selected %q, want roomy — 3%% of a window expiring in 30m is not worth chasing", got.ID)
+	}
+}
+
+// A reset timestamp already in the past is stale data, not an infinitely urgent
+// window. Dividing by a non-positive remaining time would score it above every
+// real candidate and pin selection to whichever account had the oldest reading.
+func TestSelectIgnoresAResetAlreadyInThePast(t *testing.T) {
+	m := mgr(t, acct("stale", 0), acct("live", 0))
+	now := time.Now()
+	m.UpdateQuota("stale", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.1, ResetsAt: now.Add(-10 * time.Minute).UnixMilli()},
+	})
+	m.UpdateQuota("live", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.5, ResetsAt: now.Add(30 * time.Minute).UnixMilli()},
+	})
+
+	got, _ := m.Select(SelectRequest{})
+	if got.ID != "live" {
+		t.Errorf("selected %q, want live — a reset in the past must not outrank a real window", got.ID)
+	}
+}
+
+// A model-scoped window must only weigh on requests for that model. Without
+// this, an exhausted Opus weekly window would drag Sonnet traffic off an
+// account that has plenty of Sonnet allowance left.
+func TestSelectScoresModelScopedWindowsOnlyForThatModel(t *testing.T) {
+	m := mgr(t, acct("opusheavy", 0), acct("plain", 0))
+	now := time.Now()
+	m.UpdateQuota("opusheavy", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.9, ResetsAt: now.Add(4 * time.Hour).UnixMilli()},
+		{Name: "7d_opus", Utilization: 0.05, ResetsAt: now.Add(2 * time.Hour).UnixMilli()},
+	})
+	m.UpdateQuota("plain", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.5, ResetsAt: now.Add(4 * time.Hour).UnixMilli()},
+	})
+
+	// For Opus the nearly-untouched weekly Opus window expiring in 2h dominates.
+	if got, _ := m.Select(SelectRequest{Model: "claude-opus-5"}); got.ID != "opusheavy" {
+		t.Errorf("opus selected %q, want opusheavy — its opus weekly window is about to expire unused", got.ID)
+	}
+	// For Sonnet that window does not apply, leaving only the 5h comparison.
+	if got, _ := m.Select(SelectRequest{Model: "claude-sonnet-5"}); got.ID != "plain" {
+		t.Errorf("sonnet selected %q, want plain — an opus-scoped window must not steer sonnet", got.ID)
+	}
+}
+
+func TestWindowHours(t *testing.T) {
+	cases := []struct {
+		name string
+		want float64
+	}{
+		{"5h", 5},
+		{"7d", 168},
+		{"7d_oi", 168},
+		{"7d_opus", 168},
+		{"1w", 168},
+		{"", 1},
+		{"h", 1},
+		{"xd", 1},
+		{"0h", 1},
+		{"5y", 1}, // unrecognised unit weighs 1 rather than guessing
+	}
+	for _, c := range cases {
+		if got := windowHours(c.name); got != c.want {
+			t.Errorf("windowHours(%q) = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // A paused account stays selectable (a hinted throttle should queue requests
 // on the same warm account rather than push the burst elsewhere) but must not
 // be preferred over a healthy one.

@@ -347,6 +347,38 @@ Per-screen keys are shown in the footer: `space` pauses the activity feed,
 (account, model, outcome); on Accounts, `e` toggles enabled, `+`/`-` change
 priority, `x` removes, and `enter` opens detail.
 
+## Which account gets picked
+
+Selection sorts eligible accounts by, in order: unpaused before paused, then
+priority ascending, then **how much unused allowance is about to be wasted**,
+then account ID as a deterministic backstop.
+
+That third key is the interesting one. Each quota window is scored by the rate
+you would have to spend at to avoid wasting it — headroom divided by the time
+left before it resets — and an account is ranked by its most urgent window. The
+effect is use-it-or-lose-it: given two accounts at the same priority, traffic
+concentrates on whichever one is closest to throwing capacity away, rather than
+being spread evenly or pinned to whichever happens to sort first by name.
+
+Headroom is weighted by the window's own length, because `utilization` is a
+fraction of that window's limit and the limits are not the same size. Losing 90%
+of a weekly allowance is a much larger loss than 90% of a five-hour one, and the
+weekly one is gone for a week where the 5h regenerates before the day is out.
+The upstream never reports absolute limits, so window duration stands in for
+relative capacity — an approximation that deliberately errs toward draining long
+windows. Without the weighting the 5h window dominates the ranking, since it
+almost always resets sooner, and an expiring weekly window is invisible.
+
+Windows with no headroom left, unknown reset times, or reset timestamps already
+in the past score nothing, so an imminent reset on an exhausted window is not
+mistaken for an opportunity and an account carrying no quota data at all sorts
+last instead of first.
+
+This ranking is only as good as the quota data behind it. An account with no
+observed buckets scores zero, which is why the probe renews credentials and runs
+once at startup — see `quotaProbe.intervalSeconds` under
+[Configuration](#configuration).
+
 ## Overloaded upstreams
 
 Anthropic answers `529` with `overloaded_error` when the API itself is out of
@@ -412,7 +444,9 @@ that read those values are built once at startup.
   non-loopback callers, so a local agent needs no credential.
 - **`routing.switchThreshold`** is the utilization at which an account stops
   being selected. **`sessionAffinity`** keeps one conversation on one account
-  while that account still has room. **`blockedModels`** takes globs.
+  while that account still has room. **`blockedModels`** takes globs. Accounts
+  of equal priority are ordered by how much allowance they are about to waste —
+  see [Which account gets picked](#which-account-gets-picked).
 - **`retry.budgetMs`** bounds only the time *aiproxy* adds before the first
   byte — backoff, waiting on a paused account, absorbing a rate limit,
   refreshing a credential. **`headerTimeoutMs`** bounds one attempt's wait for
