@@ -93,13 +93,21 @@ func TestRulesDetectCredentialsInAURL(t *testing.T) {
 
 // A colon-separated id:secret pair must still fire even though a
 // digest-shaped allowlist entry also uses a colon. An NTLM LM:NT hash pair is
-// directly usable for pass-the-hash, and a Twilio-style
-// ACCOUNT_SID:AUTH_TOKEN is the exact shape Twilio's own docs use for Basic
-// Auth (`curl -u SID:TOKEN`) — neither is a digest, and the allowlist's
+// directly usable for pass-the-hash, and a real Twilio ACCOUNT_SID:AUTH_TOKEN
+// pair is the exact shape Twilio's own docs use for Basic Auth
+// (`curl -u SID:TOKEN`) — neither is a digest, and the allowlist's
 // algorithm-name enumeration must not match either.
 func TestRulesDetectColonSeparatedCredentials(t *testing.T) {
 	cases := []struct{ name, text string }{
 		{"ntlm hash pair", `password: aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0`},
+		// A real Twilio pair is AC + 32 hex, a colon, then a 32-hex auth token.
+		// The shape matters twice over: the enumerated digest allowlist must not
+		// mask it, and the key containing "token" is what brings it inside the
+		// assigned-credential rule. An earlier synthetic version of this fixture
+		// used repeated-character runs, which scored 1.29 bits/byte and could
+		// never clear the entropy floor — a fixture that cannot fire is not a
+		// regression test.
+		{"twilio sid and auth token", `TWILIO_AUTH_TOKEN=ACf3a91b7d2e4c6805a1b2c3d4e5f60718:9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f40`},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -114,16 +122,13 @@ func TestRulesDetectColonSeparatedCredentials(t *testing.T) {
 // TestAllowedRejectsColonSeparatedCredentialShapes guards the allowlist half
 // of the fix directly: Allowed must not itself call a colon-separated
 // id:secret pair benign, independent of whether any current rule's keyword
-// list happens to capture it end to end. See the fix-round-2 report for why
-// the Twilio fixture below is not also asserted through Scan: as written
-// (two runs of a single repeated character) it measures ~1.29 bits/byte,
-// under the frozen 3.0 MinEntropy floor, and no keyword in the
-// assigned-credential rule contains "auth" — neither of which this task
-// authorized changing.
+// list happens to capture it end to end. The Twilio value here is the
+// assertion that would catch someone widening the digest prefix class back
+// into an open character class.
 func TestAllowedRejectsColonSeparatedCredentialShapes(t *testing.T) {
 	for _, s := range []string{
 		"aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
-		"ACaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"ACf3a91b7d2e4c6805a1b2c3d4e5f60718:9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f40",
 	} {
 		if Allowed(s) {
 			t.Errorf("Allowed(%q) = true; a colon-separated credential pair must not be allowlisted", s)
