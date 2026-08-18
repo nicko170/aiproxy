@@ -117,6 +117,9 @@ func (d *Detector) Name() string { return "rules" }
 // Safe for concurrent use: regexp.Regexp is, and nothing here is mutated after
 // New.
 func (d *Detector) Scan(_ context.Context, text string) ([]privacy.Finding, error) {
+	if len(text) < privacy.MinScanBytes {
+		return nil, nil
+	}
 	var out []privacy.Finding
 	for _, r := range d.rules {
 		for _, m := range r.Re.FindAllStringSubmatchIndex(text, -1) {
