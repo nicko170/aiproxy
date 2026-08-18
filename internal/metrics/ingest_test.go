@@ -51,6 +51,15 @@ func TestRecordPersistsRows(t *testing.T) {
 
 // Invariant 3: Record must never block, even when the writer cannot keep up.
 // A full buffer drops and counts, it does not wait.
+//
+// The writer must be genuinely prevented from draining the channel, not merely
+// slowed. The writer goroutine's for-select loop drains i.ch continuously
+// whether or not a batch is ever flushed to the store, so a large FlushInterval
+// alone does not stop it from keeping the buffer empty — whether the buffer
+// ever truly filled during a 500-Record burst came down to a scheduler race,
+// which made `Dropped() == 0` a flaky gate on the very invariant this test
+// exists to enforce. Holding the writer goroutine back from starting at all,
+// until after every Record has returned, makes the fill deterministic.
 func TestRecordNeverBlocksWhenTheBufferIsFull(t *testing.T) {
 	s, err := OpenMemory()
 	if err != nil {
@@ -58,10 +67,18 @@ func TestRecordNeverBlocksWhenTheBufferIsFull(t *testing.T) {
 	}
 	defer s.Close()
 
-	// A tiny buffer and a writer that is not running: every Record after the
-	// buffer fills must drop rather than block.
-	ing := NewIngester(s, IngestOptions{BufferSize: 4, FlushInterval: time.Hour, BatchSize: 1000})
-	defer ing.Close()
+	ing := newIngester(s, IngestOptions{BufferSize: 4, FlushInterval: time.Hour, BatchSize: 1000})
+	hold := make(chan struct{})
+	go func() {
+		<-hold
+		ing.run()
+	}()
+	defer func() {
+		close(hold)
+		if err := ing.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	}()
 
 	done := make(chan struct{})
 	go func() {
@@ -77,8 +94,11 @@ func TestRecordNeverBlocksWhenTheBufferIsFull(t *testing.T) {
 		t.Fatal("Record blocked — accounting must never delay a proxied request")
 	}
 
-	if ing.Dropped() == 0 {
-		t.Error("expected drops to be counted when the buffer overflows")
+	// The writer has not even started yet at this point (still parked on hold),
+	// so every Record beyond the 4-entry buffer MUST have dropped.
+	if want := int64(500 - 4); ing.Dropped() != want {
+		t.Errorf("Dropped() = %d, want %d — the 4-entry buffer should have overflowed "+
+			"deterministically with the writer held back", ing.Dropped(), want)
 	}
 }
 
@@ -158,5 +178,91 @@ func TestConcurrentRecordersAllLand(t *testing.T) {
 	s.DB().QueryRow(`SELECT count(*) FROM requests`).Scan(&n)
 	if n+ing.Dropped() != writers*each {
 		t.Errorf("persisted %d + dropped %d != %d recorded", n, ing.Dropped(), writers*each)
+	}
+}
+
+// The strongest possible violation of invariant 3: a panic in the batch write
+// path — a SQLite driver bug, a nil dereference — must not take the writer
+// goroutine, and with it the whole process and every in-flight proxied
+// request, down. It must be recovered, the faulting batch dropped and
+// counted, and the writer must keep running for the next one.
+//
+// writeFunc is substituted BEFORE the writer goroutine starts (via newIngester
+// rather than NewIngester) so the override is visible without a data race:
+// nothing else touches the field once run() begins reading it.
+func TestWriterSurvivesAPanicInTheBatchWriteAndKeepsRunning(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ing := newIngester(s, IngestOptions{})
+	real := ing.writeFunc
+	var calls int
+	ing.writeFunc = func(batch []entry) error {
+		calls++
+		if calls == 1 {
+			panic("simulated SQLite driver panic")
+		}
+		return real(batch)
+	}
+	go ing.run()
+	defer ing.Close()
+
+	// The first batch faults. It must not crash the writer, and it must be
+	// counted rather than silently lost.
+	ing.Record(sample(1, "a", "m", 1, 1))
+	if err := ing.Flush(); err == nil {
+		t.Error("Flush should surface the recovered panic as an error")
+	}
+	if ing.Dropped() == 0 {
+		t.Error("the panicking batch must be counted as dropped, not lost invisibly")
+	}
+
+	// The writer must still be alive to serve a later, healthy sample.
+	ing.Record(sample(2, "a", "m", 2, 2))
+	if err := ing.Flush(); err != nil {
+		t.Fatalf("writer did not survive the panic: %v", err)
+	}
+
+	var n int
+	if err := s.DB().QueryRow(`SELECT count(*) FROM requests`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("rows = %d, want 1 — only the sample recorded after the panic should have landed", n)
+	}
+}
+
+// Spec §7.3: degradation must be visible, not invisible. Once the writer has
+// stopped, a Record must not sit forever in the channel's own buffer,
+// unwritten and uncounted — it must be visibly dropped, exactly like a Record
+// against a full buffer.
+func TestRecordAfterCloseCountsAsDropped(t *testing.T) {
+	s, err := OpenMemory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	ing := NewIngester(s, IngestOptions{})
+	if err := ing.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	before := ing.Dropped()
+	ing.Record(sample(1, "a", "m", 1, 1))
+	ing.RecordQuota(QuotaSample{At: 1, AccountID: "a", Bucket: "5h", Utilization: 0.1})
+
+	if got, want := ing.Dropped(), before+2; got != want {
+		t.Errorf("Dropped() = %d, want %d — Record and RecordQuota after Close must count as drops",
+			got, want)
+	}
+
+	var n int
+	s.DB().QueryRow(`SELECT count(*) FROM requests`).Scan(&n)
+	if n != 0 {
+		t.Errorf("rows = %d, want 0 — nothing recorded after Close should ever be written", n)
 	}
 }

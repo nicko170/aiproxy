@@ -138,6 +138,13 @@ type Attempter struct {
 	rt        http.RoundTripper
 	cfg       RetryConfig
 	log       *slog.Logger
+
+	// OnResult, when set, receives every completed attempt — including one that
+	// ends in panic(http.ErrAbortHandler) on a truncated relay. It is invoked
+	// from Do's own deferred block for exactly that reason: a caller that reads
+	// Do's return value cannot see it on the panic path, since the panic unwinds
+	// past the return entirely. See the defer in Do.
+	OnResult func(Request, Result)
 }
 
 func NewAttempter(m *account.Manager, providers map[string]provider.Provider, rt http.RoundTripper, cfg RetryConfig, log *slog.Logger) *Attempter {
@@ -185,11 +192,26 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 	defer func() {
 		res.WaitMS = a.cfg.Budget.Milliseconds() - budget.Remaining().Milliseconds()
 		res.DurationMS = time.Since(started).Milliseconds()
+		// Invoked from THIS defer, not by the caller after Do returns: a defer
+		// runs during panic unwinding, before the panic continues up the stack,
+		// so this is the one place that observes a truncated relay's result. The
+		// panic is not recovered here — http.ErrAbortHandler must keep propagating
+		// so net/http still severs the connection instead of finishing it cleanly.
+		if a.OnResult != nil {
+			a.OnResult(req, res)
+		}
 	}()
 
 	for {
 		if ctx.Err() != nil {
-			res.Outcome = provider.OutcomeServerError
+			// The CLIENT's context is what is checked here, not an upstream
+			// response — a hang-up (Ctrl-C on a streaming agent) is routine and is
+			// neither a genuine upstream 5xx nor a local admission failure.
+			// OutcomeServerError is deliberately narrowed to mean the former;
+			// reporting it here would permanently pollute the upstream-error rate
+			// in every outcome breakdown with disconnects that were never upstream's
+			// doing.
+			res.Outcome = provider.OutcomeClientDisconnected
 			return res
 		}
 		if budget.Exhausted() {

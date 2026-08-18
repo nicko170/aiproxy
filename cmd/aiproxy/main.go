@@ -80,7 +80,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 	}
 	defer db.Close()
 
-	ing := metrics.NewIngester(db, metrics.IngestOptions{})
+	ing := metrics.NewIngester(db, metrics.IngestOptions{Log: log})
 	defer ing.Close()
 
 	roller := metrics.NewRoller(db, time.Minute, log)

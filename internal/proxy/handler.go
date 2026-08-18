@@ -107,7 +107,16 @@ type HandlerOptions struct {
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
+//
+// OnResult is wired onto the Attempter itself, once, here — NOT called after
+// Do returns below. Do panics with http.ErrAbortHandler on a truncated relay,
+// which unwinds straight past a call site here; the only place that survives
+// that unwind is Do's own deferred block; see the defer in Do and the comment
+// on Attempter.OnResult.
 func proxyHandler(o HandlerOptions) http.HandlerFunc {
+	if o.Attempter != nil {
+		o.Attempter.OnResult = o.OnResult
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The reserved namespace is refused HERE, at the point of harm, rather
 		// than only in the router. chi matches on r.URL.RawPath when it is set, so
@@ -157,10 +166,10 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			}
 		}
 
-		res := o.Attempter.Do(r.Context(), w, req)
-		if o.OnResult != nil {
-			o.OnResult(req, res)
-		}
+		// The result is reported to o.OnResult from inside Do itself (see above),
+		// including on the panic path, so nothing further happens with the return
+		// value here.
+		o.Attempter.Do(r.Context(), w, req)
 	}
 }
 

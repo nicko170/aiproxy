@@ -529,6 +529,46 @@ func TestAttemptWritesBadGatewayWhenAdmissionFailsLocally(t *testing.T) {
 	}
 }
 
+// A client that has already hung up (Ctrl-C on a streaming agent — routine,
+// not exceptional) must be reported as such, and not as OutcomeServerError.
+// That kind is deliberately narrowed to mean a genuine upstream 5xx actually
+// received; folding a disconnect into it would permanently pollute the
+// upstream-error rate in every outcome breakdown with hang-ups that were never
+// upstream's doing.
+func TestAttemptReportsClientDisconnectedWhenTheCallerContextIsAlreadyDone(t *testing.T) {
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: `{"ok":true}`})
+	p := anthropic.New(http.DefaultClient)
+	p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	providers := map[string]provider.Provider{"anthropic": p}
+	mgr := account.New([]config.Account{{
+		ID: "acct-0", Provider: "anthropic", Label: "acct-0", Upstream: up.URL(),
+		Credential: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+		},
+	}}, providers, account.Options{
+		SwitchThreshold: 0.98,
+		Persist:         func(string, provider.Credential) error { return nil },
+	})
+	at := NewAttempter(mgr, providers, NewTransport(TransportOptions{}), defaultRetry(), quietLogger())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // the client is already gone before Do is even called
+
+	rec := httptest.NewRecorder()
+	res := at.Do(ctx, rec, Request{
+		Method: "POST", Path: "/v1/messages", Header: http.Header{},
+		Body: []byte(`{"model":"claude-sonnet-5"}`), Model: "claude-sonnet-5",
+	})
+
+	if res.Outcome != provider.OutcomeClientDisconnected {
+		t.Errorf("Outcome = %v, want client_disconnected", res.Outcome)
+	}
+	if n := len(up.Requests()); n != 0 {
+		t.Errorf("upstream saw %d requests; a disconnected client must not still be served", n)
+	}
+}
+
 // A request answered without a single upstream attempt must not report the zero
 // value of OutcomeKind, which reads as "ok" — a failure logged as a success, and
 // one stage 2 would persist into its outcome breakdown.
@@ -1247,6 +1287,51 @@ func truncatingUpstream(t *testing.T) string {
 	return "http://" + ln.Addr().String()
 }
 
+// truncatingUpstreamWithUsage behaves like truncatingUpstream, but reports
+// usage on a message_start event before the stream breaks. That lets a test
+// assert that a mid-stream failure still records the tokens actually spent
+// before the break, rather than nothing at all.
+func truncatingUpstreamWithUsage(t *testing.T, inputTokens int64) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				io.WriteString(c, "HTTP/1.1 200 OK\r\n"+
+					"Content-Type: text/event-stream\r\n"+
+					"Transfer-Encoding: chunked\r\n\r\n")
+				payload := fmt.Sprintf(
+					"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":%d}}}\n\n",
+					inputTokens)
+				fmt.Fprintf(c, "%x\r\n%s\r\n", len(payload), payload)
+				// No terminating chunk: the stream just stops here, same as
+				// truncatingUpstream — the point is what happened before the break.
+			}(c)
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
 func attempterServerAt(t *testing.T, upstreamURL string, cfg RetryConfig) *httptest.Server {
 	t.Helper()
 	p := anthropic.New(http.DefaultClient)
@@ -1298,5 +1383,82 @@ func TestAttemptDoesNotEndATruncatedStreamCleanly(t *testing.T) {
 	}
 	if readErr == nil || errors.Is(readErr, io.EOF) {
 		t.Fatalf("read ended with %v; a truncated stream must not look like a clean finish", readErr)
+	}
+}
+
+// A truncated stream must still produce a result — the tokens spent before the
+// break — and not vanish from the accounting entirely.
+//
+// Before the fix, the caller (proxy/handler.go) invoked OnResult only AFTER
+// Do returned; Do's panic(http.ErrAbortHandler) on this exact path unwinds
+// straight past that call, so a truncated relay contributed no metrics row at
+// all. That inverts the point of the breakdown: the failures a dashboard most
+// needs to see are precisely the ones that would be missing.
+func TestAttemptRecordsResultOnATruncatedStreamEvenThoughItPanics(t *testing.T) {
+	upstreamURL := truncatingUpstreamWithUsage(t, 37)
+
+	p := anthropic.New(http.DefaultClient)
+	p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	providers := map[string]provider.Provider{"anthropic": p}
+	mgr := account.New([]config.Account{{
+		ID: "acct-0", Provider: "anthropic", Label: "acct-0", Upstream: upstreamURL,
+		Credential: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+		},
+	}}, providers, account.Options{
+		SwitchThreshold: 0.98,
+		Persist:         func(string, provider.Credential) error { return nil },
+	})
+	at := NewAttempter(mgr, providers, NewTransport(TransportOptions{}), defaultRetry(), quietLogger())
+
+	var mu sync.Mutex
+	var got Result
+	recorded := false
+	at.OnResult = func(_ Request, r Result) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = r
+		recorded = true
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		// No recover here, deliberately: net/http's own server loop special-cases
+		// http.ErrAbortHandler, the same as it does in production, so this proves
+		// OnResult survives the panic without depending on chi's Recoverer.
+		at.Do(r.Context(), w, Request{
+			Method: r.Method, Path: r.URL.RequestURI(), Header: r.Header.Clone(),
+			Body: body, Model: "claude-sonnet-5",
+		})
+	}))
+	defer srv.Close()
+
+	res, err := http.Post(srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer res.Body.Close()
+
+	// The client must NOT see a clean short 200 — same guarantee as the sibling
+	// test above, restated here because it is the other half of the point: a
+	// truncated stream must be both reported AND still broken for the client.
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200 (headers were already sent upstream)", res.StatusCode)
+	}
+	_, readErr := io.ReadAll(res.Body)
+	if readErr == nil || errors.Is(readErr, io.EOF) {
+		t.Fatalf("read ended with %v; a truncated stream must not look like a clean finish", readErr)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !recorded {
+		t.Fatal("no result was recorded for the truncated stream — the panic unwound past OnResult")
+	}
+	if got.InputTokens != 37 {
+		t.Errorf("InputTokens = %d, want 37 — tokens spent before the break must still be counted",
+			got.InputTokens)
 	}
 }

@@ -29,11 +29,14 @@ func TestOutcomeKindNumberingIsStable(t *testing.T) {
 	if int(provider.OutcomeUpstreamError) <= 8 || int(provider.OutcomeAdmissionError) <= 8 {
 		t.Error("new outcome kinds must be appended, not inserted")
 	}
+	if int(provider.OutcomeClientDisconnected) <= int(provider.OutcomeAdmissionError) {
+		t.Error("OutcomeClientDisconnected must be appended after OutcomeAdmissionError, not inserted")
+	}
 }
 
 func TestOutcomeKindStringsAreDistinct(t *testing.T) {
 	seen := map[string]bool{}
-	for k := provider.OutcomeOK; k <= provider.OutcomeAdmissionError; k++ {
+	for k := provider.OutcomeOK; k <= provider.OutcomeClientDisconnected; k++ {
 		s := k.String()
 		if s == "unknown" {
 			t.Errorf("%d has no String() case", int(k))

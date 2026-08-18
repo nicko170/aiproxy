@@ -65,6 +65,20 @@ func TestOpenEnforcesPermissions(t *testing.T) {
 	if perm := di.Mode().Perm(); perm != 0o700 {
 		t.Errorf("dir perm = %o, want 700", perm)
 	}
+
+	// WAL mode's own -wal and -shm files hold the same usage history and are
+	// created during migrate(), before the main file's Chmod — so without their
+	// own Chmod they are left world-readable at the process umask even though
+	// the main file is locked down.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		fi, err := os.Stat(path + suffix)
+		if err != nil {
+			t.Fatalf("stat %s%s: %v", path, suffix, err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s perm = %o, want 600", suffix, perm)
+		}
+	}
 }
 
 // Opening an existing database must be idempotent, not destructive.

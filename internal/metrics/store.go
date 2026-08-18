@@ -41,6 +41,18 @@ func Open(path string) (*Store, error) {
 		s.Close()
 		return nil, fmt.Errorf("chmod metrics db: %w", err)
 	}
+	// WAL mode's own -wal and -shm files hold the same usage history as the main
+	// database file and are created during migrate() above, before this point —
+	// so without this they are left at the process umask (typically 0644,
+	// world-readable) even though the main file is locked down to 0600 right
+	// above. Tolerate NotExist: a driver that has already checkpointed and
+	// removed them leaves nothing to chmod.
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.Chmod(path+suffix, 0o600); err != nil && !os.IsNotExist(err) {
+			s.Close()
+			return nil, fmt.Errorf("chmod metrics %s: %w", suffix, err)
+		}
+	}
 	return s, nil
 }
 

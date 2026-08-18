@@ -92,6 +92,18 @@ const (
 	OutcomeUpstreamError
 	// OutcomeAdmissionError is a local failure before any request was sent.
 	OutcomeAdmissionError
+	// OutcomeClientDisconnected is the proxy's own verdict when the CLIENT's
+	// context is already done at the top of the attempt loop — a hang-up, not a
+	// genuine upstream failure. It exists because that branch used to report
+	// OutcomeServerError, which is deliberately narrowed to mean a real upstream
+	// 5xx actually received; a client going away (Ctrl-C on a streaming agent,
+	// routinely) is neither that nor a local admission failure, and folding it
+	// into OutcomeServerError permanently polluted the upstream-error rate in
+	// every outcome breakdown.
+	//
+	// Appended here, after OutcomeAdmissionError: see the note above about why
+	// new kinds append rather than insert.
+	OutcomeClientDisconnected
 )
 
 func (k OutcomeKind) String() string {
@@ -118,6 +130,8 @@ func (k OutcomeKind) String() string {
 		return "upstream_error"
 	case OutcomeAdmissionError:
 		return "admission_error"
+	case OutcomeClientDisconnected:
+		return "client_disconnected"
 	}
 	return "unknown"
 }

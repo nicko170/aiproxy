@@ -21,6 +21,12 @@ var sseTerminator = []byte("\n\n")
 // maxUsageCapture bounds how much of a non-streaming body is retained to read
 // its usage envelope. Usage sits near the end of a message response, but a
 // pathological body must not be held in memory without limit.
+//
+// KNOWN LIMITATION, not covered by this round: capture retains the body's HEAD
+// while usage sits at the TAIL, so a non-streaming response larger than this
+// cap records zero tokens rather than the true count. Left as-is deliberately —
+// zeros beat wrong numbers, and a non-streaming body this large is rare — but a
+// future reader should not mistake the silence here for the cap being handled.
 const maxUsageCapture = 1 << 20 // 1 MiB
 
 // RelayOptions configures one relay.

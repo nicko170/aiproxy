@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,9 @@ type IngestOptions struct {
 	BufferSize    int
 	FlushInterval time.Duration
 	BatchSize     int
+	// Log receives the writer's own diagnostics: a batch that failed or
+	// panicked, dropped rather than fatal. Nil takes slog.Default().
+	Log *slog.Logger
 }
 
 type entry struct {
@@ -32,7 +36,14 @@ type Ingester struct {
 	store   *Store
 	ch      chan entry
 	opts    IngestOptions
+	log     *slog.Logger
 	dropped atomic.Int64
+
+	// writeFunc performs one batch write. It defaults to (*Ingester).write and is
+	// a field — rather than a direct call to that method — solely so a test can
+	// substitute a fault and prove the writer survives a panic in the batch path
+	// without depending on a real SQLite failure to produce one.
+	writeFunc func([]entry) error
 
 	// flushed signals the writer has drained everything queued before it.
 	flushReq chan chan error
@@ -42,7 +53,18 @@ type Ingester struct {
 	stopped   chan struct{}
 }
 
+// NewIngester builds the ingester and starts its writer goroutine.
 func NewIngester(s *Store, opts IngestOptions) *Ingester {
+	ing := newIngester(s, opts)
+	go ing.run()
+	return ing
+}
+
+// newIngester builds the ingester WITHOUT starting its writer goroutine, so a
+// test can arrange for the writer to start later — or substitute writeFunc
+// first — without racing the goroutine NewIngester would otherwise launch
+// immediately.
+func newIngester(s *Store, opts IngestOptions) *Ingester {
 	if opts.BufferSize <= 0 {
 		opts.BufferSize = 4096
 	}
@@ -52,21 +74,37 @@ func NewIngester(s *Store, opts IngestOptions) *Ingester {
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 100
 	}
+	log := opts.Log
+	if log == nil {
+		log = slog.Default()
+	}
 	ing := &Ingester{
 		store:    s,
 		ch:       make(chan entry, opts.BufferSize),
 		opts:     opts,
+		log:      log,
 		flushReq: make(chan chan error, 1),
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
 	}
-	go ing.run()
+	ing.writeFunc = ing.write
 	return ing
 }
 
 // Record queues a completed request. It never blocks: a full buffer drops the
-// sample and increments the drop counter.
+// sample and increments the drop counter — and so does a send after the writer
+// has already stopped, which would otherwise land in the channel's own buffer
+// and sit there forever, uncounted and never written. The stopped check is
+// deliberately tried FIRST: still non-blocking (both arms have a default), but
+// it is what keeps a post-Close sample from being silently swallowed instead of
+// visibly dropped (spec §7.3).
 func (i *Ingester) Record(s Sample) {
+	select {
+	case <-i.stopped:
+		i.dropped.Add(1)
+		return
+	default:
+	}
 	select {
 	case i.ch <- entry{sample: &s}:
 	default:
@@ -74,8 +112,15 @@ func (i *Ingester) Record(s Sample) {
 	}
 }
 
-// RecordQuota queues a quota observation under the same no-blocking contract.
+// RecordQuota queues a quota observation under the same no-blocking,
+// stopped-checked-first contract as Record.
 func (i *Ingester) RecordQuota(q QuotaSample) {
+	select {
+	case <-i.stopped:
+		i.dropped.Add(1)
+		return
+	default:
+	}
 	select {
 	case i.ch <- entry{quota: &q}:
 	default:
@@ -123,8 +168,16 @@ func (i *Ingester) run() {
 		if len(batch) == 0 {
 			return nil
 		}
-		err := i.write(batch)
+		n := len(batch)
+		err := i.writeRecovered(batch)
 		batch = batch[:0]
+		// Every caller of writeBatch — the shutdown path, the periodic ticker,
+		// and Flush — used to discard this error. A whole batch silently missing
+		// is exactly the kind of gap that only shows up much later as unexplained
+		// holes in the accounting; logging it here means it doesn't have to.
+		if err != nil {
+			i.log.Error("metrics batch write failed; batch dropped", "err", err, "batchSize", n)
+		}
 		return err
 	}
 
@@ -161,6 +214,26 @@ func (i *Ingester) drain(batch *[]entry) {
 			return
 		}
 	}
+}
+
+// writeRecovered runs writeFunc (ordinarily (*Ingester).write) with a panic
+// recovered.
+//
+// Spec invariant 3 makes the ingester the one component whose entire job is
+// protecting the request path; an unrecovered panic here — a SQLite driver
+// bug, a nil dereference somewhere in the batch path — would otherwise take
+// the whole process down, and with it every in-flight proxied request. A
+// batch that faults this way cannot be salvaged, so it is dropped and counted
+// rather than fatal: run's for-select loop, and the writer goroutine, keep
+// going for the next one.
+func (i *Ingester) writeRecovered(batch []entry) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			i.dropped.Add(int64(len(batch)))
+			err = fmt.Errorf("metrics writer recovered from panic: %v", r)
+		}
+	}()
+	return i.writeFunc(batch)
 }
 
 func (i *Ingester) write(batch []entry) error {
