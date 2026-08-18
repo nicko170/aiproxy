@@ -5,7 +5,6 @@ x aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight
                                                             
                                                             
                                                             
-                                                            
 ╭───────────────────────────────────────────────────────────
 │                                                           
 │   no accounts yet                                         
@@ -16,10 +15,11 @@ x aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight
 │     l  log in with Anthropic                              
 │     4  open accounts to import from Claude Code           
 │                                                           
-│   then point your client at ANTHROPIC_BASE_URL=http://127.
+│   then export both before starting Claude Code:           
+│     ANTHROPIC_BASE_URL=http://127.0.0.1:8118              
+│     _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1            
 │                                                           
 ╰───────────────────────────────────────────────────────────
-                                                            
                                                             
                                                             
                                                             

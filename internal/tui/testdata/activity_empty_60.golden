@@ -10,13 +10,13 @@
                                                             
                                                             
                                                             
-                                                            
 ╭───────────────────────────────────────────────────────────
 │                                                           
-│   waiting for the first request — point your client at ANT
+│   waiting for the first request — export both for Claude C
+│   ANTHROPIC_BASE_URL=http://127.0.0.1:8118                
+│   _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1              
 │                                                           
 ╰───────────────────────────────────────────────────────────
-                                                            
                                                             
                                                             
                                                             

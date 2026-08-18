@@ -79,6 +79,21 @@ func TestActivityRingIsBounded(t *testing.T) {
 	}
 }
 
+func TestClaudeCodeHintsPreserveNativeContextWindow(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.accounts = nil
+	if got := m.viewNoAccounts(24); !strings.Contains(got, claudeCodeFirstPartyEnv) {
+		t.Fatalf("new-user hint omits %q", claudeCodeFirstPartyEnv)
+	}
+
+	m = fixtureModel(120, 28)
+	m.screen = screenActivity
+	m.activity.events = nil
+	if got := m.viewActivity(24); !strings.Contains(got, claudeCodeFirstPartyEnv) {
+		t.Fatalf("empty-activity hint omits %q", claudeCodeFirstPartyEnv)
+	}
+}
+
 func TestActivityFilterCyclesThroughSeenValuesAndBackToAll(t *testing.T) {
 	events := []view.Event{{Account: "a1"}, {Account: "a2"}, {Account: "a1"}}
 	pick := func(e view.Event) string { return e.Account }

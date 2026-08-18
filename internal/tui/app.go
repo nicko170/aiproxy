@@ -15,6 +15,8 @@ import (
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
+const claudeCodeFirstPartyEnv = "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1"
+
 // screenID names the five screens, in tab order.
 type screenID int
 

@@ -160,7 +160,9 @@ func (m Model) viewNoAccounts(h int) string {
 		"  " + th.accent("l") + "  log in with Anthropic",
 		"  " + th.accent("4") + "  open accounts to import from Claude Code",
 		"",
-		th.dim("then point your client at ") + "ANTHROPIC_BASE_URL=http://" + addr,
+		th.dim("then export both before starting Claude Code:"),
+		"  ANTHROPIC_BASE_URL=http://" + addr,
+		"  " + claudeCodeFirstPartyEnv,
 	}, "\n")
 	return overlay(body, m.width, h)
 }

@@ -239,8 +239,11 @@ func (m Model) viewActivity(h int) string {
 	caption := "  " + spread(left, right, m.width-2)
 
 	if len(events) == 0 {
-		hint := "waiting for the first request — point your client at " +
-			"ANTHROPIC_BASE_URL=http://" + displayAddr(m.status.ListenAddr)
+		hint := strings.Join([]string{
+			"waiting for the first request — export both for Claude Code:",
+			"ANTHROPIC_BASE_URL=http://" + displayAddr(m.status.ListenAddr),
+			claudeCodeFirstPartyEnv,
+		}, "\n")
 		if len(a.events) > 0 {
 			hint = "nothing matches these filters — esc clears them"
 		}

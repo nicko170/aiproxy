@@ -139,8 +139,9 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("listening", "addr", ln.Addr().String(), "accounts", len(cfg.Accounts), "headless", headless)
-		log.Info("point your client at it",
-			"env", "ANTHROPIC_BASE_URL=http://"+ln.Addr().String())
+		log.Info("point Claude Code at it",
+			"baseURL", "ANTHROPIC_BASE_URL=http://"+ln.Addr().String(),
+			"firstParty", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1")
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

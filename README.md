@@ -68,8 +68,15 @@ Then point your agent at it:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3456
+export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1
 claude
 ```
+
+Both variables matter. Claude Code otherwise treats every custom base URL as a
+third-party provider and locally caps even native-1M Claude models at 200K,
+triggering auto-compaction at about 180K. aiproxy relays the Anthropic API and
+preserves the model and beta headers, so the first-party hint is the accurate
+setting here.
 
 On a first run with no accounts configured, aiproxy adopts credentials it can
 already find (`~/.config/teamclaude.json`) so you don't have to re-authorize
