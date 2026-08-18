@@ -1,10 +1,22 @@
 package privacy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
+
+// ErrNotJSON reports that the body handed to Redact is present but is not a JSON
+// document, so there is nothing for a JSON-string walker to scan.
+//
+// It is a distinct sentinel because "this body is not JSON" and "the detector
+// exploded" are different facts that must not share a failure mode: the first is
+// an ordinary shape the proxy sees constantly (GETs, multipart uploads,
+// form-encoded bodies), the second is the condition fail-closed exists for.
+// Filter.Redact maps this one to pass-through; see the comment there.
+var ErrNotJSON = errors.New("privacy: body is not a JSON document")
 
 // findingsCache lets the pipeline skip detection for a string it has already
 // scanned. It is an interface so the pipeline can be built and tested before the
@@ -80,10 +92,22 @@ func NewRedactor(detectors []Detector, cache findingsCache) *Redactor {
 //
 // A detector error is returned rather than swallowed. Fail-closed depends on the
 // caller being able to tell "scanned, found nothing" from "could not scan".
+//
+// An EMPTY body is returned unchanged with no error: there is provably nothing
+// to scan, so refusing it would be refusing a fact rather than a failure. A body
+// that is present but is not JSON returns ErrNotJSON alongside the untouched
+// bytes, so the caller can tell that shape apart from a scan that went wrong.
 func (r *Redactor) Redact(ctx context.Context, doc []byte, table *Table) ([]byte, error) {
+	// Every GET, every HEAD, and every request the router did not recognise
+	// arrives here with no body at all — proxyHandler is the catch-all NotFound
+	// handler. WalkStrings errors on empty input, so without this the default
+	// experience of switching the filter on is a 500 on every one of them.
+	if len(bytes.TrimSpace(doc)) == 0 {
+		return doc, nil
+	}
 	spans, err := WalkStrings(doc)
 	if err != nil {
-		return nil, err
+		return doc, fmt.Errorf("%w: %v", ErrNotJSON, err)
 	}
 
 	// replacement is one literal to splice, in document order.

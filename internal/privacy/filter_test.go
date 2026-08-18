@@ -2,8 +2,10 @@ package privacy
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestFilter(t *testing.T, dets ...Detector) *Filter {
@@ -95,4 +97,125 @@ func TestFilterSnapshotIsSafeUnderConcurrency(t *testing.T) {
 		_ = f.Snapshot()
 	}
 	<-done
+}
+
+// TestFilterPassesAnEmptyBodyThrough covers the shape proxyHandler sees most
+// often: it is the router's catch-all, so every GET and every unrecognised path
+// arrives with no body at all. WalkStrings errors on empty input, so before this
+// guard existed, switching the filter on turned every one of them into a 500
+// under the DEFAULT failure mode.
+func TestFilterPassesAnEmptyBodyThrough(t *testing.T) {
+	f := newTestFilter(t, &fakeDetector{name: "fake", needle: "SEKRIT", label: LabelSecret})
+	for _, body := range [][]byte{nil, {}, []byte("   \n\t ")} {
+		out, table, err := f.Redact(context.Background(), body)
+		if err != nil {
+			t.Fatalf("Redact(%q) = %v, want no error", body, err)
+		}
+		if string(out) != string(body) {
+			t.Errorf("Redact(%q) rewrote the body to %q", body, out)
+		}
+		if table == nil {
+			t.Errorf("Redact(%q) returned a nil table; the relay needs a usable one", body)
+		} else if table.Len() != 0 {
+			t.Errorf("Redact(%q) minted %d placeholders from nothing", body, table.Len())
+		}
+	}
+	if got := f.Snapshot().SentUnfiltered; got != 0 {
+		t.Errorf("SentUnfiltered = %d, want 0 — an empty body has nothing to filter", got)
+	}
+}
+
+// TestFilterPassesANonJSONBodyThroughAndCountsIt pins the documented policy:
+// a multipart or form-encoded body is a SHAPE, not a malfunction, so it does not
+// fail closed — but it does go upstream unscanned, and property 7 says that must
+// never be silent.
+func TestFilterPassesANonJSONBodyThroughAndCountsIt(t *testing.T) {
+	f := newTestFilter(t, &fakeDetector{name: "fake", needle: "SEKRIT", label: LabelSecret})
+	body := []byte("--boundary\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nSEKRIT\r\n--boundary--")
+	out, table, err := f.Redact(context.Background(), body)
+	if err != nil {
+		t.Fatalf("Redact = %v, want a pass-through rather than a fail-closed refusal", err)
+	}
+	if string(out) != string(body) {
+		t.Errorf("body was rewritten:\n got %q\nwant %q", out, body)
+	}
+	if table == nil || table.Len() != 0 {
+		t.Errorf("want an empty, non-nil table, got %v", table)
+	}
+	if got := f.Snapshot().SentUnfiltered; got != 1 {
+		t.Errorf("SentUnfiltered = %d, want 1 — this body reached upstream unscanned", got)
+	}
+}
+
+// TestFilterRecordsAScanFailure is property 7 at the counter level: with the
+// filter open and a detector that will not run, every request goes upstream
+// completely unprotected, and the only trace is here.
+func TestFilterRecordsAScanFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		mode           FailureMode
+		wantUnfiltered int64
+	}{
+		{"open sends it anyway", Open, 1},
+		{"closed refuses", Closed, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := New(Options{
+				Detectors:     []Detector{&errDetector{}},
+				Key:           testKey,
+				OnScanFailure: tc.mode,
+			})
+			if _, _, err := f.Redact(context.Background(), []byte(`{"a":"something long enough"}`)); err == nil {
+				t.Fatal("Redact succeeded with a detector that always errors")
+			}
+			snap := f.Snapshot()
+			if snap.LastError == "" {
+				t.Error("LastError is empty after a scan failure")
+			}
+			if snap.SentUnfiltered != tc.wantUnfiltered {
+				t.Errorf("SentUnfiltered = %d, want %d", snap.SentUnfiltered, tc.wantUnfiltered)
+			}
+		})
+	}
+}
+
+// TestFilterScanTimeoutIsAScanFailure covers the aggregate latency bound: a scan
+// that overruns must behave exactly like any other scan failure, so onScanFailure
+// governs it rather than the request hanging for as long as the model takes.
+func TestFilterScanTimeoutIsAScanFailure(t *testing.T) {
+	f := New(Options{
+		Detectors:     []Detector{&blockingDetector{}},
+		Key:           testKey,
+		OnScanFailure: Closed,
+		ScanTimeout:   20 * time.Millisecond,
+	})
+	start := time.Now()
+	_, _, err := f.Redact(context.Background(), []byte(`{"a":"something long enough to scan"}`))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Redact = %v, want a deadline-exceeded scan failure", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("Redact took %s; the timeout did not bound it", elapsed)
+	}
+	if f.Snapshot().LastError == "" {
+		t.Error("a timeout left no LastError; it is a scan failure like any other")
+	}
+}
+
+// errDetector always fails, standing in for a corrupted model install.
+type errDetector struct{}
+
+func (errDetector) Name() string { return "err" }
+func (errDetector) Scan(context.Context, string) ([]Finding, error) {
+	return nil, errors.New("detector is broken")
+}
+
+// blockingDetector never returns until its context is done, standing in for the
+// model tier's inference time.
+type blockingDetector struct{}
+
+func (blockingDetector) Name() string { return "blocking" }
+func (blockingDetector) Scan(ctx context.Context, _ string) ([]Finding, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
 }

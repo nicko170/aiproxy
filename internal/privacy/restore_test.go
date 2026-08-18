@@ -266,3 +266,78 @@ func TestRestorerIgnoresMalformedEvents(t *testing.T) {
 		}
 	}
 }
+
+// TestRestorerBodyRestoresUnderStructuralKeys is the non-streaming half of a
+// symmetry the request side does not have. Inbound, "name"/"id"/"type" are
+// skipped so the filter cannot corrupt the protocol. Outbound, a placeholder
+// under one of those keys can only be there because we minted it, so skipping
+// it emits our own placeholder to the client and does not even count it.
+func TestRestorerBodyRestoresUnderStructuralKeys(t *testing.T) {
+	tab, p := tableWith(t, LabelSecret, "acme-prod.internal")
+	var unresolved []string
+	r := NewRestorer(tab, Passthrough, func(s string) { unresolved = append(unresolved, s) })
+
+	for _, key := range []string{"name", "id", "type", "note"} {
+		body := []byte(`{"` + key + `":"prefix ` + p + ` suffix"}`)
+		out, err := r.Body(body)
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		if !strings.Contains(string(out), "acme-prod.internal") {
+			t.Errorf("placeholder under %q was not restored: %s", key, out)
+		}
+	}
+	if len(unresolved) != 0 {
+		t.Errorf("unresolved callback fired %d times for placeholders that resolve", len(unresolved))
+	}
+}
+
+// TestRestorerBodyCountsUnresolvedUnderStructuralKeys: the old skip meant an
+// unrestorable placeholder under "name" was neither restored NOR counted, so
+// Unresolved stayed 0 while the agent received a placeholder.
+func TestRestorerBodyCountsUnresolvedUnderStructuralKeys(t *testing.T) {
+	var unresolved []string
+	r := NewRestorer(NewTable(testKey), Passthrough, func(s string) { unresolved = append(unresolved, s) })
+	if _, err := r.Body([]byte(`{"name":"orphan [[AIPROXY_SECRET_deadbeef]]"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 1 {
+		t.Errorf("unresolved = %v, want exactly one placeholder reported", unresolved)
+	}
+}
+
+// TestStreamingAndNonStreamingAgreeOnTheSameToolCall is the regression that
+// motivated the change: identical content restored differently depending only on
+// stream:true|false is a property-1 violation, and one of the two answers was
+// silently wrong.
+func TestStreamingAndNonStreamingAgreeOnTheSameToolCall(t *testing.T) {
+	tab, p := tableWith(t, LabelSecret, "acme-prod.internal")
+
+	nonStreaming := []byte(`{"type":"tool_use","name":"` + p + `","input":{"host":"` + p + `"}}`)
+	got, err := NewRestorer(tab, Passthrough, nil).Body(nonStreaming)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"type":"tool_use","name":"acme-prod.internal","input":{"host":"acme-prod.internal"}}`
+	if string(got) != want {
+		t.Errorf("non-streaming:\n got %s\nwant %s", got, want)
+	}
+
+	// The same values arriving as a block start: both fields must resolve too.
+	start, _ := json.Marshal(map[string]any{
+		"type": "content_block_start", "index": 0,
+		"content_block": map[string]any{
+			"type": "tool_use", "name": p, "input": map[string]any{"host": p},
+		},
+	})
+	out, err := NewRestorer(tab, Passthrough, nil).Event(ev(string(start)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "AIPROXY_") {
+		t.Errorf("content_block_start left a placeholder behind: %s", out)
+	}
+	if strings.Count(string(out), "acme-prod.internal") != 2 {
+		t.Errorf("content_block_start restored %d of 2 fields: %s", strings.Count(string(out), "acme-prod.internal"), out)
+	}
+}

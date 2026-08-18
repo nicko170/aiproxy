@@ -9,6 +9,7 @@ import (
 
 	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/privacy/rules"
+	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
@@ -153,4 +154,103 @@ type errDetector struct{}
 func (errDetector) Name() string { return "err" }
 func (errDetector) Scan(context.Context, string) ([]privacy.Finding, error) {
 	return nil, io.ErrUnexpectedEOF
+}
+
+// proxyHandler is registered as the router's NotFound and MethodNotAllowed
+// handler, so it is the catch-all for everything that is not a control route or
+// a passthrough prefix. Before Redact short-circuited on an empty body, enabling
+// the filter turned every GET into a 500 under the DEFAULT failure mode, and
+// upstream saw nothing at all.
+func TestPrivacyDoesNotRefuseBodilessRequests(t *testing.T) {
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Privacy = testFilter(t, privacy.Closed)
+	}, testutil.Script{Status: 200, Body: `{"data":[]}`})
+
+	res, err := http.Get(h.srv.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, res.Body)
+
+	if res.StatusCode != 200 {
+		t.Errorf("GET /v1/models = %d, want 200", res.StatusCode)
+	}
+	if n := len(h.up.Requests()); n != 1 {
+		t.Fatalf("upstream received %d requests, want 1", n)
+	}
+}
+
+// A body the JSON walker cannot read is a shape, not a malfunction: refusing it
+// would break file uploads outright under the default failure mode. It does go
+// upstream unscanned, so the filter counts it.
+func TestPrivacyPassesNonJSONBodiesThroughAndCountsThem(t *testing.T) {
+	f := testFilter(t, privacy.Closed)
+	h := newRouterHarness(t, func(o *HandlerOptions) { o.Privacy = f },
+		testutil.Script{Status: 200, Body: `{}`})
+
+	body := "--b\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nhello\r\n--b--"
+	res, err := http.Post(h.srv.URL+"/v1/files", "multipart/form-data; boundary=b", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, res.Body)
+
+	if res.StatusCode != 200 {
+		t.Errorf("status = %d, want 200", res.StatusCode)
+	}
+	reqs := h.up.Requests()
+	if len(reqs) != 1 {
+		t.Fatalf("upstream received %d requests, want 1", len(reqs))
+	}
+	if string(reqs[0].Body) != body {
+		t.Errorf("the body was altered:\n got %q\nwant %q", reqs[0].Body, body)
+	}
+	if got := f.Snapshot().SentUnfiltered; got != 1 {
+		t.Errorf("SentUnfiltered = %d, want 1", got)
+	}
+}
+
+// A fail-closed refusal must produce a metrics row and an Activity entry, for
+// the same reason the blocked-model refusal above it does: without one, the
+// request is invisible to every window query and the operator sees a client
+// error with no trace on the proxy at all.
+func TestPrivacyFailClosedReportsAResult(t *testing.T) {
+	var got []Result
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Privacy = privacy.New(privacy.Options{
+			Detectors:     []privacy.Detector{errDetector{}},
+			Key:           []byte("0123456789abcdef0123456789abcdef"),
+			OnScanFailure: privacy.Closed,
+		})
+		prev := o.OnResult
+		o.OnResult = func(req Request, res Result) {
+			got = append(got, res)
+			if prev != nil {
+				prev(req, res)
+			}
+		}
+	}, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-opus-5","messages":[{"role":"user","content":"a long enough value"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	io.Copy(io.Discard, res.Body)
+
+	if len(got) != 1 {
+		t.Fatalf("OnResult fired %d times, want 1", len(got))
+	}
+	if got[0].Outcome != provider.OutcomeAdmissionError {
+		t.Errorf("Outcome = %v, want an admission error", got[0].Outcome)
+	}
+	if got[0].StartedAt == 0 {
+		t.Error("StartedAt = 0: the row lands in bucket 0, invisible to every window query")
+	}
+	if got[0].TTFBMS != -1 {
+		t.Errorf("TTFBMS = %d, want -1 — no first byte was produced", got[0].TTFBMS)
+	}
 }

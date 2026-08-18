@@ -223,8 +223,34 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 						"aiproxy's privacy model is not available. Run \"aiproxy privacy install\", or disable privacy.ner in config."
 				}
 				writeError(w, status, "api_error", msg)
+				if o.OnResult != nil {
+					// Same reasoning as the blocked-model refusal above: a
+					// refusal that reports no result produces no metrics row and
+					// no Activity entry, so the operator sees a 5xx at the client
+					// and nothing whatsoever on the proxy. StartedAt must be
+					// stamped and TTFBMS must be -1 for the same reasons given
+					// there. OutcomeAdmissionError is the established verdict for
+					// a local failure before any request was sent, which is
+					// exactly what this is.
+					o.OnResult(req, Result{
+						Status:    status,
+						Outcome:   provider.OutcomeAdmissionError,
+						StartedAt: time.Now().UnixMilli(),
+						TTFBMS:    -1,
+					})
+				}
 				return
 			default:
+				// The request goes upstream with NO filtering. Filter.Redact has
+				// already recorded the error and incremented SentUnfiltered, so
+				// Status and the TUI both show it — property 7 is what stops this
+				// being indistinguishable from "scanned, found nothing".
+				//
+				// Note that Redact returns on the FIRST detector error and
+				// discards every replacement it had already made, so under open
+				// even Tier 1's findings are lost when the model tier fails. That
+				// is deliberate: a partially redacted body is a body whose
+				// restore table describes something other than what was sent.
 				o.Log.Warn("privacy filter failed; sending unfiltered", "err", err)
 			}
 		}

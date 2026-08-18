@@ -111,26 +111,77 @@ func (r *Restorer) blockStart(raw []byte, line int, m map[string]any) ([]byte, e
 	if block == nil {
 		return raw, nil
 	}
-	text, isString := block["text"].(string)
-	if !isString || text == "" {
-		return raw, nil
-	}
-	// A complete value: restore it whole with a throwaway rewriter, so no
-	// pending state is created for a block that has not started streaming.
-	w := newRewriter(r.table, r.mode, r.onUnresolved)
-	out, err := w.Write(text)
+	// Every string in the block, at any depth — not just "text". Spec §8.2 lists
+	// a tool block's "input" here too, and extended thinking arrives under
+	// "thinking". In practice the provider opens a block with input:{} and
+	// thinking:"" and streams the content as deltas, so this is inert on today's
+	// wire format; it is implemented rather than noted as a limitation because
+	// "inert until the provider changes one field" is exactly the shape of a
+	// future silent leak, and the recursion is six lines.
+	//
+	// A throwaway rewriter per string: a complete value cannot be split, so no
+	// pending state should survive into the block that has not started streaming.
+	restored, changed, err := r.restoreWhole(block)
 	if err != nil {
 		return nil, err
 	}
-	tail, err := w.Flush()
-	if err != nil {
-		return nil, err
-	}
-	if out+tail == text {
+	if !changed {
 		return raw, nil
 	}
-	block["text"] = out + tail
+	m["content_block"] = restored
 	return r.reencode(raw, line, m)
+}
+
+// restoreWhole substitutes placeholders in every string reachable from v,
+// returning the rewritten value and whether anything changed.
+//
+// Values here are decoded JSON, so a plaintext containing quotes, backslashes,
+// or newlines is escaped once by the re-marshal in reencode. That is the whole
+// difference from input_json_delta (§8.3), where the fragment is itself a JSON
+// document inside a string and needs two levels.
+func (r *Restorer) restoreWhole(v any) (any, bool, error) {
+	switch t := v.(type) {
+	case string:
+		if t == "" {
+			return t, false, nil
+		}
+		w := newRewriter(r.table, r.mode, r.onUnresolved)
+		out, err := w.Write(t)
+		if err != nil {
+			return nil, false, err
+		}
+		tail, err := w.Flush()
+		if err != nil {
+			return nil, false, err
+		}
+		return out + tail, out+tail != t, nil
+	case map[string]any:
+		changed := false
+		for k, child := range t {
+			out, c, err := r.restoreWhole(child)
+			if err != nil {
+				return nil, false, err
+			}
+			if c {
+				t[k], changed = out, true
+			}
+		}
+		return t, changed, nil
+	case []any:
+		changed := false
+		for i, child := range t {
+			out, c, err := r.restoreWhole(child)
+			if err != nil {
+				return nil, false, err
+			}
+			if c {
+				t[i], changed = out, true
+			}
+		}
+		return t, changed, nil
+	default:
+		return v, false, nil
+	}
 }
 
 func (r *Restorer) blockStop(raw []byte, m map[string]any) ([]byte, error) {
@@ -208,9 +259,19 @@ func indexOf(m map[string]any) int {
 // Body restores a complete non-streaming response.
 //
 // It reuses the request side's machinery: the same JSON walker finds string
-// values, and each is rewritten whole. Structural keys are skipped for the same
-// reason they are on the way in — rewriting "model" or "id" would corrupt the
-// response — and the original bytes are returned when nothing changes.
+// values, and each is rewritten whole. The original bytes are returned when
+// nothing changes.
+//
+// SkipKey is deliberately NOT consulted here, unlike on the request side. The
+// two directions are not symmetric. Inbound, skipping "model", "id", "name" and
+// "type" stops the filter corrupting the protocol with a placeholder the
+// provider would reject. Outbound, a placeholder under one of those keys can
+// only be there because WE minted it and the model echoed it back — a tool call
+// whose name argument carried a redacted value, say — so skipping is exactly
+// wrong: it emits our own placeholder to the client verbatim, and does not even
+// count it as unresolved. The streaming path never had this restriction, so the
+// two paths disagreed on the identical tool call depending on stream:true|false,
+// which is a property-1 violation with no signal attached.
 func (r *Restorer) Body(body []byte) ([]byte, error) {
 	spans, err := WalkStrings(body)
 	if err != nil {
@@ -222,9 +283,6 @@ func (r *Restorer) Body(body []byte) ([]byte, error) {
 	}
 	var reps []replacement
 	for _, span := range spans {
-		if SkipKey(span.Key, span.ParentKey) {
-			continue
-		}
 		w := newRewriter(r.table, r.mode, r.onUnresolved)
 		out, err := w.Write(span.Value)
 		if err != nil {
