@@ -29,6 +29,7 @@ var routeFor = map[string]struct{ method, pattern string }{
 	"SetAccountEnabled":   {http.MethodPost, ReservedPrefix + "/api/v1/accounts/{id}/enabled"},
 	"SetPriority":         {http.MethodPost, ReservedPrefix + "/api/v1/accounts/{id}/priority"},
 	"RemoveAccount":       {http.MethodDelete, ReservedPrefix + "/api/v1/accounts/{id}"},
+	"Settings":            {http.MethodGet, ReservedPrefix + "/api/v1/settings"},
 	"UpdateSettings":      {http.MethodPost, ReservedPrefix + "/api/v1/settings"},
 }
 

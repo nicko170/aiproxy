@@ -6,7 +6,10 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +33,14 @@ type testHarness struct {
 }
 
 func newHarness(t *testing.T, accts ...config.Account) *testHarness {
+	t.Helper()
+	return newHarnessWithClock(t, nil, accts...)
+}
+
+// newHarnessWithClock is newHarness with an injectable clock, for tests that
+// need to control what ServerStatus sees as "now" (uptime, the p95 TTFB
+// window). now may be nil, in which case Local uses the real wall clock.
+func newHarnessWithClock(t *testing.T, now func() time.Time, accts ...config.Account) *testHarness {
 	t.Helper()
 	ms, err := metrics.OpenMemory()
 	if err != nil {
@@ -56,9 +67,20 @@ func newHarness(t *testing.T, accts ...config.Account) *testHarness {
 
 	dropped := func() int64 { return ing.Dropped() }
 
-	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped)
+	var opts []option
+	if now != nil {
+		opts = append(opts, withClock(now))
+	}
+	local := NewLocal(mgr, ms, cs, "127.0.0.1:3456", dropped, opts...)
 	return &testHarness{t: t, local: local, mgr: mgr, ms: ms, cs: cs, ing: ing, dropped: dropped}
 }
+
+// noWaiter satisfies account.Waiter without ever actually waiting; it is only
+// safe to use when the account's ramp is disabled and unpaused, so Admit
+// never has a reason to call it.
+type noWaiter struct{}
+
+func (noWaiter) Wait(context.Context, time.Duration) error { return nil }
 
 // stubProvider is the minimal provider.Provider a test account needs; view
 // never calls into it directly, but account.New requires one per provider
@@ -92,9 +114,16 @@ func acctCfg(id string, priority int) config.Account {
 	}
 }
 
-func TestServerStatusReportsListenAddrAndDroppedCount(t *testing.T) {
-	h := newHarness(t, acctCfg("a", 0))
+// UptimeSeconds must reflect actual elapsed clock time, not merely be
+// non-negative (a check that variable-length windows, an off-by-a-day sign
+// error, or a stopped clock could never trip). An injected clock makes the
+// elapsed time exact and repeatable.
+func TestServerStatusReportsListenAddrDroppedCountAndExactUptime(t *testing.T) {
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	cur := base
+	h := newHarnessWithClock(t, func() time.Time { return cur }, acctCfg("a", 0))
 
+	cur = base.Add(90 * time.Second)
 	st, err := h.local.ServerStatus(context.Background())
 	if err != nil {
 		t.Fatalf("ServerStatus: %v", err)
@@ -102,8 +131,8 @@ func TestServerStatusReportsListenAddrAndDroppedCount(t *testing.T) {
 	if st.ListenAddr != "127.0.0.1:3456" {
 		t.Errorf("ListenAddr = %q", st.ListenAddr)
 	}
-	if st.UptimeSeconds < 0 {
-		t.Errorf("UptimeSeconds = %d, want >= 0", st.UptimeSeconds)
+	if st.UptimeSeconds != 90 {
+		t.Errorf("UptimeSeconds = %d, want exactly 90 (base clock advanced by 90s)", st.UptimeSeconds)
 	}
 	if st.MetricsDropped != 0 {
 		t.Errorf("MetricsDropped = %d, want 0", st.MetricsDropped)
@@ -122,6 +151,83 @@ func TestServerStatusTTFBIsZeroWithNoRequests(t *testing.T) {
 	}
 	if st.TTFBP95MS != 0 {
 		t.Errorf("TTFBP95MS = %d, want 0", st.TTFBP95MS)
+	}
+}
+
+// A sample inside the trailing statusLatencyWindow must be reflected in the
+// p95 TTFB figure — the counterpart to the "no requests" zero case above,
+// which a suite that only ever tests the empty window cannot catch.
+func TestServerStatusTTFBReflectsASampleInsideTheWindow(t *testing.T) {
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	h := newHarnessWithClock(t, func() time.Time { return base }, acctCfg("a", 0))
+
+	h.ing.Record(metrics.Sample{
+		StartedAt: base.Add(-time.Minute).UnixMilli(), AccountID: "a", Provider: "stub",
+		Model: "claude-sonnet-5", Status: 200, Outcome: "ok", TTFBMS: 77, WaitMS: 0,
+	})
+	if err := h.ing.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	st, err := h.local.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServerStatus: %v", err)
+	}
+	if st.TTFBP95MS != 77 {
+		t.Errorf("TTFBP95MS = %d, want 77 (the one sample inside the window)", st.TTFBP95MS)
+	}
+}
+
+// A sample older than statusLatencyWindow must NOT be reflected: ServerStatus
+// is a live "right now" readout, not a historical query. Before this test
+// existed, inverting the window (or shrinking it to a nanosecond) left every
+// other test green.
+func TestServerStatusTTFBExcludesASampleOutsideTheWindow(t *testing.T) {
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC)
+	h := newHarnessWithClock(t, func() time.Time { return base }, acctCfg("a", 0))
+
+	h.ing.Record(metrics.Sample{
+		StartedAt: base.Add(-2 * time.Hour).UnixMilli(), AccountID: "a", Provider: "stub",
+		Model: "claude-sonnet-5", Status: 200, Outcome: "ok", TTFBMS: 99, WaitMS: 0,
+	})
+	if err := h.ing.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	st, err := h.local.ServerStatus(context.Background())
+	if err != nil {
+		t.Fatalf("ServerStatus: %v", err)
+	}
+	if st.TTFBP95MS != 0 {
+		t.Errorf("TTFBP95MS = %d, want 0 (the only sample is 2h old, outside statusLatencyWindow)", st.TTFBP95MS)
+	}
+}
+
+// Status.InFlight must reflect account.Manager's admitted count, driven
+// through the same Admit/Release path the proxy's request loop uses — not
+// asserted nowhere, as it was before this test existed.
+func TestServerStatusInFlightReflectsAdmittedAccounts(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+	ctx := context.Background()
+
+	if err := h.mgr.Admit(ctx, "a", noWaiter{}); err != nil {
+		t.Fatalf("Admit: %v", err)
+	}
+	st, err := h.local.ServerStatus(ctx)
+	if err != nil {
+		t.Fatalf("ServerStatus: %v", err)
+	}
+	if st.InFlight != 1 {
+		t.Errorf("InFlight = %d, want 1 after one Admit", st.InFlight)
+	}
+
+	h.mgr.Release("a")
+	st2, err := h.local.ServerStatus(ctx)
+	if err != nil {
+		t.Fatalf("ServerStatus: %v", err)
+	}
+	if st2.InFlight != 0 {
+		t.Errorf("InFlight = %d, want 0 after Release", st2.InFlight)
 	}
 }
 
@@ -300,6 +406,45 @@ func TestSetPriorityPersistsThroughConfigStore(t *testing.T) {
 	}
 }
 
+// Concurrent conflicting mutations must never leave the persisted config and
+// the live Manager disagreeing: each SetPriority call persists through
+// config.Store then applies to Manager as two separate steps, and without a
+// lock spanning both, one goroutine's persist can land between another's
+// persist and apply, leaving the file holding one value and the manager
+// holding a different one until restart.
+func TestConcurrentSetPriorityMutationsLeaveConfigAndManagerAgreeing(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+
+	const n = 50
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(priority int) {
+			defer wg.Done()
+			if err := h.local.SetPriority(context.Background(), "a", priority); err != nil {
+				t.Errorf("SetPriority(%d): %v", priority, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	got, ok := h.mgr.Get("a")
+	if !ok {
+		t.Fatal("account a should still exist")
+	}
+	cfg, err := h.cs.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.Accounts) != 1 {
+		t.Fatalf("persisted accounts = %+v, want exactly one", cfg.Accounts)
+	}
+	if cfg.Accounts[0].Priority != got.Priority {
+		t.Errorf("manager priority %d disagrees with persisted priority %d after %d concurrent mutations",
+			got.Priority, cfg.Accounts[0].Priority, n)
+	}
+}
+
 func TestRemoveAccountPersistsAndDropsFromManager(t *testing.T) {
 	h := newHarness(t, acctCfg("a", 0), acctCfg("b", 1))
 
@@ -339,7 +484,7 @@ func TestUpdateSettingsRejectsInvalidValuesWithoutPersisting(t *testing.T) {
 		HeaderTimeoutMS: 60000, BodyIdleMS: 120000, QuotaProbeIntervalSeconds: 300,
 		MetricsRetentionDays: 90,
 	}
-	if err := h.local.UpdateSettings(context.Background(), bad); err == nil {
+	if _, err := h.local.UpdateSettings(context.Background(), bad); err == nil {
 		t.Error("want an error for a negative switch threshold")
 	}
 
@@ -362,7 +507,7 @@ func TestUpdateSettingsPersistsAndAppliesLiveTunableFieldsImmediately(t *testing
 		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 120,
 		MetricsRetentionDays: 30,
 	}
-	if err := h.local.UpdateSettings(context.Background(), good); err != nil {
+	if _, err := h.local.UpdateSettings(context.Background(), good); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)
 	}
 
@@ -386,6 +531,116 @@ func TestUpdateSettingsPersistsAndAppliesLiveTunableFieldsImmediately(t *testing
 	}
 	if got.ID != "a" {
 		t.Errorf("selected %q, want a; SessionAffinity=false should apply without a restart", got.ID)
+	}
+}
+
+// UpdateSettings must report exactly which changed fields are live versus
+// restart-gated: a changed live field appears under Live, a changed
+// restart-gated field appears under NeedsRestart, and an UNCHANGED
+// restart-gated field appears in neither — reporting it would tell a
+// stage-4 settings screen a field is pending a restart when nothing about
+// it actually changed.
+func TestUpdateSettingsReportsAppliedLiveAndNeedsRestartFields(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+	def := config.Default()
+
+	s := Settings{
+		SwitchThreshold:           0.5, // changed from the 0.98 default: live
+		SessionAffinity:           def.Routing.SessionAffinity,
+		RetryBudgetMS:             def.Retry.BudgetMS,
+		InlineAbsorbMaxMS:         def.Retry.InlineAbsorbMaxMS,
+		HeaderTimeoutMS:           def.Retry.HeaderTimeoutMS,
+		BodyIdleMS:                def.Retry.BodyIdleMS,
+		BlockedModels:             []string{"*fable*"}, // changed from []: restart-gated
+		QuotaProbeIntervalSeconds: def.QuotaProbe.IntervalSeconds,
+		MetricsRetentionDays:      def.Metrics.RetentionDays,
+	}
+	applied, err := h.local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatalf("UpdateSettings: %v", err)
+	}
+
+	if !slices.Contains(applied.Live, "switchThreshold") {
+		t.Errorf("Live = %v, want it to contain switchThreshold", applied.Live)
+	}
+	if slices.Contains(applied.Live, "sessionAffinity") {
+		t.Errorf("Live = %v, must not contain sessionAffinity (unchanged)", applied.Live)
+	}
+	if !slices.Contains(applied.NeedsRestart, "blockedModels") {
+		t.Errorf("NeedsRestart = %v, want it to contain blockedModels", applied.NeedsRestart)
+	}
+	for _, unchanged := range []string{"retryBudgetMs", "inlineAbsorbMaxMs", "headerTimeoutMs", "bodyIdleMs",
+		"quotaProbeIntervalSeconds", "metricsRetentionDays"} {
+		if slices.Contains(applied.NeedsRestart, unchanged) {
+			t.Errorf("NeedsRestart = %v, must not contain unchanged field %q", applied.NeedsRestart, unchanged)
+		}
+	}
+}
+
+// Settings must round-trip exactly what UpdateSettings wrote — the getter
+// that lets a caller read-modify-write through the seam instead of reaching
+// around Source to the config store.
+func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+
+	want := Settings{
+		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
+		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
+		BlockedModels: []string{"*fable*", "*mythos*"}, QuotaProbeIntervalSeconds: 200,
+		MetricsRetentionDays: 45,
+	}
+	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
+		t.Fatalf("UpdateSettings: %v", err)
+	}
+
+	got, err := h.local.Settings(context.Background())
+	if err != nil {
+		t.Fatalf("Settings: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Settings() = %+v, want %+v", got, want)
+	}
+}
+
+// A read-modify-write cycle through Settings/UpdateSettings must preserve
+// every field the caller did not touch — including a bool that is false and
+// a slice that is non-empty, the two shapes that a caller reconstructing
+// Settings from scratch (rather than reading it first) would silently zero.
+func TestSettingsReadModifyWritePreservesUntouchedFields(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+
+	initial := Settings{
+		SwitchThreshold: 0.7, RetryBudgetMS: 9000, InlineAbsorbMaxMS: 3000,
+		HeaderTimeoutMS: 45000, BodyIdleMS: 90000, SessionAffinity: false,
+		BlockedModels: []string{"*fable*"}, QuotaProbeIntervalSeconds: 200,
+		MetricsRetentionDays: 45,
+	}
+	if _, err := h.local.UpdateSettings(context.Background(), initial); err != nil {
+		t.Fatalf("UpdateSettings (seed): %v", err)
+	}
+
+	current, err := h.local.Settings(context.Background())
+	if err != nil {
+		t.Fatalf("Settings: %v", err)
+	}
+	current.SwitchThreshold = 0.85 // the only field this caller means to change
+
+	if _, err := h.local.UpdateSettings(context.Background(), current); err != nil {
+		t.Fatalf("UpdateSettings (read-modify-write): %v", err)
+	}
+
+	final, err := h.local.Settings(context.Background())
+	if err != nil {
+		t.Fatalf("Settings: %v", err)
+	}
+	if final.SwitchThreshold != 0.85 {
+		t.Errorf("SwitchThreshold = %v, want 0.85", final.SwitchThreshold)
+	}
+	if final.SessionAffinity != false {
+		t.Errorf("SessionAffinity = %v, want false — an untouched field must survive a read-modify-write", final.SessionAffinity)
+	}
+	if len(final.BlockedModels) != 1 || final.BlockedModels[0] != "*fable*" {
+		t.Errorf("BlockedModels = %v, want [*fable*] — an untouched field must survive a read-modify-write", final.BlockedModels)
 	}
 }
 

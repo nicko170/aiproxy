@@ -9,6 +9,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -267,6 +268,17 @@ func removeAccountHandler(o HandlerOptions) http.HandlerFunc {
 	})
 }
 
+func settingsHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		s, err := src.Settings(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+			return
+		}
+		writeJSON(w, s)
+	})
+}
+
 func updateSettingsHandler(o HandlerOptions) http.HandlerFunc {
 	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
 		var s view.Settings
@@ -274,25 +286,34 @@ func updateSettingsHandler(o HandlerOptions) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
 			return
 		}
-		if err := src.UpdateSettings(r.Context(), s); err != nil {
+		applied, err := src.UpdateSettings(r.Context(), s)
+		if err != nil {
 			// Validate is the only reason UpdateSettings fails on well-formed
 			// JSON (a config-store write failure is an internal error), so this
 			// route only ever sees a validation error here — reported as 400.
 			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true})
+		// applied.Live / applied.NeedsRestart tell the caller which of the
+		// fields it just sent actually took effect versus which were persisted
+		// but require a restart (see view.Applied's doc comment) — returned as
+		// data so a settings screen cannot mistake a pending field for an
+		// applied one.
+		writeJSON(w, applied)
 	})
 }
 
-// writeMutationError reports an unknown-account-id error as 404 rather than
-// 500: it is the caller naming something that does not exist, not a proxy
-// fault. Every mutation on Source (SetAccountEnabled, SetPriority,
-// RemoveAccount) returns exactly this shape of error for that case and
-// nothing else, so treating any error here as "not found" is safe — there is
-// no other failure mode a config-store write in this path can currently
-// produce, and if one is added later it should get its own explicit check
-// rather than silently masquerading as 404.
+// writeMutationError reports an unknown-account-id error as 404: the caller
+// named something that does not exist, not a proxy fault. Every other error a
+// mutation on Source (SetAccountEnabled, SetPriority, RemoveAccount) can
+// return — a config-store write failure, for instance — is reported as 500
+// instead: it is not the caller's fault and pretending it is a 404 would tell
+// a client the account still doesn't exist when the real problem was the
+// store.
 func writeMutationError(w http.ResponseWriter, err error) {
-	writeError(w, http.StatusNotFound, "not_found_error", err.Error())
+	if errors.Is(err, view.ErrUnknownAccount) {
+		writeError(w, http.StatusNotFound, "not_found_error", err.Error())
+		return
+	}
+	writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
 }

@@ -18,6 +18,11 @@ type Status struct {
 	InFlight       int    `json:"inFlight"`
 	TTFBP95MS      int64  `json:"ttfbP95Ms"`
 	MetricsDropped int64  `json:"metricsDropped"`
+	// EventsDropped is how many Subscribe events have been discarded for a
+	// slow or abandoned subscriber (hub.publish never blocks; see hub.go).
+	// Mirrors MetricsDropped's principle: a drop is invisible unless a Status
+	// field says so.
+	EventsDropped int64 `json:"eventsDropped"`
 }
 
 // Account is everything about one account that either front-end may show.
@@ -134,6 +139,23 @@ type Settings struct {
 	BlockedModels             []string `json:"blockedModels"`
 	QuotaProbeIntervalSeconds int      `json:"quotaProbeIntervalSeconds"`
 	MetricsRetentionDays      int      `json:"metricsRetentionDays"`
+}
+
+// Applied reports which fields an UpdateSettings call actually put into
+// effect on the running proxy versus which were persisted but require a
+// restart to take effect (see UpdateSettings's doc comment for why some
+// fields are restart-gated).
+//
+// This is returned as data, deliberately, rather than left to a doc comment:
+// a stage-4 settings screen decodes a JSON response and cannot show a
+// pending field as already applied without actively ignoring a value it
+// already parsed. A comment can only be read by a person, not by the code
+// that renders the result. When a currently restart-gated field later
+// becomes live, only the classification here narrows — no signature or
+// wire-format change is needed for callers already handling both lists.
+type Applied struct {
+	Live         []string `json:"live"`
+	NeedsRestart []string `json:"needsRestart"`
 }
 
 // Event is one completed request, published to every Subscribe-r. It carries

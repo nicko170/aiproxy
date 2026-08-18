@@ -33,6 +33,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Post("/api/v1/accounts/{id}/enabled", setAccountEnabledHandler(o))
 		cp.Post("/api/v1/accounts/{id}/priority", setAccountPriorityHandler(o))
 		cp.Delete("/api/v1/accounts/{id}", removeAccountHandler(o))
+		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))
 
 		// Anything else under the reserved prefix is a 404, never a proxied

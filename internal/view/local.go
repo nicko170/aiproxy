@@ -3,6 +3,7 @@ package view
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
@@ -32,25 +33,57 @@ type Local struct {
 	now        func() time.Time
 
 	hub *hub
+
+	// mu serializes every mutation (SetAccountEnabled, SetPriority,
+	// RemoveAccount, UpdateSettings) end to end, across both the
+	// config.Store persist and the account.Manager apply. config.Store.Update
+	// already serializes the persist step alone, and Manager serializes its
+	// own apply step alone, but nothing previously serialized the PAIR: two
+	// concurrent mutations could interleave persist-A, persist-B, apply-B,
+	// apply-A, leaving the config file holding B while the live Manager holds
+	// A — disagreeing until restart, which is exactly the failure the
+	// persist-then-apply ordering exists to avoid. Holding mu across the
+	// whole body of each mutation makes the pair atomic with respect to every
+	// other mutation.
+	mu sync.Mutex
+}
+
+// option configures a Local at construction. It exists so tests can inject a
+// fake clock without adding a parameter every caller must pass; see withClock.
+type option func(*Local)
+
+// withClock overrides both the clock ServerStatus reads from and the instant
+// NewLocal stamps as "started", so uptime and window-relative queries (p95
+// TTFB) are deterministic in tests instead of racing real wall-clock time.
+func withClock(now func() time.Time) option {
+	return func(l *Local) {
+		l.now = now
+		l.started = now()
+	}
 }
 
 // NewLocal builds a Local over the given services. dropped may be nil, which
 // Local treats as always reporting zero (matching the pre-stage-3 status
 // handler's convention).
-func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64) *Local {
+func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, opts ...option) *Local {
 	if dropped == nil {
 		dropped = func() int64 { return 0 }
 	}
-	return &Local{
+	now := time.Now
+	l := &Local{
 		mgr:        mgr,
 		metrics:    ms,
 		config:     cs,
 		listenAddr: listenAddr,
-		started:    time.Now(),
+		started:    now(),
 		dropped:    dropped,
-		now:        time.Now,
+		now:        now,
 		hub:        newHub(),
 	}
+	for _, o := range opts {
+		o(l)
+	}
+	return l
 }
 
 // Publish feeds one completed request into the event stream. cmd/aiproxy
@@ -79,6 +112,7 @@ func (l *Local) ServerStatus(ctx context.Context) (Status, error) {
 		InFlight:       inFlight,
 		TTFBP95MS:      lat.TTFBP95,
 		MetricsDropped: l.dropped(),
+		EventsDropped:  l.hub.droppedCount(),
 	}, nil
 }
 
@@ -170,9 +204,16 @@ func (l *Local) Subscribe(ctx context.Context) (<-chan Event, error) {
 // SetAccountEnabled persists first, through the config store, and only then
 // applies the change to the live Manager: a failed write must leave nothing
 // changed, rather than a runtime state the next restart silently reverts.
+//
+// mu is held across both steps (see Local.mu's doc comment): without it, two
+// concurrent calls could interleave persist-A, persist-B, apply-B, apply-A,
+// leaving the config file and the live Manager disagreeing until restart.
 func (l *Local) SetAccountEnabled(ctx context.Context, accountID string, enabled bool) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if _, ok := l.mgr.Get(accountID); !ok {
-		return fmt.Errorf("unknown account %q", accountID)
+		return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
 	}
 	if _, err := l.config.Update(func(c *config.Config) error {
 		return setAccountField(c, accountID, func(a *config.Account) { a.Disabled = !enabled })
@@ -183,8 +224,11 @@ func (l *Local) SetAccountEnabled(ctx context.Context, accountID string, enabled
 }
 
 func (l *Local) SetPriority(ctx context.Context, accountID string, priority int) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if _, ok := l.mgr.Get(accountID); !ok {
-		return fmt.Errorf("unknown account %q", accountID)
+		return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
 	}
 	if _, err := l.config.Update(func(c *config.Config) error {
 		return setAccountField(c, accountID, func(a *config.Account) { a.Priority = priority })
@@ -197,8 +241,11 @@ func (l *Local) SetPriority(ctx context.Context, accountID string, priority int)
 // RemoveAccount drops the account from the config store, the live Manager,
 // and — inside Manager.Remove — any session affinity pinned to it.
 func (l *Local) RemoveAccount(ctx context.Context, accountID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if _, ok := l.mgr.Get(accountID); !ok {
-		return fmt.Errorf("unknown account %q", accountID)
+		return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
 	}
 	if _, err := l.config.Update(func(c *config.Config) error {
 		for i := range c.Accounts {
@@ -207,12 +254,52 @@ func (l *Local) RemoveAccount(ctx context.Context, accountID string) error {
 				return nil
 			}
 		}
-		return fmt.Errorf("unknown account %q", accountID)
+		return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
 	}); err != nil {
 		return err
 	}
 	return l.mgr.Remove(accountID)
 }
+
+// Settings reads the live-tunable subset of config back from the config
+// store, so a caller can read-modify-write through the seam (see Source's
+// doc comment on this method for why that matters).
+func (l *Local) Settings(ctx context.Context) (Settings, error) {
+	c, err := l.config.Load()
+	if err != nil {
+		return Settings{}, err
+	}
+	return settingsFromConfig(c), nil
+}
+
+func settingsFromConfig(c config.Config) Settings {
+	return Settings{
+		SwitchThreshold:           c.Routing.SwitchThreshold,
+		RetryBudgetMS:             c.Retry.BudgetMS,
+		InlineAbsorbMaxMS:         c.Retry.InlineAbsorbMaxMS,
+		HeaderTimeoutMS:           c.Retry.HeaderTimeoutMS,
+		BodyIdleMS:                c.Retry.BodyIdleMS,
+		SessionAffinity:           c.Routing.SessionAffinity,
+		BlockedModels:             c.Routing.BlockedModels,
+		QuotaProbeIntervalSeconds: c.QuotaProbe.IntervalSeconds,
+		MetricsRetentionDays:      c.Metrics.RetentionDays,
+	}
+}
+
+// liveSettingsFields and restartSettingsFields name, in Applied's vocabulary,
+// which Settings fields Manager reads live versus which are baked into
+// structs built once at startup with no reload path. Keeping the field names
+// here (rather than inline in UpdateSettings) is what makes "a field became
+// live" a one-line change: move its name from one slice to the other and
+// wire the corresponding Manager setter; UpdateSettings's diff logic does not
+// change.
+var (
+	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity"}
+	restartSettingsFields = []string{
+		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
+		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
+	}
+)
 
 // UpdateSettings validates before writing anything, then persists the
 // live-tunable subset of config (spec §6.2), then applies to the running
@@ -230,11 +317,29 @@ func (l *Local) RemoveAccount(ctx context.Context, accountID string) error {
 // timers is a larger change than this stage, and this comment plus the
 // implementation report are where that limitation is recorded rather than
 // silently discovered later.
-func (l *Local) UpdateSettings(ctx context.Context, s Settings) error {
+//
+// The Applied return exists because that gap must be reported as data, not
+// merely as this comment: a stage-4 settings screen decodes a JSON response,
+// and nothing about a 200 with no body tells it that six of nine fields it
+// just sent are sitting unapplied in the config file. Applied.NeedsRestart
+// contains a field name only when the caller actually changed it (comparing
+// against the config as it was before this call) AND that field is one of
+// the restart-gated ones — an unchanged restart-gated field is silent, same
+// as an unchanged live one, so a screen that only re-renders on a nonempty
+// list does the right thing by default.
+func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error) {
 	if err := s.Validate(); err != nil {
-		return err
+		return Applied{}, err
 	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var applied Applied
 	if _, err := l.config.Update(func(c *config.Config) error {
+		before := settingsFromConfig(*c)
+		applied = diffSettings(before, s)
+
 		c.Routing.SwitchThreshold = s.SwitchThreshold
 		c.Routing.SessionAffinity = s.SessionAffinity
 		c.Routing.BlockedModels = s.BlockedModels
@@ -246,12 +351,56 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) error {
 		c.Metrics.RetentionDays = s.MetricsRetentionDays
 		return nil
 	}); err != nil {
-		return err
+		return Applied{}, err
 	}
 
 	l.mgr.SetSwitchThreshold(s.SwitchThreshold)
 	l.mgr.SetSessionAffinity(s.SessionAffinity)
-	return nil
+	return applied, nil
+}
+
+// diffSettings reports which changed fields between before and after are
+// live versus restart-gated, using liveSettingsFields and
+// restartSettingsFields as the classification. BlockedModels is compared
+// element-wise and in order: a caller resending the same list unchanged
+// (even a nil vs an empty slice, both length zero) must not be reported as a
+// change.
+func diffSettings(before, after Settings) Applied {
+	var applied Applied
+	changed := map[string]bool{
+		"switchThreshold":           before.SwitchThreshold != after.SwitchThreshold,
+		"sessionAffinity":           before.SessionAffinity != after.SessionAffinity,
+		"blockedModels":             !stringSlicesEqual(before.BlockedModels, after.BlockedModels),
+		"retryBudgetMs":             before.RetryBudgetMS != after.RetryBudgetMS,
+		"inlineAbsorbMaxMs":         before.InlineAbsorbMaxMS != after.InlineAbsorbMaxMS,
+		"headerTimeoutMs":           before.HeaderTimeoutMS != after.HeaderTimeoutMS,
+		"bodyIdleMs":                before.BodyIdleMS != after.BodyIdleMS,
+		"quotaProbeIntervalSeconds": before.QuotaProbeIntervalSeconds != after.QuotaProbeIntervalSeconds,
+		"metricsRetentionDays":      before.MetricsRetentionDays != after.MetricsRetentionDays,
+	}
+	for _, name := range liveSettingsFields {
+		if changed[name] {
+			applied.Live = append(applied.Live, name)
+		}
+	}
+	for _, name := range restartSettingsFields {
+		if changed[name] {
+			applied.NeedsRestart = append(applied.NeedsRestart, name)
+		}
+	}
+	return applied
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func setAccountField(c *config.Config, accountID string, fn func(*config.Account)) error {
@@ -261,5 +410,5 @@ func setAccountField(c *config.Config, accountID string, fn func(*config.Account
 			return nil
 		}
 	}
-	return fmt.Errorf("unknown account %q", accountID)
+	return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
 }

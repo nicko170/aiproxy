@@ -95,6 +95,52 @@ func TestPublishFansOutToEveryConcurrentSubscriber(t *testing.T) {
 	}
 }
 
+// Subscribe's documented contract (source.go) is that the channel is closed
+// when ctx is cancelled, not merely abandoned — so a caller ranging over it
+// (`for ev := range ch`) terminates instead of hanging forever. Before this
+// was fixed, the subscriber's map entry was deleted but the channel itself
+// was never closed.
+func TestSubscribeChannelClosesOnCancellation(t *testing.T) {
+	h := newHub()
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := h.subscribe(ctx)
+	cancel()
+
+	done := make(chan struct{})
+	go func() {
+		for range ch {
+			// Drain until closed; a range over a channel that is never
+			// closed blocks here forever, which is exactly the defect this
+			// test catches.
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("range over the subscriber channel never terminated: channel was not closed on cancellation")
+	}
+}
+
+// A full subscriber must not merely have its events dropped silently: the
+// drop is counted so Status.EventsDropped can report it (spec invariant 3:
+// a proxied request is never blocked to feed a UI, but a drop "says so").
+func TestPublishCountsDroppedEventsForAFullSubscriber(t *testing.T) {
+	h := newHub()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := h.subscribe(ctx)
+
+	for i := 0; i < subscriberBuffer+5; i++ {
+		h.publish(Event{Model: "m"})
+	}
+	if got := h.droppedCount(); got != 5 {
+		t.Errorf("droppedCount() = %d, want 5", got)
+	}
+	_ = ch
+}
+
 // Cancelling a subscriber's context must release both its channel and its
 // watcher goroutine. Repeating this many times must not grow the hub's
 // subscriber set — a leak here would eventually make every publish slower

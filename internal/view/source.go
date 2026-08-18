@@ -1,6 +1,16 @@
 package view
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrUnknownAccount is the sentinel every Source mutation that names an
+// account by id wraps its "no such account" error in. Distinguishing this
+// from every other failure (e.g. a config-store write error) matters at the
+// control API boundary: a caller naming something that does not exist is a
+// 404, not a 500 (see internal/proxy.writeMutationError).
+var ErrUnknownAccount = errors.New("unknown account")
 
 // Source is the presentation seam (spec §3.1): the single query interface
 // both the TUI (stage 4) and the web dashboard (stage 5) read through, so
@@ -46,5 +56,22 @@ type Source interface {
 	SetAccountEnabled(ctx context.Context, accountID string, enabled bool) error
 	SetPriority(ctx context.Context, accountID string, priority int) error
 	RemoveAccount(ctx context.Context, accountID string) error
-	UpdateSettings(ctx context.Context, s Settings) error
+
+	// Settings reads the live-tunable subset of config back (spec §6.2), so a
+	// caller can read-modify-write through the seam instead of reaching
+	// around Source to the config store directly. Without this, a caller
+	// wanting to change one field of Settings has to reconstruct every other
+	// field itself — and since UpdateSettings writes every field it is
+	// given unconditionally, a caller that gets one of those reconstructed
+	// values wrong (or leaves a zero-value bool/slice where the real value
+	// was non-zero) silently overwrites it.
+	Settings(ctx context.Context) (Settings, error)
+
+	// UpdateSettings validates s, persists it, and applies whichever fields
+	// take effect on the running proxy without a restart. The returned
+	// Applied says which fields actually took effect versus which were
+	// written but require a restart (see Applied's doc comment and
+	// Local.UpdateSettings for why that split exists and is returned as data
+	// rather than documented).
+	UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 }
