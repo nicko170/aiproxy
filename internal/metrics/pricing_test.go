@@ -72,6 +72,7 @@ func TestPricesMatchPublishedRates(t *testing.T) {
 		{"claude-sonnet-4-5-20250929", 3, 15},
 		{"claude-haiku-4-5", 1, 5},
 		{"claude-fable-5", 10, 50},
+		{"claude-mythos-5", 10, 50},
 	}
 	for _, c := range cases {
 		p, ok := PriceFor(c.model)

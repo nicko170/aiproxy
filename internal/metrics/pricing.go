@@ -42,6 +42,9 @@ var prices = map[string]Price{
 	"claude-sonnet-4":  {InputPerMTok: 3, OutputPerMTok: 15, CacheReadPerMTok: 0.30, CacheWritePerMTok: 3.75},
 	"claude-haiku-4-5": {InputPerMTok: 1, OutputPerMTok: 5, CacheReadPerMTok: 0.10, CacheWritePerMTok: 1.25},
 	"claude-fable-5":   {InputPerMTok: 10, OutputPerMTok: 50, CacheReadPerMTok: 1.00, CacheWritePerMTok: 12.50},
+	// Mythos shares Fable's rate card but not its name prefix, so it needs its
+	// own row — longest-prefix matching would otherwise leave it unpriced (NULL).
+	"claude-mythos-5": {InputPerMTok: 10, OutputPerMTok: 50, CacheReadPerMTok: 1.00, CacheWritePerMTok: 12.50},
 }
 
 // PriceFor resolves a model name to a rate card, matching the longest known
