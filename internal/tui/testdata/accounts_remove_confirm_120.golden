@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  up 4h12m  ·  2 in flight  ·  p95 1.24s                                              
+  1 overview   2 activity   3 usage   4 accounts   5 settings                                                           
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   pri  account                       state                   5h    7d    in flight
+ ▸ p1   nick@example.com (Personal)   ready                   63%   18%   2
+   p2   ops@example.com (Ops)         rate-limited · back i…  91%   44%   0
+
+  remove nick@example.com (Personal)?  its history stays in the ledger; its credential is deleted. y remove · any other 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  y remove  ·  any other key keeps it  ·  ? help  ·  q quit                                                             

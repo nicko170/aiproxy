@@ -45,13 +45,22 @@ func (m Model) viewOverview(h int) string {
 			b.WriteString("\n")
 		}
 		// Account line: identity-coloured label, dim particulars, state word.
+		// Narrowing drops the particulars first, then shortens the label —
+		// the state word is the thing a glance is for and always survives.
 		state, stateSev := accountState(a, nowMS)
-		left := th.identity(a.ID, th.bold(a.Label)) +
-			th.dim(fmt.Sprintf("   p%d · %s", a.Priority, a.Provider))
 		right := th.sev(stateSev, state)
 		if a.InFlight > 0 {
 			right += th.dim(" · ") + fmt.Sprintf("%d in flight", a.InFlight)
 		}
+		partic := fmt.Sprintf("   p%d · %s", a.Priority, a.Provider)
+		if m.width < 90 {
+			partic = ""
+		}
+		labelMax := m.width - lipgloss.Width(right) - len(partic) - 2
+		if labelMax < 12 {
+			labelMax = 12
+		}
+		left := th.identity(a.ID, th.bold(truncate(a.Label, labelMax))) + th.dim(partic)
 		b.WriteString(spread(left, right, m.width) + "\n")
 
 		if a.LastError != "" && a.Status != "active" {
@@ -115,7 +124,7 @@ func (m Model) probeSummary() string {
 		return ""
 	}
 	if errs > 0 {
-		s += th.dim(" · ") + th.warn(fmt.Sprintf("%d account(s) failing to probe", errs))
+		s += th.dim(" · ") + th.warn(plural(errs, "account")+" failing to probe")
 	}
 	return s
 }

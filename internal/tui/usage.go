@@ -8,6 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nicko170/aiproxy/internal/view"
 )
@@ -236,11 +237,16 @@ func chartGroups(cols []map[string]float64) []string {
 // plainShades distinguish stacked groups without colour.
 var plainShades = []rune("█▓▒░▚▞")
 
-// renderChart draws stacked columns of height h. Each column scales to the
-// global maximum; a non-zero column always shows at least one cell.
-func renderChart(cols []map[string]float64, groups []string, h int, th theme) []string {
+// renderChart draws stacked columns of height h, each column barW cells
+// wide with no gap — the flow reads as a continuous area, a tide of
+// requests, rather than a picket fence. Each column scales to the global
+// maximum; a non-zero column always shows at least one cell.
+func renderChart(cols []map[string]float64, groups []string, h, barW int, th theme) []string {
 	if h <= 0 || len(cols) == 0 {
 		return nil
+	}
+	if barW < 1 {
+		barW = 1
 	}
 	gi := map[string]int{}
 	for i, g := range groups {
@@ -304,9 +310,9 @@ func renderChart(cols []map[string]float64, groups []string, h int, th theme) []
 				if th.mode == modeNone {
 					ch = string(plainShades[g%len(plainShades)])
 				}
-				b.WriteString(th.identity(groups[g], ch))
+				b.WriteString(th.identity(groups[g], strings.Repeat(ch, barW)))
 			} else {
-				b.WriteString(" ")
+				b.WriteString(strings.Repeat(" ", barW))
 			}
 		}
 		lines[row] = b.String()
@@ -342,9 +348,23 @@ func (m Model) viewUsage(h int) string {
 	}
 	now := m.now
 	from, to := now.Add(-r.span).UnixMilli(), now.UnixMilli()
-	cols := chartColumns(u.series.Points, from, to, chartW)
+	// One column per rollup bucket, drawn barW cells wide so the area fills
+	// the chart; more buckets than cells folds buckets together instead.
+	grain := time.Hour
+	if r.gran == view.GranularityMinute {
+		grain = time.Minute
+	}
+	ncols := int(r.span / grain)
+	if ncols > chartW {
+		ncols = chartW
+	}
+	if ncols < 1 {
+		ncols = 1
+	}
+	barW := chartW / ncols
+	cols := chartColumns(u.series.Points, from, to, ncols)
 	groups := chartGroups(cols)
-	chart := renderChart(cols, groups, chartH, th)
+	chart := renderChart(cols, groups, chartH, barW, th)
 
 	var b strings.Builder
 	b.WriteString(sel + "\n\n")
@@ -358,7 +378,11 @@ func (m Model) viewUsage(h int) string {
 			maxTotal = t
 		}
 	}
-	scale := th.dim(fmt.Sprintf("▲ %s req/%s", formatTokens(int64(maxTotal)), map[view.Granularity]string{view.GranularityMinute: "min", view.GranularityHour: "col"}[r.gran]))
+	unit := "req/h"
+	if r.gran == view.GranularityMinute {
+		unit = "req/min"
+	}
+	scale := th.dim(fmt.Sprintf("▲ %s %s", formatTokens(int64(maxTotal)), unit))
 	b.WriteString("  " + scale + "\n")
 	for _, line := range chart {
 		b.WriteString("  " + line + "\n")
@@ -383,26 +407,33 @@ func (m Model) viewUsage(h int) string {
 	if t.UnpricedRequests > 0 {
 		cost += th.warn(fmt.Sprintf(" +%d unpriced", t.UnpricedRequests))
 	}
+	// The ledger line: requests and cost first — they are what the screen is
+	// for — then detail, shed from the right as the terminal narrows.
 	tot := []string{
 		fmt.Sprintf("%s %s", th.bold(formatTokens(t.Requests)), th.dim("requests")),
+		fmt.Sprintf("%s %s", th.bold(cost), th.dim("cost")),
 		fmt.Sprintf("%s %s", formatTokens(t.InputTokens), th.dim("in")),
 		fmt.Sprintf("%s %s", formatTokens(t.OutputTokens), th.dim("out")),
 		fmt.Sprintf("%s %s", formatTokens(t.CacheReadTokens), th.dim("cache r")),
 		fmt.Sprintf("%s %s", formatTokens(t.CacheWriteTokens), th.dim("cache w")),
-		fmt.Sprintf("%s %s", th.bold(cost), th.dim("cost")),
 		fmt.Sprintf("%s/%s %s", formatMS(u.latency.TTFBP50MS), formatMS(u.latency.TTFBP95MS), th.dim("ttfb p50/p95")),
 	}
-	if m.width < 100 {
-		tot = tot[:6]
+	totLine := "  " + strings.Join(tot, th.dim("   "))
+	for lipgloss.Width(totLine) > m.width && len(tot) > 2 {
+		tot = tot[:len(tot)-1]
+		totLine = "  " + strings.Join(tot, th.dim("   "))
 	}
-	b.WriteString("  " + strings.Join(tot, th.dim("   ")) + "\n\n")
+	b.WriteString(totLine + "\n\n")
 
 	// Two ledgers: top models and top accounts, side by side when they fit.
-	mt := m.ledger("top models", u.topModel, false)
-	at := m.ledger("top accounts", u.topAcct, true)
 	if m.width >= 104 {
-		b.WriteString(sideBySide(mt, at, (m.width-6)/2))
+		colW := (m.width - 6) / 2
+		mt := m.ledger("top models", u.topModel, false, colW)
+		at := m.ledger("top accounts", u.topAcct, true, colW)
+		b.WriteString(sideBySide(mt, at, colW))
 	} else {
+		mt := m.ledger("top models", u.topModel, false, m.width-4)
+		at := m.ledger("top accounts", u.topAcct, true, m.width-4)
 		b.WriteString(strings.Join(mt, "\n") + "\n\n" + strings.Join(at, "\n"))
 	}
 	return b.String()
@@ -417,25 +448,45 @@ func (m Model) groupLabel(key string) string {
 	return key
 }
 
-// ledger renders a small totals table: key, requests, tokens, cost.
-func (m Model) ledger(title string, rows []aggRow, identity bool) []string {
+// ledger renders a small totals table — key, requests, tokens, cost — in a
+// column colW cells wide. Cost survives every narrowing (it is the point of
+// the ledger); tokens go first, then requests.
+func (m Model) ledger(title string, rows []aggRow, identity bool, colW int) []string {
 	th := m.th
 	out := []string{"  " + th.dim(title)}
 	if len(rows) == 0 {
-		out = append(out, "  "+th.dim("—"))
+		out = append(out, "  "+th.dim("nothing yet"))
 		return out
 	}
+	showTok := colW >= 56
+	showReq := colW >= 42
+	nw := colW - 12 // margin + cost column
+	if showReq {
+		nw -= 13
+	}
+	if showTok {
+		nw -= 13
+	}
+	if nw > 26 {
+		nw = 26
+	}
+	if nw < 10 {
+		nw = 10
+	}
 	for _, r := range rows {
-		name := truncate(m.groupLabel(r.key), 24)
-		cell := padRight(name, 26)
+		cell := padRight(truncate(m.groupLabel(r.key), nw), nw)
 		if identity {
 			cell = th.identity(r.key, cell)
 		}
-		out = append(out, fmt.Sprintf("  %s%s %s  %s %s  %s",
-			cell,
-			padLeft(formatTokens(r.requests), 7), th.dim("req"),
-			padLeft(formatTokens(r.tokens), 7), th.dim("tok"),
-			padLeft(formatCost(r.cost), 8)))
+		line := "  " + cell
+		if showReq {
+			line += "  " + padLeft(formatTokens(r.requests), 7) + " " + th.dim("req")
+		}
+		if showTok {
+			line += "  " + padLeft(formatTokens(r.tokens), 7) + " " + th.dim("tok")
+		}
+		line += "  " + padLeft(formatCost(r.cost), 8)
+		out = append(out, line)
 	}
 	return out
 }

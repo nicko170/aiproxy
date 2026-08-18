@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  up 4h12m  ·  2 in flight  ·  p95 1.24s                                              
+  1 overview   2 activity   3 usage   4 accounts   5 settings                                                           
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                          ╭──────────────────────────────────────────────────────────────────╮                          
+                          │                                                                  │                          
+                          │   log in with Anthropic                                          │                          
+                          │                                                                  │                          
+                          │   1. open this url (ctrl+o opens it for you)                     │                          
+                          │      https://claude.ai/oauth/authorize?code_challenge=…          │                          
+                          │                                                                  │                          
+                          │   2. approve access in the browser                               │                          
+                          │                                                                  │                          
+                          │   3. if the browser cannot reach this machine, paste the code:   │                          
+                          │      paste the code here                                         │                          
+                          │                                                                  │                          
+                          │   waiting for the browser or a pasted code…                      │                          
+                          │                                                                  │                          
+                          ╰──────────────────────────────────────────────────────────────────╯                          
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+
+  enter submit code  ·  ctrl+o open url  ·  esc cancel  ·  ? help  ·  q quit                                            

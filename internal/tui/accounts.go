@@ -198,11 +198,9 @@ func (m Model) accountsFooter() []string {
 	if m.accts.importing {
 		return []string{"c from Claude Code", "g from legacy config", "esc cancel"}
 	}
-	keys := []string{"j/k select", "enter detail", "e enable/disable", "+/- priority", "x remove", "i import", "l login"}
-	if m.width < 100 {
-		keys = []string{"enter detail", "e enable/disable", "x remove", "i import", "l login"}
-	}
-	return keys
+	// Ordered so the footer sheds from the right when narrow: navigation
+	// hints go before the mutations do.
+	return []string{"l login", "i import", "e enable/disable", "+/- priority", "x remove", "enter detail", "j/k select"}
 }
 
 func (m Model) viewAccounts(h int) string {

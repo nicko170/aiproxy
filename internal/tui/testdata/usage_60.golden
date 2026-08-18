@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+  range 24h   by model
+
+  ▲ 11 req/h
+              ▓▓                        ▓▓        
+        ▓▓  ▓▓██        ▓▓  ▓▓        ▓▓▓▓██      
+        ▓▓  ████      ▓▓▓▓████        ▓▓████    ▓▓
+      ▓▓████████      ▓▓██████  ▓▓  ▓▓██████    ▓▓
+    ▓▓██████████▓▓  ▓▓████████▓▓▓▓██████████  ▓▓██
+    ████████████▓▓████████████▓▓████████████▓▓████
+  ████████████████████████████████████████████████
+  ████████████████████████████████████████████████
+  █ claude-fable-5  ·  ▓ claude-haiku-4
+
+  412 requests   $12.40 +3 unpriced cost   5.2M in
+
+  top models
+  claude-fable-5          310 req     4.9M tok    $11.00
+  claude-haiku-4          102 req   780.0k tok     $1.40
+
+  top accounts
+  nick@example.com …      290 req     4.1M tok     $9.30
+  ops@example.com (…      122 req     1.6M tok     $3.10
+
+
+  r range  ·  g group by  ·  ? help  ·  q quit              

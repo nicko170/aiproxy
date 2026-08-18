@@ -515,7 +515,7 @@ func (m Model) View() string {
 	}
 	content = fitHeight(content, contentH)
 
-	return strings.Join([]string{header, tabs, rule, content, m.viewFlash(), footer}, "\n")
+	return clipAnsi(strings.Join([]string{header, tabs, rule, content, m.viewFlash(), footer}, "\n"), m.width)
 }
 
 // lamp is the one-glyph answer to "is anything wrong?": the worst severity
@@ -616,7 +616,7 @@ func (m Model) viewFooter() string {
 	var keys []string
 	switch {
 	case m.login.active:
-		keys = []string{"enter submit code", "o open url", "esc cancel"}
+		keys = []string{"enter submit code", "ctrl+o open url", "esc cancel"}
 	case m.help:
 		keys = []string{"esc close"}
 	default:
@@ -626,28 +626,33 @@ func (m Model) viewFooter() string {
 		case screenActivity:
 			keys = m.activityFooter()
 		case screenUsage:
-			keys = []string{"r range", "g group by", "j/k top table"}
+			keys = []string{"r range", "g group by"}
 		case screenAccounts:
 			keys = m.accountsFooter()
 		case screenSettings:
 			keys = m.settingsFooter()
 		}
 	}
-	keys = append(keys, "? help", "q quit")
+	global := []string{"? help", "q quit"}
 
-	var parts []string
-	for _, k := range keys {
-		key, _, found := strings.Cut(k, " ")
-		if !found {
-			parts = append(parts, th.dim(k))
-			continue
+	render := func(ks []string) string {
+		var parts []string
+		for _, k := range ks {
+			key, rest, found := strings.Cut(k, " ")
+			if !found {
+				parts = append(parts, th.dim(k))
+				continue
+			}
+			parts = append(parts, th.accent(key)+" "+th.dim(rest))
 		}
-		parts = append(parts, th.accent(key)+" "+th.dim(k[len(key)+1:]))
+		return "  " + strings.Join(parts, th.dim("  ·  "))
 	}
-	line := "  " + strings.Join(parts, th.dim("  ·  "))
-	for lipgloss.Width(line) > m.width && len(parts) > 2 {
-		parts = parts[1:] // shed leftmost screen keys before the global pair
-		line = "  " + strings.Join(parts, th.dim("  ·  "))
+	line := render(append(append([]string{}, keys...), global...))
+	// Too narrow: shed screen keys from the right, least essential last-
+	// listed first; the global pair always survives.
+	for lipgloss.Width(line) > m.width && len(keys) > 0 {
+		keys = keys[:len(keys)-1]
+		line = render(append(append([]string{}, keys...), global...))
 	}
 	return padAnsi(line, m.width)
 }
@@ -718,6 +723,47 @@ func fitHeight(s string, h int) string {
 	return strings.Join(lines, "\n")
 }
 
+// clipAnsi hard-cuts every line of s at width cells, ANSI-aware. This is the
+// frame's last line of defence: a line that would wrap turns the whole
+// screen to rubble, so an over-long one is cut instead, keeping its styling
+// closed with a reset.
+func clipAnsi(s string, width int) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if lipgloss.Width(line) <= width {
+			continue
+		}
+		var b strings.Builder
+		cells, styled := 0, false
+		r := []rune(line)
+		for j := 0; j < len(r); j++ {
+			if r[j] == '\x1b' {
+				k := j + 1
+				if k < len(r) && r[k] == '[' {
+					for k < len(r) && r[k] != 'm' {
+						k++
+					}
+				}
+				seq := string(r[j:min(k+1, len(r))])
+				b.WriteString(seq)
+				styled = seq != "\x1b[0m"
+				j = k
+				continue
+			}
+			if cells >= width {
+				break
+			}
+			b.WriteRune(r[j])
+			cells++
+		}
+		if styled {
+			b.WriteString("\x1b[0m")
+		}
+		lines[i] = b.String()
+	}
+	return strings.Join(lines, "\n")
+}
+
 // padAnsi pads s with spaces to width cells, ANSI-aware, truncating by
 // dropping nothing (headers compose themselves to fit; this only pads).
 func padAnsi(s string, width int) string {
@@ -760,6 +806,14 @@ func bucketRank(name string) int {
 	default:
 		return 2
 	}
+}
+
+// plural renders a count with its noun, without the "(s)" shrug.
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // bucketLabel renders a provider bucket name as its instrument label.
