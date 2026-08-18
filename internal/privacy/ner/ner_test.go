@@ -774,3 +774,182 @@ func TestRealDetectorTruncatesAndReportsAtTheConfiguredDefault(t *testing.T) {
 		}
 	}
 }
+
+// A MULTI-TOKEN entity straddling a window boundary is the case the local
+// de-duplication cannot handle, and the case TestScanDeduplicatesAcrossOverlapping-
+// Windows cannot reach: that test tags a single S- token, which is boundary-immune
+// and can only ever decode identically in both windows.
+//
+// Here window i sees only the entity's first tokens, and Decode's "close on O, E,
+// or S" terminal constraint forces a legal tag onto its last token — yielding a
+// TRUNCATED span. Window i+1 sees the entity whole and yields the full span.
+// Different (Start, End) pairs, so Scan returns BOTH. The guarantee that only the
+// full span is redacted lives in privacy.Resolve, so that is what this asserts.
+func TestBoundaryEntityResolvesToOneFullSpan(t *testing.T) {
+	d, fake := newFakeDetector(t, []string{"private_person"})
+	// Shrunk from 2048/512: forcing this at the real window size would need
+	// megabytes of fixture for no extra coverage.
+	d.window, d.overlap = 8, 4
+
+	// 20 bytes, one token per byte under byteTokenizer. Windows are [0,8),
+	// [4,12), [8,16), [12,20). The entity is absolute tokens [6,10) — inside
+	// window 1 whole, and cut by the boundaries of windows 0 and 2.
+	const text = "0123456789abcdefghij"
+	const entStart, entEnd = 6, 10
+
+	// Tag by ABSOLUTE token, which is what a real model does: the same token
+	// gets the same tag whichever window it is seen in.
+	fake.tag = func(w, i int) int {
+		abs := w*(d.window-d.overlap) + i
+		switch {
+		case abs == entStart:
+			return labelIndex(t, d, "B-private_person")
+		case abs > entStart && abs < entEnd-1:
+			return labelIndex(t, d, "I-private_person")
+		case abs == entEnd-1:
+			return labelIndex(t, d, "E-private_person")
+		}
+		return labelIndex(t, d, "O")
+	}
+
+	got, err := d.Scan(context.Background(), text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range got {
+		t.Logf("Scan returned [%d,%d) %q", f.Start, f.End, text[f.Start:f.End])
+	}
+
+	// The premise: Scan itself emits differently-clipped spans for one entity.
+	// If this stops being true the test below stops proving anything, so it is
+	// asserted rather than assumed.
+	var sawFull, sawClipped bool
+	for _, f := range got {
+		switch {
+		case f.Start == entStart && f.End == entEnd:
+			sawFull = true
+		case f.Start >= entStart && f.End <= entEnd:
+			sawClipped = true
+		}
+	}
+	if !sawFull {
+		t.Fatalf("no window decoded the whole entity [%d,%d): %+v", entStart, entEnd, got)
+	}
+	if !sawClipped {
+		t.Fatalf("the fixture no longer produces a clipped span, so it cannot "+
+			"exercise the case it exists for: %+v", got)
+	}
+
+	// The guarantee, where it actually lives: Resolve drops a span overlapping
+	// one already kept and keeps the longer, so the clipped spans disappear and
+	// the whole entity is redacted exactly once.
+	resolved := privacy.Resolve([][]privacy.Finding{got})
+	if len(resolved) != 1 {
+		t.Fatalf("Resolve returned %d findings, want 1 covering the whole entity: %+v",
+			len(resolved), resolved)
+	}
+	if resolved[0].Start != entStart || resolved[0].End != entEnd {
+		t.Errorf("resolved span = [%d,%d) %q, want [%d,%d) %q",
+			resolved[0].Start, resolved[0].End, text[resolved[0].Start:resolved[0].End],
+			entStart, entEnd, text[entStart:entEnd])
+	}
+	// And nothing is redacted twice: a byte covered by two findings would be
+	// substituted, then substituted again inside already-placeholder text.
+	covered := map[int]int{}
+	for _, f := range resolved {
+		for b := f.Start; b < f.End; b++ {
+			covered[b]++
+		}
+	}
+	for b, n := range covered {
+		if n > 1 {
+			t.Errorf("byte %d is covered by %d findings", b, n)
+		}
+	}
+}
+
+// Exact duplicates from the overlap must still collapse inside Scan, so the
+// best-effort dedup is not dead code that Resolve merely papers over.
+func TestScanStillCollapsesExactDuplicatesAtASmallWindow(t *testing.T) {
+	d, fake := newFakeDetector(t, []string{"private_person"})
+	d.window, d.overlap = 8, 4
+	const text = "0123456789abcdefghij"
+	// Absolute token 5 is inside both window 0 [0,8) and window 1 [4,12), and a
+	// single-token S- entity decodes identically in both.
+	fake.tag = func(w, i int) int {
+		if w*(d.window-d.overlap)+i == 5 {
+			return labelIndex(t, d, "S-private_person")
+		}
+		return labelIndex(t, d, "O")
+	}
+	got, err := d.Scan(context.Background(), text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	for _, f := range got {
+		if f.Start == 5 && f.End == 6 {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("the identical span [5,6) was returned %d times: %+v", n, got)
+	}
+}
+
+// ModelState must distinguish "not installed" from "installed, not yet used":
+// they call for different messages in the TUI — run the install, versus nothing
+// is wrong.
+func TestModelStateReportsAbsentWhenTheAssetsAreMissing(t *testing.T) {
+	d, err := New(Options{Dir: filepath.Join(t.TempDir(), "nothing-here"),
+		Labels: []string{"private_person"}, MaxScanBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.ModelState(); got != stateAbsent {
+		t.Errorf("ModelState with no assets on disk = %q, want %q", got, stateAbsent)
+	}
+}
+
+// A directory with the right filenames but wrong contents is NOT installed:
+// Present verifies digests, so a partial or corrupted fetch reports absent
+// rather than pretending to be ready.
+func TestModelStateReportsAbsentForAnUnverifiedInstall(t *testing.T) {
+	dir := t.TempDir()
+	assets, err := Assets(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		t.Skipf("no ONNX Runtime build for this platform: %v", err)
+	}
+	for _, a := range assets {
+		if err := os.WriteFile(filepath.Join(dir, a.Name), []byte("not the real file"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d, err := New(Options{Dir: dir, Labels: []string{"private_person"}, MaxScanBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.ModelState(); got != stateAbsent {
+		t.Errorf("ModelState with wrong-digest files = %q, want %q", got, stateAbsent)
+	}
+}
+
+// The other half, against the real install: present but not yet exercised must
+// report "installed", and only become "ready" once a scan has built the session.
+func TestModelStateReportsInstalledBeforeTheFirstScan(t *testing.T) {
+	dir := modelDir(t)
+	d, err := New(Options{Dir: dir, Labels: []string{"private_person"}, MaxScanBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if got := d.ModelState(); got != stateInstalled {
+		t.Fatalf("ModelState before the first scan = %q, want %q", got, stateInstalled)
+	}
+	if _, err := d.Scan(context.Background(), adaSentence); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.ModelState(); got != stateReady {
+		t.Errorf("ModelState after a successful scan = %q, want %q", got, stateReady)
+	}
+}

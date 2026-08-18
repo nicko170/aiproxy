@@ -36,15 +36,24 @@ const (
 	overlap = window / 4
 )
 
-// Model states reported by ModelState. "off" means the detector can never load
-// because no category is enabled; "absent" means it has not been loaded yet,
-// including the case where the assets are not on disk at all.
+// Model states reported by ModelState. They are distinct because they call for
+// different messages: "absent" means run the install, "installed" means it is
+// there and simply has not been needed yet, "error" means the install is broken.
 const (
-	stateOff     = "off"
-	stateAbsent  = "absent"
-	stateLoading = "loading"
-	stateReady   = "ready"
-	stateError   = "error"
+	// stateOff: no category is enabled, so nothing can ever load. Reporting
+	// "absent" here would imply something is missing that is not.
+	stateOff = "off"
+	// stateAbsent: the assets are not on disk (or not at the verified digest).
+	// The fix is to fetch them.
+	stateAbsent = "absent"
+	// stateInstalled: the assets are on disk and verified, but the session has
+	// not been built because no scan has needed it yet. Lazy loading is
+	// deliberate, so this is the steady state of a correctly installed model on
+	// an idle proxy — not a problem to report.
+	stateInstalled = "installed"
+	stateLoading   = "loading"
+	stateReady     = "ready"
+	stateError     = "error"
 )
 
 // encoder is the tokenizer as the detector uses it.
@@ -86,7 +95,12 @@ type Detector struct {
 	trans    [][]float32
 	session  runner
 	enabled  map[string]privacy.Label
-	state    atomic.Value // string: off, absent, loading, ready, error
+	state    atomic.Value // string: off, absent, installed, loading, ready, error
+
+	// window and overlap are the constants below, held as fields only so a test
+	// can shrink them. Forcing a multi-token entity across a real 2048-token
+	// boundary would need megabytes of fixture; at window=8 it is six lines.
+	window, overlap int
 }
 
 // New builds a detector. It validates every requested category against the
@@ -101,14 +115,28 @@ func New(o Options) (*Detector, error) {
 		}
 		d.enabled[name] = label
 	}
-	switch {
-	case len(d.enabled) == 0:
-		// Nothing can ever load, so "absent" would imply something is missing
-		// that is not.
+	d.window, d.overlap = window, overlap
+	if len(d.enabled) == 0 {
 		d.state.Store(stateOff)
-	default:
-		d.state.Store(stateAbsent)
+		return d, nil
 	}
+	// Whether the assets are actually on disk is the difference between "run
+	// aiproxy privacy install" and "ready, not yet used", and that distinction is
+	// surfaced in view.Status.Privacy.ModelState and rendered in the TUI. It can
+	// only be answered by verifying digests, which costs a full read of ~850MB —
+	// measured at 350-640ms on an SSD, since SHA256 is hardware-accelerated.
+	// Paid synchronously and once, on a path that only runs when an operator has
+	// opted into the model and already downloaded the weights, in exchange for
+	// never reporting a transiently wrong state.
+	d.state.Store(stateAbsent)
+	if assets, err := Assets(runtime.GOOS, runtime.GOARCH); err == nil {
+		if Present(o.Dir, assets) {
+			d.state.Store(stateInstalled)
+		}
+	}
+	// An Assets error means this platform has no ONNX Runtime build at all, so
+	// nothing can be installed and "absent" is the honest answer; the first scan
+	// then fails with the reason.
 	return d, nil
 }
 
@@ -157,11 +185,20 @@ func (d *Detector) Scan(ctx context.Context, text string) ([]privacy.Finding, er
 	}
 	seen := map[key]bool{}
 	var out []privacy.Finding
-	for base := 0; base < len(toks); base += window - overlap {
+	win, ov := d.window, d.overlap
+	if win <= 0 {
+		win = window
+	}
+	if ov < 0 || ov >= win {
+		// A step of zero or less would never terminate. Clamping rather than
+		// erroring keeps a bad injection a slow scan instead of a hung request.
+		ov = win / 4
+	}
+	for base := 0; base < len(toks); base += win - ov {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		end := min(base+window, len(toks))
+		end := min(base+win, len(toks))
 		chunk := toks[base:end]
 
 		ids := make([]int64, len(chunk))
@@ -211,9 +248,31 @@ func (d *Detector) Scan(ctx context.Context, text string) ([]privacy.Finding, er
 				Start: start, End: stop,
 				Label: label, Rule: "ner:" + sp.Label, Confidence: sp.Score,
 			}
+			// De-duplication here is BEST-EFFORT, and deliberately so. It
+			// catches the exact duplicate the overlap region produces: an
+			// entity seen whole in two windows decodes to the same
+			// (start, end, label) twice.
+			//
+			// What it does NOT catch is the same entity reported with
+			// DIFFERENT bounds. An entity straddling a boundary is only
+			// partly inside window i, and Decode's "close on O, E, or S"
+			// terminal constraint then forces a legal tag onto that window's
+			// last token — yielding a TRUNCATED span [p,r). Window i+1 sees
+			// the entity whole in the overlap and yields the full [p,q) with
+			// q > r. Different keys, so both survive this map and both are
+			// returned.
+			//
+			// That is safe because it is not the last word: privacy.Resolve
+			// runs downstream over every detector's findings and drops any
+			// span overlapping one already kept, keeping the LONGER of two —
+			// so [p,r) is discarded and only [p,q) is redacted. Widening the
+			// key or merging spans here would duplicate a guarantee that
+			// already exists one layer up, and get it subtly differently.
+			// TestBoundaryEntityResolvesToOneFullSpan pins the end-to-end
+			// behaviour, because that is where the guarantee actually lives.
 			k := key{f.Start, f.End, f.Label}
 			if seen[k] {
-				continue // the overlap region reported it twice
+				continue // the overlap region reported it twice, identically
 			}
 			seen[k] = true
 			out = append(out, f)
@@ -287,8 +346,8 @@ func (d *Detector) load() error {
 	return d.loadErr
 }
 
-// ModelState is what view.Status.Privacy reports: off, absent, loading, ready, or
-// error.
+// ModelState is what view.Status.Privacy reports: off, absent, installed,
+// loading, ready, or error.
 func (d *Detector) ModelState() string {
 	v, _ := d.state.Load().(string)
 	if v == "" {

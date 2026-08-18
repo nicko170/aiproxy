@@ -41,7 +41,12 @@ type Status struct {
 // PrivacyStatus is the privacy filter's state and counters.
 type PrivacyStatus struct {
 	Enabled bool `json:"enabled"`
-	// ModelState is off, absent, downloading, loading, ready, or error.
+	// ModelState is off, absent, downloading, installed, loading, ready, or
+	// error. The distinctions carry different messages: "absent" means fetch the
+	// assets, "installed" means they are present and verified but no scan has
+	// needed the session yet (loading is lazy, so this is the steady state of a
+	// correctly installed model on an idle proxy), and "error" means the install
+	// is broken.
 	ModelState    string `json:"modelState"`
 	DownloadedPct int    `json:"downloadedPct,omitempty"`
 	// Redactions counts distinct values replaced, per label, this session.
