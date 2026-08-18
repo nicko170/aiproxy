@@ -34,6 +34,7 @@ var routeFor = map[string]struct{ method, pattern string }{
 	"Login":               {http.MethodPost, ReservedPrefix + "/api/v1/accounts/login"},
 	"ImportCredentials":   {http.MethodPost, ReservedPrefix + "/api/v1/accounts/import"},
 	"ProbeNow":            {http.MethodPost, ReservedPrefix + "/api/v1/probe"},
+	"ApplyUpdate":         {http.MethodPost, ReservedPrefix + "/api/v1/update"},
 }
 
 // unroutedAllowlist names Source methods deliberately reachable through no

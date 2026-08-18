@@ -40,6 +40,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))
 		cp.Post("/api/v1/probe", probeNowHandler(o))
+		cp.Post("/api/v1/update", applyUpdateHandler(o))
 		cp.Post("/api/v1/accounts/import", importCredentialsHandler(o))
 
 		// Login is the one view.Source method served by more than a single

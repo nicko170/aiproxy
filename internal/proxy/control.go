@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -444,4 +445,40 @@ func writeMutationError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+}
+
+// applyUpdateHandler installs the latest release over the running binary. It
+// answers before any restart happens, because none does: the response says
+// what was installed and that a restart is needed, which is all this endpoint
+// can honestly promise (see view.Source.ApplyUpdate).
+func applyUpdateHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		res, err := src.ApplyUpdate(r.Context())
+		if err != nil {
+			writeUpdateError(w, err)
+			return
+		}
+		writeJSON(w, res)
+	})
+}
+
+// writeUpdateError maps internal/updater's sentinels to statuses that mean
+// something distinct to a client. Collapsing all of these into 500 would tell
+// an operator to file a bug when the real answer is "re-run the installer"
+// (403), "this is a dev build" (412), or "one is already running" (409). A
+// failed checksum is 502 rather than 500: the upstream release served bytes
+// that did not match its own manifest, and nothing local is wrong.
+func writeUpdateError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, updater.ErrUpdateInProgress):
+		writeError(w, http.StatusConflict, "invalid_request_error", err.Error())
+	case errors.Is(err, updater.ErrDevBuild):
+		writeError(w, http.StatusPreconditionFailed, "invalid_request_error", err.Error())
+	case errors.Is(err, updater.ErrNotWritable):
+		writeError(w, http.StatusForbidden, "permission_error", err.Error())
+	case errors.Is(err, updater.ErrChecksumMismatch):
+		writeError(w, http.StatusBadGateway, "api_error", err.Error())
+	default:
+		writeError(w, http.StatusInternalServerError, "internal_error", err.Error())
+	}
 }
