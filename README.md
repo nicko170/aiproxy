@@ -95,6 +95,207 @@ the same origin as the release asset, so it defends against a corrupted or
 truncated download. It is not a signature: anyone who could publish a release
 could publish its checksum too. Release signing isn't implemented yet.
 
+## Privacy filter
+
+aiproxy can scan request bodies for secrets and personal information before
+they leave your machine, replacing each match with a stable placeholder and
+restoring the original value in the response so the agent never sees the
+substitution. **It is off by default.**
+
+**Every key under `privacy` takes effect on restart, not immediately** — the
+detector set, the allowlist and denylist, the failure modes, the cache's salt,
+and (when the model is configured) its session are all built once at startup,
+the same way `update.checkIntervalHours` is. Flipping `enabled` on does **not**
+turn on protection for the request you send next; it schedules protection for
+after you restart aiproxy. `enabled` and `denylist` are editable from the
+Settings screen, and it marks each one `saved · restart to apply` the moment you
+change it, so you're not left guessing there. `onScanFailure`,
+`onUnresolvedPlaceholder` and `scanTimeoutMS` have no Settings-screen row yet —
+edit them in `config.json` or through `POST /_aiproxy/api/v1/settings` — and
+nothing in the TUI will tell you a restart is pending for those three. Either
+way: restart before you trust it.
+
+```json
+"privacy": {
+  "enabled": false,
+  "onScanFailure": "closed",
+  "onUnresolvedPlaceholder": "passthrough",
+  "scanTimeoutMS": 10000,
+  "rules": { "builtinSecrets": true, "entropy": true },
+  "denylist": [],
+  "allowlistExtra": [],
+  "cacheEntries": 50000,
+  "ner": {
+    "enabled": false,
+    "labels": [],
+    "maxScanBytes": 4096
+  }
+}
+```
+
+Turning `enabled` on turns on the deterministic rules (`rules.builtinSecrets`
+and `rules.entropy`), because those are the reason to enable the filter at
+all — pattern-matched credentials (API keys, tokens, connection strings) and,
+with `entropy` on, high-entropy strings assigned to a credential-shaped
+variable. `denylist` adds your own literal strings or patterns to redact;
+`allowlistExtra` exempts values the rules would otherwise catch.
+`cacheEntries` bounds the LRU that remembers a string's findings so a repeated
+value (a system prompt sent on every turn) is not rescanned.
+
+The local NER model (`ner`) adds detection for prose PII — email addresses,
+phone numbers, physical addresses, and personal names — but **every label is
+individually opt-in, and the default set is empty even when `ner.enabled` is
+true.** Two categories the model supports, `private_url` and `private_date`,
+are deliberately left for you to enable rather than defaulted on: source code
+is full of import URLs, API endpoints, documentation links, changelog dates,
+and licence years, none of which are a privacy concern, and redacting them
+corrupts the agent's context for almost no privacy gain. `maxScanBytes`
+(default 4096) bounds how much of any one string the model looks at — see
+"Cost and limits" below; the deterministic rules have no such cap.
+
+### Installing the model
+
+The NER model is not bundled — it's roughly **850 MB** (a 27.9 MB tokenizer,
+an 809 MB quantized ONNX model and its weights file, and a 7–12 MB platform
+ONNX Runtime library), so it is fetched on demand:
+
+```sh
+aiproxy privacy install   # downloads and verifies every asset (~850 MB)
+aiproxy privacy status    # reports what's installed
+```
+
+Every download is checked against a SHA-256 digest compiled into the binary
+before it's used. The model is pinned to Hugging Face revision
+`7ffa9a043d54d1be65afb281eddf0ffbe629385b`, and the runtime to ONNX Runtime
+v1.23.2, so an install today and an install next year fetch byte-identical
+files. Supported platforms are darwin/arm64, darwin/amd64, linux/amd64, and
+linux/arm64 — there's no ONNX Runtime build for Windows in that pin, so the
+model tier is unavailable there. The deterministic rules have no such
+restriction and work on every platform.
+
+### Cost and limits
+
+Running the model costs real time. Measured on an Apple M3 Pro (darwin/arm64,
+CPU), with the benchmarks at the end of this section:
+
+| Input | Tokens | Latency | Throughput |
+|---|---|---|---|
+| 512 B | 166 | 126 ms | 1,321 tok/s |
+| 2 KB | 663 | 281 ms | 2,356 tok/s |
+| 4 KB | 1,325 | 589 ms | 2,249 tok/s |
+| 16 KB | 5,313 | 3.42 s | 1,553 tok/s |
+
+Three things in that curve matter more than the headline number. There is a
+**fixed cost of roughly 30–55 ms per scan**, so a short string is dominated by
+setup rather than inference — which is much of why the cache earns its keep.
+Throughput **peaks around 2,000 tokens and falls after**, because past one
+2,048-token window the 25% overlap re-processes tokens: 16 KB pays about a 50%
+tax. And **concurrency buys nothing** — inference is serialized, so twelve
+cores deliver one core's throughput, and ~2,300 tok/s is the ceiling for the
+whole process, not per request.
+
+That last point is the one to size against: at 4 KB per newly-seen string,
+that is under two fresh scans a second for the entire proxy. Resent
+conversation history is served from the cache and costs nothing, so steady
+state is far better than that — but a burst of new conversations queues.
+
+By comparison the deterministic rules scan the same 4 KB in **0.91 ms**, about
+650× faster, and have **no cap** — so a credential or denylisted value anywhere
+in a large file is still caught. Tokenization is not the cost either: it runs
+at 1.4M tok/s, under 0.2% of a scan, so a slow scan is always inference.
+
+This is why `ner.maxScanBytes` defaults to 4096. A string longer than the cap
+is scanned by the model only up to the cap, and the truncation is logged, never
+silent, so it isn't mistaken for a full scan.
+
+Numbers taken on one machine are worth exactly that, so the benchmarks are
+committed — measure your own silicon:
+
+```sh
+AIPROXY_MODEL_DIR=~/.config/aiproxy/models/privacy-filter \
+  go test ./internal/privacy/ner -run '^$' -bench . -benchtime 10x
+go test ./internal/privacy/rules -run '^$' -bench . -benchtime 200x
+```
+
+They skip without `AIPROXY_MODEL_DIR`, so an ordinary `go test ./...` still
+needs no download.
+
+### Failure modes
+
+`onScanFailure` (default `closed`) governs the request side: if the filter
+can't scan a request — the model isn't installed, a detector errors, the scan
+runs past `scanTimeoutMS` — `closed` refuses the request rather than sending it
+upstream unfiltered, because a privacy filter that silently degrades is worse
+than no filter: you'd believe you were protected exactly when you weren't.
+Setting it to `open` sends the request unfiltered and records that it happened.
+
+Either way it is recorded, and that recording is the point: the header shows
+`⊘ filter error` while a scan is failing, and `⊘ 3 unfiltered` for as long as
+the session has sent anything upstream unscanned. Both outrank the redaction
+count, because a count is reassurance and you should never be shown reassurance
+in place of a fault.
+
+One thing outranks both of those: `⊘ 2 unresolved`, a placeholder that came
+back from upstream with no entry in this request's restore table. A filter
+error tells you a scan didn't happen; an unresolved placeholder means one did,
+and the reversal it promised didn't hold — so it wins the header outright.
+
+`scanTimeoutMS` (default 10000) bounds the whole request's scan. It is the only
+ceiling on the latency the filter adds — scanning happens before the retry loop,
+so `retry.budgetMS` doesn't cover it, and `ner.maxScanBytes` bounds one string
+rather than one request. With the model tier off (the default) the rules are
+microseconds and this never fires. With it on, 10 s is roughly seventeen
+freshly-seen 4 KB strings at the measured 589 ms each; past that the scan
+expires and `onScanFailure` decides what happens. Raise it if you'd rather wait than refuse. There's no
+"unbounded" value: a 0 is read as unset and replaced by the default.
+
+`onUnresolvedPlaceholder` (default `passthrough`) governs the response side:
+if a response contains a placeholder that isn't in this request's restore
+table, `passthrough` emits it verbatim and counts it, because the
+alternative — guessing at the original value — means writing a wrong value
+into your files. Setting it to `error` severs the stream instead.
+
+### What is and isn't protected
+
+Deterministic rules catch credentials and internal identifiers, anywhere in a
+request, regardless of size: recognised vendor token formats, PEM blocks, JWTs,
+connection strings, credential-shaped assignments, and your own `denylist`
+entries. Entropy is a *qualifier* on those rules, not a detector of its own —
+a bare high-entropy string with no keyword, assignment or vendor prefix around
+it is not flagged, because in real source code that shape is far more often a
+checksum, a UUID, or a minified asset than a secret, and replacing one with a
+placeholder derails the agent. The NER model, where enabled, catches prose PII like names and contact
+details. Neither protects **the source code itself** — the agent needs to
+read and write your code to do its job, and no redaction scheme can change
+that. This filter is about what leaves your machine as an incidental,
+extractable secret or personal detail, not about hiding your codebase from
+the model you're paying to work on it.
+
+Two shapes of request are **never filtered**, by design, and both are worth
+knowing about:
+
+- **The passthrough paths** — `/api/oauth/file_upload`, `/api/oauth/files/`,
+  `/v1/code/`, and `/v1/oauth/token`. These carry your own paired credential
+  rather than a rotated account's, and they're relayed byte-for-byte: redacting
+  a credential the far end has to verify just breaks authentication. **File
+  uploads go through `/api/oauth/file_upload`, so a file you attach is not
+  scanned.** The filter covers what your agent *sends as model context*, not
+  what you hand the provider directly.
+- **Any request body that isn't JSON.** The filter works by walking JSON string
+  values, so a multipart or form-encoded body has nothing it can read. Those
+  pass through unfiltered rather than being refused — refusing would break
+  uploads outright under the default failure mode — and each one increments the
+  same `unfiltered` counter the header shows.
+
+There is one intentional, residual disclosure even when everything works:
+each placeholder is a keyed hash of the original value, so the same secret
+always produces the same placeholder within an install. That's what keeps
+the provider's prompt cache working across turns — a value that changed
+identity on every request would bust the cache on every request. It does
+tell the provider "this is the same value as before, whatever it is": a
+hash, not the value, but a hash is still a bit of information they didn't
+have.
+
 ## Quick start
 
 ```sh
@@ -150,7 +351,10 @@ priority, `x` removes, and `enter` opens detail.
 
 Config lives at `~/.config/aiproxy/config.json` (honouring `XDG_CONFIG_HOME`),
 with the accounting database beside it at `metrics.db`. Both are written for
-you on first run; the Settings screen edits most of it live.
+you on first run. The Settings screen edits a subset of it: `switchThreshold`,
+`sessionAffinity` and `update.checkEnabled` apply immediately, everything else
+is written to disk and marked `saved · restart to apply`, because the objects
+that read those values are built once at startup.
 
 ```json
 {
@@ -160,7 +364,8 @@ you on first run; the Settings screen edits most of it live.
   "quotaProbe": { "intervalSeconds": 300 },
   "metrics": { "retentionDays": 90 },
   "mitm": { "enabled": true },
-  "update": { "checkEnabled": true, "checkIntervalHours": 24 }
+  "update": { "checkEnabled": true, "checkIntervalHours": 24 },
+  "privacy": { "enabled": false }
 }
 ```
 
@@ -173,7 +378,9 @@ you on first run; the Settings screen edits most of it live.
   byte — backoff, waiting on a paused account, absorbing a rate limit,
   refreshing a credential. **`headerTimeoutMs`** bounds one attempt's wait for
   upstream headers, which is the model's own thinking time. They are two
-  separate clocks on purpose; conflating them cancels healthy requests.
+  separate clocks on purpose; conflating them cancels healthy requests. Note
+  that the privacy scan is a *third*: it runs before the retry loop, so
+  `budgetMs` does not cover it and `privacy.scanTimeoutMS` bounds it instead.
 - **`quotaProbe.intervalSeconds`** defaults to 300 because the zero-spend usage
   endpoint is itself rate limited — polling it aggressively gets the probe
   throttled and leaves selection deciding on stale numbers. Set it to `0` to
@@ -181,6 +388,8 @@ you on first run; the Settings screen edits most of it live.
 - **`update.checkEnabled`** turns the daily release check on or off and takes
   effect immediately; **`checkIntervalHours`** takes effect on restart, because
   the checker's ticker is built once at startup. See [Updating](#updating).
+- **`privacy`** is shown collapsed above; every key in it, and the fact that all
+  of them are restart-gated, is in [Privacy filter](#privacy-filter).
 
 ## Flags
 
@@ -192,8 +401,9 @@ you on first run; the Settings screen edits most of it live.
 | `--log-level` | `debug`, `info`, `warn`, or `error` |
 | `--version` | print version and exit |
 
-One subcommand: `aiproxy update` (see [Updating](#updating)). Everything else is
-flags.
+Two subcommands: `aiproxy update` (see [Updating](#updating)) and `aiproxy
+privacy install` / `aiproxy privacy status` (see [Privacy filter](#privacy-filter)).
+Everything else is flags.
 
 `--headless` is how you run it as a service. The TUI and stderr logging can't
 share a terminal, so under the TUI logs feed the Activity screen's ring buffer

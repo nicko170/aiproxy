@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
@@ -294,4 +295,169 @@ func (e *endlessReader) Read(p []byte) (int, error) {
 	}
 	time.Sleep(5 * time.Millisecond)
 	return len(p), nil
+}
+
+// restoreFixture builds a real restorer plus the placeholder its table resolves,
+// so the relay-level tests below exercise the production restore path rather
+// than a stub of it.
+func restoreFixture(t *testing.T) (*privacy.Restorer, string, string) {
+	t.Helper()
+	const secret = "AKIAIOSFODNN7EXAMPLE"
+	f := testFilter(t, privacy.Closed)
+	redacted, table, err := f.Redact(context.Background(),
+		[]byte(`{"messages":[{"role":"user","content":"key `+secret+` here"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end, ok := privacy.FindPlaceholder(string(redacted))
+	if !ok {
+		t.Fatalf("no placeholder was minted: %s", redacted)
+	}
+	return f.Restorer(table), string(redacted[start:end]), secret
+}
+
+// The restoring path holds a whole non-streaming body in memory. A pathological
+// body must hit a stated ceiling rather than being retained without limit, and
+// the ceiling must be an error rather than a silent truncation — a truncated
+// body is a corrupted one.
+func TestRestoreChunkRefusesToBufferPastTheCeiling(t *testing.T) {
+	r, _, _ := restoreFixture(t)
+	opts := RelayOptions{Restore: r, Streaming: false}
+
+	events := make([]byte, maxRestoreBuffer)
+	if _, err := restoreChunk(&events, []byte("one byte over"), opts); err == nil {
+		t.Fatal("restoreChunk accepted a body past maxRestoreBuffer")
+	}
+
+	// The same ceiling applies to a stream, where the held bytes are one
+	// incomplete event rather than a whole body.
+	events = make([]byte, maxRestoreBuffer)
+	if _, err := restoreChunk(&events, []byte("over"), RelayOptions{Restore: r, Streaming: true}); err == nil {
+		t.Fatal("restoreChunk accepted a stream event past maxRestoreBuffer")
+	}
+}
+
+// A stream that ends without a final terminator still has to reach the client:
+// dropping the tail silently loses whatever the last event carried, which on
+// this path is the end of the model's answer.
+func TestFlushRestoreEmitsAStreamThatEndedWithoutATerminator(t *testing.T) {
+	r, placeholder, secret := restoreFixture(t)
+
+	// A complete event, minus the trailing blank line that would frame it.
+	partial := []byte(`event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"key ` + placeholder + `"}}`)
+	events := append([]byte{}, partial...)
+
+	out, err := flushRestore(&events, RelayOptions{Restore: r, Streaming: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), secret) {
+		t.Errorf("the unterminated tail was not restored: %s", out)
+	}
+	if len(events) != 0 {
+		t.Errorf("flushRestore left %d bytes held", len(events))
+	}
+	// Flushing twice must not re-emit: Relay calls it once at EOF, but the held
+	// buffer is shared state and a double emit would duplicate output.
+	again, err := flushRestore(&events, RelayOptions{Restore: r, Streaming: true})
+	if err != nil || len(again) != 0 {
+		t.Errorf("second flush returned %q, %v; want nothing", again, err)
+	}
+}
+
+// The reason the restoring path buffers at all: a placeholder does not respect
+// chunk boundaries, and neither does an SSE event. This splits one event across
+// two relay reads and asserts the client still receives the plaintext — through
+// the real Relay, over a real socket, which is the layer the unit tests above
+// cannot reach.
+func TestRelayRestoresAPlaceholderSplitAcrossReads(t *testing.T) {
+	r, placeholder, secret := restoreFixture(t)
+
+	event := `event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"key ` +
+		placeholder + ` here"}}` + "\n\n"
+	// Cut inside the placeholder itself, which is where the naive
+	// rewrite-each-chunk implementation fails.
+	cut := strings.Index(event, placeholder) + 5
+
+	chunks := &chunkedReader{parts: []string{event[:cut], event[cut:]}}
+	srv := relayServer(t, func() (io.ReadCloser, http.Header) {
+		return io.NopCloser(chunks), http.Header{"Content-Type": []string{"text/event-stream"}}
+	}, RelayOptions{BodyIdle: 5 * time.Second, Streaming: true, Restore: r})
+
+	res, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	got, _ := io.ReadAll(res.Body)
+
+	if !strings.Contains(string(got), secret) {
+		t.Errorf("the split placeholder was not restored: %s", got)
+	}
+	if strings.Contains(string(got), privacy.Sentinel) {
+		t.Errorf("a placeholder reached the client: %s", got)
+	}
+}
+
+// chunkedReader hands out one part per Read, so a caller sees exactly the chunk
+// boundaries the test chose rather than whatever the socket coalesces into.
+type chunkedReader struct {
+	parts []string
+	i     int
+}
+
+func (c *chunkedReader) Read(p []byte) (int, error) {
+	if c.i >= len(c.parts) {
+		return 0, io.EOF
+	}
+	n := copy(p, c.parts[c.i])
+	c.i++
+	return n, nil
+}
+
+// Property 3 through the composed path: a stream with no placeholder sentinel
+// is passed through with NO added buffering.
+//
+// Filter.Redact always returns a table, so before this the relay armed a
+// restorer for EVERY request once the filter was on — including the
+// overwhelming majority that redact nothing. An armed restorer holds bytes
+// until the next event terminator, so an upstream chunk that ends mid-event is
+// withheld entirely: the first chunk here writes zero bytes and the client sees
+// nothing until the next chunk arrives 100ms later.
+func TestRelayIsNotArmedWhenNothingWasRedacted(t *testing.T) {
+	const head = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"one\"}}\n"
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Privacy = testFilter(t, privacy.Closed)
+	}, testutil.Script{
+		Status: 200,
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		SSE: []testutil.SSEChunk{
+			// Deliberately one newline short of an event terminator, which is
+			// exactly what a token stream looks like in the wild: upstream chunk
+			// boundaries have nothing to do with event boundaries.
+			{Data: head},
+			{Delay: 100 * time.Millisecond, Data: "\n"},
+		},
+	})
+
+	start := time.Now()
+	res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"claude-opus-5","messages":[{"role":"user","content":"nothing sensitive at all"}],"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	buf := make([]byte, 4096)
+	n, err := res.Body.Read(buf)
+	firstByte := time.Since(start)
+	if n == 0 {
+		t.Fatalf("no bytes before %v: %v", firstByte, err)
+	}
+	if firstByte > 60*time.Millisecond {
+		t.Errorf("first byte took %v; the stream was buffered to the next event terminator", firstByte)
+	}
+	io.Copy(io.Discard, res.Body)
 }

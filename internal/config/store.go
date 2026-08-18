@@ -54,6 +54,26 @@ func (s *Store) loadLocked() (Config, error) {
 	if cfg.Update.CheckIntervalHours <= 0 {
 		cfg.Update.CheckIntervalHours = Default().Update.CheckIntervalHours
 	}
+	// Bounds handed to an LRU and to a scan budget; a hand-edited 0 or negative
+	// would disable the cache or the model silently.
+	if cfg.Privacy.CacheEntries <= 0 {
+		cfg.Privacy.CacheEntries = Default().Privacy.CacheEntries
+	}
+	if cfg.Privacy.NER.MaxScanBytes <= 0 {
+		cfg.Privacy.NER.MaxScanBytes = Default().Privacy.NER.MaxScanBytes
+	}
+	// There is deliberately no "unbounded" setting: an unbounded scan is the
+	// defect this timeout exists to fix, and a hand-edited 0 would reinstate it
+	// silently. Raise it if you would rather wait than refuse.
+	if cfg.Privacy.ScanTimeoutMS <= 0 {
+		cfg.Privacy.ScanTimeoutMS = Default().Privacy.ScanTimeoutMS
+	}
+	if cfg.Privacy.OnScanFailure == "" {
+		cfg.Privacy.OnScanFailure = Default().Privacy.OnScanFailure
+	}
+	if cfg.Privacy.OnUnresolvedPlaceholder == "" {
+		cfg.Privacy.OnUnresolvedPlaceholder = Default().Privacy.OnUnresolvedPlaceholder
+	}
 	return cfg, nil
 }
 

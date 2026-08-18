@@ -18,6 +18,9 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/privacy"
+	"github.com/nicko170/aiproxy/internal/privacy/ner"
+	"github.com/nicko170/aiproxy/internal/privacy/rules"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
@@ -202,6 +205,120 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 }
 
+// nonEntropyRules drops every rule that leans on an entropy floor to avoid
+// false positives, for when the operator has turned entropy-based detection
+// off entirely.
+//
+// Dropping only the floor — keeping the rule active but unqualified — is not
+// an option: entropy is what stops the generic "assigned credential" rule
+// from firing on every `password = "changeme"` in every example config
+// (see rules.Builtin's doc comment). Disabling entropy while leaving that
+// rule in place would turn the single most false-positive-prone rule in the
+// table into an unconditional one — a false-positive machine, and strictly
+// worse than leaving entropy on. So "entropy: false" means "do not use
+// entropy-based detection at all," i.e. the rule itself is dropped.
+func nonEntropyRules(rs []rules.Rule) []rules.Rule {
+	out := make([]rules.Rule, 0, len(rs))
+	for _, r := range rs {
+		if r.MinEntropy == 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// buildPrivacy assembles the privacy filter from config, or returns nil when it
+// is disabled — which is the default. Detector ORDER is significant: it is the
+// tiebreak privacy.Resolve uses for identical spans, so the deterministic rules
+// are registered before the model.
+func buildPrivacy(cfg config.Config, log *slog.Logger) (*privacy.Filter, error) {
+	if !cfg.Privacy.Enabled {
+		return nil, nil
+	}
+	key, err := privacy.LoadOrCreateKey(privacy.KeyPath())
+	if err != nil {
+		return nil, err
+	}
+	scanFail, err := privacy.ParseFailureMode(cfg.Privacy.OnScanFailure)
+	if err != nil {
+		return nil, err
+	}
+	unresolved := privacy.Passthrough
+	if cfg.Privacy.OnUnresolvedPlaceholder == "error" {
+		unresolved = privacy.ErrorOut
+	}
+
+	// modelState reports the NER model's readiness. It stays nil when no NER
+	// category is enabled, which Filter.ModelState reports as "off" — a filter
+	// running deterministic rules only is fully functional.
+	var modelState func() string
+
+	var dets []privacy.Detector
+	if cfg.Privacy.Rules.BuiltinSecrets {
+		builtin := rules.Builtin()
+		if !cfg.Privacy.Rules.Entropy {
+			builtin = nonEntropyRules(builtin)
+		}
+		rd, err := rules.New(builtin, cfg.Privacy.AllowlistExtra)
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, rd)
+	}
+	if len(cfg.Privacy.Denylist) > 0 {
+		dl, err := rules.NewDenylist(cfg.Privacy.Denylist)
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, dl)
+	}
+	// The model goes LAST, so privacy.Resolve's registration-order tiebreak
+	// gives an identical span to a deterministic rule rather than to a
+	// probabilistic one.
+	if cfg.Privacy.NER.Enabled && len(cfg.Privacy.NER.Labels) > 0 {
+		nd, err := ner.New(ner.Options{
+			Dir:          ner.Dir(),
+			Labels:       cfg.Privacy.NER.Labels,
+			MaxScanBytes: cfg.Privacy.NER.MaxScanBytes,
+			Log:          log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, nd)
+		modelState = nd.ModelState
+	}
+
+	// Enabled with nothing to detect is a legitimate config to write by hand and
+	// a silent no-op to run: "privacy filter active" is logged, the header shows
+	// a filter that is on, Status reports enabled:true, and not one byte is ever
+	// examined. Warn rather than refuse — refusing would turn a harmless
+	// misconfiguration into a proxy that will not start.
+	if len(dets) == 0 {
+		log.Warn("privacy filter is enabled but has no detectors; nothing will be scanned. " +
+			"Set privacy.rules.builtinSecrets, add privacy.denylist entries, or enable privacy.ner with labels.")
+	}
+
+	// The salt carries everything that changes what a scan MEANS, so a toggle or
+	// a denylist edit invalidates the cache without any expiry logic.
+	salt := privacy.Salt(
+		"rules=v1",
+		fmt.Sprintf("builtin=%t", cfg.Privacy.Rules.BuiltinSecrets),
+		fmt.Sprintf("entropy=%t", cfg.Privacy.Rules.Entropy),
+		fmt.Sprintf("deny=%d", len(cfg.Privacy.Denylist)),
+		strings.Join(cfg.Privacy.NER.Labels, ","),
+	)
+	return privacy.New(privacy.Options{
+		Detectors:     dets,
+		Cache:         privacy.NewCache(cfg.Privacy.CacheEntries, salt),
+		Key:           key,
+		Unresolved:    unresolved,
+		OnScanFailure: scanFail,
+		ScanTimeout:   time.Duration(cfg.Privacy.ScanTimeoutMS) * time.Millisecond,
+		ModelState:    modelState,
+	}), nil
+}
+
 // buildHandler wires config into a serving handler. Kept separate from run so
 // tests exercise the real composition without binding a port. The returned
 // *prober.Prober and *updater.Checker are separate from the handler because
@@ -291,11 +408,23 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			HeaderTimeout:   headerTimeout,
 		}, log)
 
+	pf, err := buildPrivacy(cfg, log)
+	if err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("privacy filter: %w", err)
+	}
+	if pf != nil {
+		log.Info("privacy filter active",
+			"onScanFailure", cfg.Privacy.OnScanFailure,
+			"scanTimeoutMS", cfg.Privacy.ScanTimeoutMS,
+			"denylist", len(cfg.Privacy.Denylist),
+			"nerLabels", len(cfg.Privacy.NER.Labels))
+	}
+
 	// view.Local is the presentation seam (spec §3.1): the control API below
 	// reads through it rather than computing anything of its own, which is
 	// what lets a future view.HTTP (a detached daemon) replace it without
 	// internal/proxy's routes changing at all.
-	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd)
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd, pf)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
@@ -309,6 +438,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		PassthroughPrefixes: proxy.DefaultPassthroughPrefixes,
 		Dropped:             ing.Dropped,
 		View:                vl,
+		Privacy:             pf,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,

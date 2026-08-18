@@ -16,6 +16,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
@@ -193,7 +194,7 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 	// TestRouterStatusReportsMetricsDropped) is reflected in what ServerStatus
 	// reports; view.Local captures the func at construction.
 	pb := prober.New(mgr, providers, time.Hour)
-	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped, pb, nil)
+	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped, pb, nil, nil)
 	h.view = vl
 	ho.View = vl
 
@@ -571,5 +572,79 @@ func TestBetaHeaderAndModelReachUpstreamUnaltered(t *testing.T) {
 	}
 	if !strings.Contains(string(got.Body), `"claude-opus-5"`) {
 		t.Errorf("model was rewritten: %s", got.Body)
+	}
+}
+
+// padReader yields an endless run of a byte that is legal inside a JSON string,
+// so a test can stream a body past maxBodyBytes without holding one in memory.
+type padReader struct{}
+
+func (padReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
+}
+
+// A body past maxBodyBytes is REFUSED, not truncated.
+//
+// The proxy used to read exactly maxBodyBytes and forward whatever fitted. With
+// the privacy filter on that was a leak with a trigger anyone could pull: a
+// truncated JSON document is malformed, malformed reads as "not JSON", and a
+// body that is not JSON is passed upstream UNFILTERED — so padding a request
+// past the cap pushed its first 64 MiB, secrets included, to the provider even
+// under onScanFailure:closed. Upstream then rejects it, after receiving it,
+// which is precisely the disclosure the filter exists to prevent.
+//
+// Asserted with the filter both off and on, because truncating a client's
+// request and sending it anyway was never right; the filter only raised the
+// price. Upstream must see ZERO requests either way.
+func TestRouterRefusesOversizeBodyWithoutCallingUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		privacy bool
+	}{
+		{name: "filter off"},
+		{name: "filter on", privacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRouterHarness(t, func(o *HandlerOptions) {
+				if tc.privacy {
+					o.Privacy = testFilter(t, privacy.Closed)
+				}
+			}, testutil.Script{Status: 200, Body: `{}`})
+
+			// A well-formed prefix followed by enough padding to cross the cap:
+			// the leak needed the truncation point to land INSIDE a document,
+			// not on a body that was never JSON to begin with.
+			body := io.MultiReader(
+				strings.NewReader(`{"model":"claude-opus-5","messages":[{"role":"user","content":"`),
+				io.LimitReader(padReader{}, maxBodyBytes+1),
+				strings.NewReader(`"}]}`),
+			)
+			req, err := http.NewRequest(http.MethodPost, h.srv.URL+"/v1/messages", body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("content-type", "application/json")
+
+			res, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			payload, _ := io.ReadAll(res.Body)
+
+			if res.StatusCode != http.StatusRequestEntityTooLarge {
+				t.Errorf("status = %d, want %d for an over-limit body",
+					res.StatusCode, http.StatusRequestEntityTooLarge)
+			}
+			if !strings.Contains(string(payload), "exceeds") {
+				t.Errorf("body = %s, want it to say the request exceeds the limit", payload)
+			}
+			if n := len(h.up.Requests()); n != 0 {
+				t.Fatalf("upstream received %d requests; an over-limit body must send zero", n)
+			}
+		})
 	}
 }

@@ -87,6 +87,86 @@ type Update struct {
 	CheckIntervalHours int  `json:"checkIntervalHours"`
 }
 
+// PrivacyRules toggles the deterministic detectors. Both default on, because
+// they are the reason to enable the filter at all.
+type PrivacyRules struct {
+	BuiltinSecrets bool `json:"builtinSecrets"`
+	Entropy        bool `json:"entropy"`
+}
+
+// PrivacyNER configures the local NER model.
+//
+// Labels is empty by default and every entry is opt-in. private_url and
+// private_date in particular would be destructive in source code, where import
+// URLs, API endpoints, doc links, changelog dates, and licence years are
+// everywhere — redacting them corrupts the agent's context for almost no privacy
+// gain.
+//
+// MaxScanBytes bounds how much of any ONE decoded string the model looks at, and
+// it is a LATENCY bound wearing a size limit's clothes. Measured on darwin/arm64
+// CPU: ~0.5 ms/token, ~4 bytes/token. 4 KB scans in ~520 ms, 16 KB in ~2.84 s,
+// and the original 262144 default extrapolated to ~45 s inside one Scan — with
+// the NER runner's Run serialised by a mutex, that is a head-of-line block on
+// every other request. 4 KB bounds the worst case for a newly-seen string to
+// roughly the same order as the p95 TTFB this proxy already reports, so the
+// model does not dominate a request it is only assisting.
+//
+// The recall tradeoff, stated plainly because the cap otherwise reads as a bug:
+// a string longer than the cap is scanned by the model only up to the cap, so
+// prose PII in the TAIL of a large file is missed by the model tier, and the
+// truncation is logged every time it happens. That is acceptable because the
+// deterministic rules have NO cap and still scan the whole string — credentials
+// and denylist entries anywhere in a large file are caught regardless. The model
+// tier exists for prose PII, and prose messages are short; large blobs are the
+// rules' domain.
+type PrivacyNER struct {
+	Enabled      bool     `json:"enabled"`
+	Labels       []string `json:"labels"`
+	MaxScanBytes int      `json:"maxScanBytes"`
+}
+
+// Privacy configures the local privacy filter.
+//
+// Enabled defaults to FALSE. The filter rewrites request bodies, and that is not
+// a behaviour to acquire silently on upgrade — but once it is on, the
+// deterministic rules come with it.
+// ScanTimeoutMS bounds the DETECTION work in a request's scan — every string
+// in the body, aggregated — which is the only ceiling on the latency the filter
+// adds once the model is up. It does NOT bound the model's one-time load: that
+// happens inside the first Scan that needs it, under a sync.Once, and takes no
+// context, so the first request after startup (and any request queued behind it)
+// pays an ~850 MB load that this deadline cannot interrupt. Every scan after
+// that is bounded. Redaction runs synchronously in proxyHandler,
+// before the attempt loop, so it sits OUTSIDE retry.budgetMS — the budget that
+// exists precisely to bound the time the proxy adds. maxScanBytes bounds one
+// string (~520 ms at the 4 KB default), not a request: a fresh conversation
+// carrying sixty unseen strings is ~31 s of inference, serialised behind the
+// model runner, and the symptom presents as "aiproxy is timing out" with
+// nothing in the retry budget or account rotation to explain it.
+//
+// Default 10000 ms, deliberately the same figure as retry.budgetMS: the proxy
+// adds at most ~10 s of retry and at most ~10 s of scan, so its own worst-case
+// contribution is one number an operator can hold in their head. With the model
+// tier off — the default — the deterministic rules are microseconds and this
+// never fires. With it on, 10 s is roughly nineteen freshly-seen 4 KB strings;
+// past that the scan expires, which is an ordinary scan failure and therefore
+// obeys onScanFailure. Raise it if you would rather wait than refuse.
+//
+// There is no "unbounded" value: a non-positive setting is replaced by the
+// default on load, because an unbounded scan is precisely the defect this
+// bounds and a hand-edited 0 would reinstate it silently.
+type Privacy struct {
+	Enabled                 bool         `json:"enabled"`
+	OnScanFailure           string       `json:"onScanFailure"`
+	OnUnresolvedPlaceholder string       `json:"onUnresolvedPlaceholder"`
+	ScanTimeoutMS           int          `json:"scanTimeoutMS"`
+	Rules                   PrivacyRules `json:"rules"`
+	Denylist                []string     `json:"denylist"`
+	AllowlistExtra          []string     `json:"allowlistExtra"`
+	CacheEntries            int          `json:"cacheEntries"`
+	NER                     PrivacyNER   `json:"ner"`
+}
+
 type Config struct {
 	Listen     Listen     `json:"listen"`
 	Accounts   []Account  `json:"accounts"`
@@ -96,6 +176,7 @@ type Config struct {
 	Metrics    Metrics    `json:"metrics"`
 	MITM       MITM       `json:"mitm"`
 	Update     Update     `json:"update"`
+	Privacy    Privacy    `json:"privacy"`
 }
 
 // Default returns the configuration for a fresh install.
@@ -114,6 +195,17 @@ func Default() Config {
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},
 		Update:     Update{CheckEnabled: true, CheckIntervalHours: 24},
+		Privacy: Privacy{
+			Enabled:                 false,
+			OnScanFailure:           "closed",
+			OnUnresolvedPlaceholder: "passthrough",
+			ScanTimeoutMS:           10000,
+			Rules:                   PrivacyRules{BuiltinSecrets: true, Entropy: true},
+			Denylist:                []string{},
+			AllowlistExtra:          []string{},
+			CacheEntries:            50000,
+			NER:                     PrivacyNER{Enabled: false, Labels: []string{}, MaxScanBytes: 4096},
+		},
 	}
 }
 

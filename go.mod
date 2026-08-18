@@ -7,6 +7,8 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/charmbracelet/x/term v0.2.2
+	github.com/dlclark/regexp2 v1.12.0
+	github.com/ebitengine/purego v0.10.2
 	github.com/go-chi/chi/v5 v5.3.1
 	modernc.org/sqlite v1.56.0
 )

@@ -128,6 +128,15 @@ The restore table has to reach `Relay`, which is called deep inside
 and the relay does no rewriting at all — which is what keeps the filter's cost
 exactly zero when it is disabled.
 
+**Refined during implementation.** "Nil" is not the right test, because
+`Filter.Redact` always returns a table: with the filter on, the table is
+non-nil for every request, including the overwhelming majority that redact
+nothing. The relay therefore arms a restorer only when the table is
+**non-empty**. The table is complete by construction once redaction finishes
+(§5.3), so an empty one provably cannot resolve anything — and arming one
+anyway costs property 3 for almost every request, since a restorer buffers to
+the next event terminator.
+
 **`passthroughHandler` is excluded outright.** Those paths
 (`proxy.DefaultPassthroughPrefixes` — OAuth, `/v1/code/`) relay the client's own
 credential. Redacting a credential the upstream must verify breaks
@@ -285,9 +294,23 @@ carrying a password; `.env` assignments
 
 A bare high-entropy string in source code is usually a hash, a UUID, or a
 fixture — not a secret. So entropy is a *qualifier*, not a detector: it applies
-only inside the capture group of a contextual rule, or to standalone base64/hex
-runs of at least 24 characters with Shannon entropy at or above 4.0 bits/char
-(base64) or 3.0 (hex).
+only inside the capture group of a contextual rule.
+
+**Corrected after implementation.** This section originally also promised a
+standalone entropy detector over base64/hex runs of at least 24 characters at
+4.0 (base64) / 3.0 (hex) bits per character. That was not built, and the spec is
+being corrected rather than the code, because the standalone form was rejected
+during implementation for exactly the false positives the paragraph above warns
+about — minified assets, checksums, opaque ids, and test fixtures are all
+high-entropy and none of them are secrets, and a false positive here replaces a
+value the agent needs with a placeholder.
+
+What exists is `ShannonBits` as a `MinEntropy` floor on rule rows that already
+have keyword context — today only `assigned-credential`. The consequence, stated
+plainly because it is a real recall gap: a bare 40-character token sitting in
+prose with no assignment, no keyword, and no recognised vendor prefix is caught
+by no tier. `rules.entropy` gates the qualifier, not a detector. The README
+describes this behaviour as built.
 
 ### 6.4 Allowlist
 
@@ -312,9 +335,17 @@ merely slow but unusable.
 
 **Key:** `SHA256(rulesetVersion ‖ modelVersion ‖ activeRuleToggles ‖ enabledLabels ‖ decodedString)`.
 
-`activeRuleToggles` is load-bearing rather than defensive: `rules.builtinSecrets`
-and `rules.entropy` are live-tunable (§10), so without them in the key, turning
-entropy off would leave its findings cached and still being applied.
+`activeRuleToggles` was specified as load-bearing on the assumption that
+`rules.builtinSecrets` and `rules.entropy` were live-tunable. **They are not
+(§10, corrected): every one of them is fixed for the process lifetime**, and the
+cache is rebuilt from scratch on the restart a toggle requires. So the toggles
+in the salt are inert in the shipped system.
+
+They are kept rather than removed, and the reason is recorded here so a later
+reader does not delete them as dead weight: the moment any toggle becomes live
+— which is the obvious next change to make here — a salt without them silently
+keeps applying findings from the ruleset the operator just turned off. The cost
+of carrying them is one hash of a short string per cache key.
 **Value:** the `[]Finding` for that string — byte offsets and labels, nothing
 else.
 
@@ -456,9 +487,18 @@ approximate offsets.
 - **Decoding.** BIOES tags with constrained Viterbi, using the transition
   parameters in `viterbi_calibration.json`.
 - **Label filtering.** Only labels enabled in config produce findings.
-- **Bounds.** `maxScanBytes` (default 256 KiB) caps what any one string
+- **Bounds.** `maxScanBytes` (default 4 KiB) caps what any one string
   contributes; anything longer is scanned up to the cap and the truncation is
-  reported, never silently dropped.
+  reported, never silently dropped. This is a LATENCY bound, not a size limit:
+  measured on darwin/arm64 CPU the model costs ~0.5 ms/token at ~4 bytes/token,
+  so 4 KB scans in ~520 ms, 16 KB in ~2.84 s, and the 256 KiB this spec
+  originally specified extrapolated to ~45 s inside a single `Scan` — with the
+  runner serialised by a mutex, a head-of-line block on every other request.
+  The recall tradeoff is accepted deliberately: prose PII in the tail of a large
+  file is missed by the model tier, but the deterministic rules have no cap and
+  still scan the whole string, so credentials and denylist entries anywhere in a
+  large file are caught regardless. The model tier is for prose PII, and prose
+  messages are short; large blobs are the rules' domain.
 
 ### 9.4 Assets
 
@@ -483,6 +523,7 @@ operators who would rather not have it happen on demand.
   "enabled": false,
   "onScanFailure": "closed",
   "onUnresolvedPlaceholder": "passthrough",
+  "scanTimeoutMS": 10000,
   "rules": { "builtinSecrets": true, "entropy": true },
   "denylist": [],
   "allowlistExtra": [],
@@ -490,7 +531,7 @@ operators who would rather not have it happen on demand.
   "ner": {
     "enabled": false,
     "labels": [],
-    "maxScanBytes": 262144
+    "maxScanBytes": 4096
   }
 }
 ```
@@ -502,11 +543,28 @@ individually opt-in and the default set is empty — `private_url` and
 `private_date` in particular would be destructive in source code, where import
 URLs, endpoints, doc links, changelog dates, and licence years are everywhere.
 
-`enabled`, `onScanFailure`, `onUnresolvedPlaceholder`, `rules`, `denylist`, and
-`allowlistExtra` are live-tunable. `ner.enabled`, `ner.labels`, and
-`cacheEntries` are restart-gated: the session, the label set baked into cache
-keys, and the LRU's capacity are all fixed at construction. Both classes are
-reported through `view.Applied` as usual.
+`scanTimeoutMS` bounds the whole request's scan and is the only ceiling on the
+latency the filter adds: redaction runs in `proxyHandler` before the attempt
+loop, so `retry.budgetMS` does not cover it, and `ner.maxScanBytes` bounds one
+string rather than a request. A timeout is an ordinary scan failure and
+therefore obeys `onScanFailure`. A non-positive value is read as unset and
+replaced by the default; there is deliberately no "unbounded" setting.
+
+**Corrected after implementation: every key here is restart-gated.** The spec
+originally claimed `enabled`, `onScanFailure`, `onUnresolvedPlaceholder`,
+`rules`, `denylist`, and `allowlistExtra` were live-tunable. None of them are.
+The whole filter — detector set, allowlist, denylist, failure modes, cache salt,
+LRU capacity, and (when configured) the model session — is assembled once by
+`buildPrivacy` at startup, and there is no reload path from the config store
+back into it. Flipping `enabled` on does not protect the next request; it
+schedules protection for after a restart.
+
+That is deliberate scope rather than an oversight, and the same gap the retry
+clocks and blocked-model list already have: a live-reload path for a
+composed-at-startup object is a larger change than this work. What matters is
+that it is not claimed otherwise. Every one of these fields is reported through
+`view.Applied` as needing a restart, the Settings screen marks the two rows it
+exposes `saved · restart to apply`, and the README says so in its own words.
 
 ## 11. Seam and UI
 
@@ -516,27 +574,44 @@ rendered by the poll the TUI already makes:
 
 ```go
 type PrivacyStatus struct {
-    Enabled       bool             `json:"enabled"`
-    ModelState    string           `json:"modelState"` // off, absent, downloading, loading, ready, error
-    DownloadedPct int              `json:"downloadedPct,omitempty"`
-    Redactions    map[string]int64 `json:"redactions"` // label -> count this session
-    CacheHitRate  float64          `json:"cacheHitRate"`
-    LastError     string           `json:"lastError,omitempty"`
-    Unresolved    int64            `json:"unresolved"` // placeholders passed through
+    Enabled        bool             `json:"enabled"`
+    ModelState     string           `json:"modelState"` // off, absent, installed, loading, ready, error
+    Redactions     map[string]int64 `json:"redactions"` // label -> count this session
+    CacheHitRate   float64          `json:"cacheHitRate"`
+    Unresolved     int64            `json:"unresolved"`     // placeholders passed through
+    SentUnfiltered int64            `json:"sentUnfiltered"` // requests that went upstream unscanned
+    LastError      string           `json:"lastError,omitempty"`
 }
 ```
+
+Two changes from the original sketch, both after implementation.
+`DownloadedPct` and the `downloading` model state are gone: assets are fetched
+by `aiproxy privacy install`, a CLI path with its own progress output, and never
+by the running server, so nothing could write them. `SentUnfiltered` was added
+because property 7 needs it — under `onScanFailure: open` a broken filter sends
+every request upstream unprotected, and without a counter that state is
+byte-identical in `Status` to a filter that scanned everything and found
+nothing.
 
 No new `view.Source` method, and therefore no new route: the model downloads
 lazily on enable, and `aiproxy privacy install` is a CLI path that needs no
 seam. The lockstep test stays green without a `routeFor` entry.
 
-In the TUI: a header segment when the filter is active and has redacted
-something — `⊘ 12 redacted`, falling back to `[!] 12 redacted` under `modeNone`
-and shedding whole words rather than clipping, exactly as the update segment
-does; a per-request
-redaction count in the Activity feed, because seeing it work is what makes it
-trustworthy; the new settings rows; and `Unresolved > 0` surfaced as a warning,
-since that is the one condition that means the agent received something wrong.
+In the TUI: one header segment, chosen from four states in order of urgency —
+`LastError` (`⊘ filter error`), then `SentUnfiltered > 0` (`⊘ 3 unfiltered`),
+then `Unresolved > 0` (`⊘ 2 unresolved`), then the session redaction total
+(`⊘ 12 redacted`). Each falls back to a wordier-to-plainer ladder and to `[!]`
+under `modeNone`, shedding whole words rather than clipping, exactly as the
+update segment does. The first three outrank the count because a count is
+reassurance, and reassurance must never be shown in place of a fault.
+
+**Corrected after implementation: there is no per-request redaction count in the
+Activity feed.** The header's session total is what exists. Wiring a per-request
+count would mean carrying it from the redaction that produced it, through
+`proxy.Request` and the attempt loop, into `Result` and the metrics row the feed
+renders from — a seam change, not a display change — and it was not done.
+`Table.Len()` exists and is used by the relay to decide whether to arm a
+restorer at all; it is not a UI number.
 
 ## 12. Failure modes
 

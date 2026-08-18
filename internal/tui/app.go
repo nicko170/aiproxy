@@ -657,20 +657,105 @@ func (m Model) viewHeader() string {
 	// unconditionally would let clipAnsi cut it mid-word ("^ 0.2.0 availab"),
 	// which reads as a rendering fault. So: try the full wording, fall back to
 	// just the version, and only drop it when even that will not fit.
-	join := func(extra string) string {
-		if extra == "" {
+	join := func(extra ...string) string {
+		if len(extra) == 0 {
 			return strings.Join(segs, th.dim("  ·  "))
 		}
-		return strings.Join(append(append([]string{}, segs...), extra), th.dim("  ·  "))
+		return strings.Join(append(append([]string{}, segs...), extra...), th.dim("  ·  "))
 	}
-	line := join("")
-	for _, seg := range m.updateSegments() {
-		if candidate := join(seg); lipgloss.Width(candidate) <= m.width {
-			line = candidate
-			break
+
+	// privacyOptions and updateOptions each end with "" — "omit this segment
+	// entirely" — so the ladder below can shed one independently of the
+	// other. Privacy is tried outer and update inner: for a given privacy
+	// candidate every update candidate (down to omitted) is tried before the
+	// privacy candidate itself shrinks, so an update notice is always shed
+	// before the privacy segment is.
+	privacyOptions := append(append([]string{}, m.privacySegments()...), "")
+	updateOptions := append(append([]string{}, m.updateSegments()...), "")
+
+	line := join()
+outer:
+	for _, p := range privacyOptions {
+		for _, u := range updateOptions {
+			var extra []string
+			if p != "" {
+				extra = append(extra, p)
+			}
+			if u != "" {
+				extra = append(extra, u)
+			}
+			candidate := join(extra...)
+			if lipgloss.Width(candidate) <= m.width {
+				line = candidate
+				break outer
+			}
 		}
 	}
 	return padAnsi(line, m.width)
+}
+
+// privacySegments returns the header's privacy wordings, longest first.
+//
+// Four states, most urgent first, because only one segment fits:
+//
+//  1. An unresolved placeholder — the agent has ALREADY received something
+//     wrong and has already acted on it: written the file, run the command,
+//     told the operator the answer. Nothing else here describes damage that
+//     has landed.
+//  2. A scan error. The filter is not doing its job, and under
+//     onScanFailure:open that is completely silent everywhere else.
+//  3. Requests sent unfiltered. Same condition seen from the other side, and it
+//     persists after the error that caused it has stopped recurring.
+//  4. The redaction count, which merely means the filter is working.
+//
+// Unresolved leads because the other two are STICKY for the process lifetime:
+// LastError is never cleared (by design — see Snapshot.LastError), and
+// SentUnfiltered only ever rises. One non-JSON POST or one transient error that
+// has since recovered would otherwise pin "filter error" or "N unfiltered"
+// forever, and every unresolved placeholder after that — the live, ongoing
+// wrongness — would have no surface at all. A stale description of a fault that
+// is over must not outrank a fault that is happening. Both still outrank the
+// count for the reason the count exists: a count is reassurance, and
+// reassurance must never be shown in place of a fault.
+func (m Model) privacySegments() []string {
+	th := m.th
+	p := m.status.Privacy
+	if !p.Enabled {
+		return nil
+	}
+	glyph := "⊘ "
+	if th.mode == modeNone {
+		glyph = "[!] "
+	}
+	if p.Unresolved > 0 {
+		return []string{
+			th.bad(fmt.Sprintf("%s%d unresolved", glyph, p.Unresolved)),
+			th.bad(fmt.Sprintf("%d unresolved", p.Unresolved)),
+		}
+	}
+	if p.LastError != "" {
+		return []string{
+			th.bad(glyph + "filter error"),
+			th.bad("filter error"),
+		}
+	}
+	if p.SentUnfiltered > 0 {
+		return []string{
+			th.bad(fmt.Sprintf("%s%d unfiltered", glyph, p.SentUnfiltered)),
+			th.bad(fmt.Sprintf("%d unfiltered", p.SentUnfiltered)),
+		}
+	}
+	var total int64
+	for _, n := range p.Redactions {
+		total += n
+	}
+	if total == 0 {
+		return nil
+	}
+	return []string{
+		th.dim(fmt.Sprintf("%s%d redacted", glyph, total)),
+		th.dim(fmt.Sprintf("%d redacted", total)),
+	}
 }
 
 // updateSegments returns the header's update wordings from longest to

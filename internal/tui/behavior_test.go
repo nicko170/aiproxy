@@ -451,3 +451,115 @@ func TestUpdateHeaderDegradesWithoutBecomingAmbiguous(t *testing.T) {
 		}
 	}
 }
+
+func TestHeaderShowsRedactionCount(t *testing.T) {
+	m := fixtureModel(120, 28)
+	if strings.Contains(m.viewHeader(), "redacted") {
+		t.Fatal("header mentions redactions with the filter off")
+	}
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions: map[string]int64{"SECRET": 9, "EMAIL": 3},
+	}
+	if got := m.viewHeader(); !strings.Contains(got, "12 redacted") {
+		t.Errorf("header = %q, want a total of 12 redacted", got)
+	}
+}
+
+// Unresolved placeholders are the one privacy condition that means the agent
+// received something wrong, so they must read as a warning rather than a count.
+func TestHeaderWarnsOnUnresolvedPlaceholders(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{Enabled: true, ModelState: "ready", Unresolved: 2}
+	if got := m.viewHeader(); !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want it to surface unresolved placeholders", got)
+	}
+}
+
+// When both counters are nonzero the unresolved warning must win outright —
+// not just appear alongside the count — because an unresolved placeholder
+// means the agent received something wrong, which outranks a count of things
+// that worked as intended. A regression that reordered privacySegments'
+// priority would slip past TestHeaderShowsRedactionCount and
+// TestHeaderWarnsOnUnresolvedPlaceholders alone, since neither sets both
+// counters at once.
+func TestHeaderUnresolvedOutranksRedactionCountWhenBothAreSet(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions: map[string]int64{"SECRET": 9, "EMAIL": 3},
+		Unresolved: 2,
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want it to surface the unresolved warning", got)
+	}
+	if strings.Contains(got, "redacted") {
+		t.Errorf("header = %q, must not also show the redaction count once unresolved is nonzero", got)
+	}
+}
+
+// Property 7: with onScanFailure:open and a broken model, every request goes
+// upstream completely unfiltered while the counters read exactly as they do for
+// a quiet, working filter. The header must be able to tell those apart.
+func TestHeaderWarnsWhenTheFilterIsFailing(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "error",
+		Redactions: map[string]int64{"SECRET": 9},
+		LastError:  "privacy: detector ner: model unavailable",
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "filter error") {
+		t.Errorf("header = %q, want the scan failure surfaced", got)
+	}
+	if strings.Contains(got, "redacted") {
+		t.Errorf("header = %q, must not show reassurance in place of a fault", got)
+	}
+}
+
+// The unfiltered count outlives the error that caused it: an operator who
+// restarts a broken model still needs to know requests went out unprotected.
+func TestHeaderWarnsOnRequestsSentUnfiltered(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions:     map[string]int64{"SECRET": 9},
+		SentUnfiltered: 3,
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "3 unfiltered") {
+		t.Errorf("header = %q, want the unfiltered count surfaced", got)
+	}
+	if strings.Contains(got, "redacted") || strings.Contains(got, "unresolved") {
+		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
+	}
+}
+
+// LastError and SentUnfiltered are both sticky for the process lifetime — the
+// error string is never cleared, and the unfiltered count only rises — so with
+// the old ranking a single non-JSON POST, or one transient scan error that has
+// since recovered, pinned "filter error" / "N unfiltered" in the header
+// permanently and the operator never saw an unresolved placeholder again. An
+// unresolved placeholder means the agent has already received something wrong
+// and acted on it, which outranks a request that went out unfiltered and
+// outranks a stale description of a fault that is over. All three set at once
+// is the only arrangement that pins the order.
+func TestHeaderUnresolvedOutranksStickyFilterFaults(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions:     map[string]int64{"SECRET": 9},
+		Unresolved:     2,
+		SentUnfiltered: 3,
+		LastError:      "privacy: detector ner: model unavailable",
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want the unresolved warning to win over the sticky ones", got)
+	}
+	if strings.Contains(got, "filter error") || strings.Contains(got, "unfiltered") ||
+		strings.Contains(got, "redacted") {
+		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
+	}
+}

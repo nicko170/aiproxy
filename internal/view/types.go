@@ -32,6 +32,50 @@ type Status struct {
 	// it for free, with no second poll cycle and no new route — and the check's
 	// own cadence is decoupled from that poll entirely.
 	Update UpdateStatus `json:"update"`
+	// Privacy reports the local privacy filter, following the same precedent as
+	// Probe and Update: a fact about the running instance, rendered by the poll
+	// the TUI already makes.
+	Privacy PrivacyStatus `json:"privacy"`
+}
+
+// PrivacyStatus is the privacy filter's state and counters.
+type PrivacyStatus struct {
+	Enabled bool `json:"enabled"`
+	// ModelState is off, absent, installed, loading, ready, or error. The
+	// distinctions carry different messages: "absent" means fetch the assets,
+	// "installed" means they are present and verified but no scan has needed the
+	// session yet (loading is lazy, so this is the steady state of a correctly
+	// installed model on an idle proxy), and "error" means the install is
+	// broken.
+	//
+	// There is no "downloading": the assets are fetched by "aiproxy privacy
+	// install", which is a CLI path with its own progress output, and never by
+	// the running server, so no writer here could ever report one.
+	//
+	// There is no download-progress field. The design sketched one, but the
+	// model is fetched by "aiproxy privacy install" — a CLI path with its own
+	// progress output — and never by the running server, so a percentage here
+	// would have nothing to report and no writer to set it.
+	ModelState string `json:"modelState"`
+	// Redactions counts values replaced, per label, this session — one increment
+	// per distinct value PER REQUEST, so a secret resent every turn is counted
+	// every turn. It measures work done, not distinct secrets found.
+	Redactions map[string]int64 `json:"redactions"`
+	// CacheHitRate is 0..1. A collapsed rate is the first symptom of a cache-key
+	// bug, which otherwise shows up only as unexplained latency.
+	CacheHitRate float64 `json:"cacheHitRate"`
+	// Unresolved counts placeholders that reached a client unresolved: the agent
+	// received a placeholder where a real value belonged.
+	Unresolved int64 `json:"unresolved"`
+	// SentUnfiltered counts requests that reached upstream with no filtering at
+	// all — a scan that failed under onScanFailure:open, or a body the JSON
+	// walker could not read. With LastError it is what makes property 7 true:
+	// "enabled and protecting nothing" must not look identical to "enabled and
+	// nothing found".
+	SentUnfiltered int64 `json:"sentUnfiltered"`
+	// LastError is the most recent scan failure, sticky, empty if there has been
+	// none.
+	LastError string `json:"lastError,omitempty"`
 }
 
 // UpdateStatus is what the running instance knows about newer releases.
@@ -209,6 +253,18 @@ type Settings struct {
 	// checker's ticker is built once at startup.
 	UpdateCheckEnabled       bool `json:"updateCheckEnabled"`
 	UpdateCheckIntervalHours int  `json:"updateCheckIntervalHours"`
+	// PrivacyEnabled and the two failure modes configure the local privacy
+	// filter. Enabled is restart-gated: the detector set, the cache salt, and the
+	// model session are all built once at startup.
+	PrivacyEnabled       bool   `json:"privacyEnabled"`
+	PrivacyOnScanFailure string `json:"privacyOnScanFailure"`
+	PrivacyOnUnresolved  string `json:"privacyOnUnresolved"`
+	// PrivacyScanTimeoutMS bounds the whole request's scan. It is the only
+	// ceiling on the latency the filter adds: redaction runs before the attempt
+	// loop, so retry.budgetMS does not cover it. Zero is read as "unset" and
+	// replaced by the default, the same way the two failure modes read "".
+	PrivacyScanTimeoutMS int      `json:"privacyScanTimeoutMs"`
+	PrivacyDenylist      []string `json:"privacyDenylist"`
 }
 
 // Applied reports which fields an UpdateSettings call actually put into

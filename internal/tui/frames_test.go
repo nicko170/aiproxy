@@ -81,6 +81,8 @@ func fixtureModel(w, h int) Model {
 		BlockedModels: []string{"claude-3-*"}, QuotaProbeIntervalSeconds: 300,
 		MetricsRetentionDays: 90,
 		UpdateCheckEnabled:   true, UpdateCheckIntervalHours: 24,
+		PrivacyEnabled: false, PrivacyOnScanFailure: "closed", PrivacyOnUnresolved: "passthrough",
+		PrivacyDenylist: []string{"acme-prod.internal"},
 	}
 	m.settings.needsRestart = map[string]bool{"metricsRetentionDays": true}
 	m.settings.justApplied = map[string]bool{"switchThreshold": true}

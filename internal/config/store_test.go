@@ -204,3 +204,68 @@ func TestNonPositiveUpdateIntervalFallsBackToTheDefault(t *testing.T) {
 		t.Errorf("CheckIntervalHours = %d, want 24", cfg.Update.CheckIntervalHours)
 	}
 }
+
+func TestPrivacyDefaultsAreOffAndSafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Privacy.Enabled {
+		t.Error("the privacy filter must be off by default; it rewrites request bodies")
+	}
+	if cfg.Privacy.OnScanFailure != "closed" {
+		t.Errorf("OnScanFailure = %q, want closed", cfg.Privacy.OnScanFailure)
+	}
+	if cfg.Privacy.OnUnresolvedPlaceholder != "passthrough" {
+		t.Errorf("OnUnresolvedPlaceholder = %q, want passthrough", cfg.Privacy.OnUnresolvedPlaceholder)
+	}
+	if !cfg.Privacy.Rules.BuiltinSecrets || !cfg.Privacy.Rules.Entropy {
+		t.Error("enabling the filter should bring the deterministic rules with it")
+	}
+	if cfg.Privacy.NER.Enabled {
+		t.Error("the model must be off by default")
+	}
+	if len(cfg.Privacy.NER.Labels) != 0 {
+		t.Errorf("NER labels = %v, want none by default", cfg.Privacy.NER.Labels)
+	}
+	if cfg.Privacy.CacheEntries != 50000 {
+		t.Errorf("CacheEntries = %d, want 50000", cfg.Privacy.CacheEntries)
+	}
+	// 4096, not 262144: the model costs ~0.5 ms/token on CPU, so the old default
+	// was a ~45-second scan inside one request. See PrivacyNER's doc comment.
+	if cfg.Privacy.NER.MaxScanBytes != 4096 {
+		t.Errorf("MaxScanBytes = %d, want 4096", cfg.Privacy.NER.MaxScanBytes)
+	}
+}
+
+// The default must stay a bound a user will actually wait for. At the measured
+// ~0.5 ms/token and ~4 bytes/token, this is the arithmetic that condemned
+// 262144; if someone raises the default, this fails and makes them justify it.
+func TestPrivacyNERDefaultBoundsWorstCaseScanLatency(t *testing.T) {
+	const (
+		bytesPerToken = 4
+		msPerToken    = 0.5
+		budgetMillis  = 1000 // one newly-seen string must not cost more than ~1s
+	)
+	got := Default().Privacy.NER.MaxScanBytes
+	worst := float64(got) / bytesPerToken * msPerToken
+	if worst > budgetMillis {
+		t.Errorf("MaxScanBytes = %d implies a worst-case model scan of ~%.0f ms, over the %d ms budget",
+			got, worst, budgetMillis)
+	}
+}
+
+func TestPrivacyNonPositiveBoundsFallBackToDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"privacy":{"cacheEntries":0,"ner":{"maxScanBytes":-1}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Privacy.CacheEntries <= 0 || cfg.Privacy.NER.MaxScanBytes <= 0 {
+		t.Errorf("bounds were not corrected on load: %+v", cfg.Privacy)
+	}
+}

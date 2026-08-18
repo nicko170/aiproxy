@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
+	"github.com/nicko170/aiproxy/internal/privacy"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/view"
 )
@@ -112,6 +114,9 @@ type HandlerOptions struct {
 	// aggregation logic of its own. A nil View is only safe when no test or
 	// caller exercises a control route.
 	View view.Source
+	// Privacy redacts request bodies and restores responses. Nil disables the
+	// whole path at zero cost.
+	Privacy *privacy.Filter
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
@@ -124,6 +129,11 @@ type HandlerOptions struct {
 func proxyHandler(o HandlerOptions) http.HandlerFunc {
 	if o.Attempter != nil {
 		o.Attempter.OnResult = o.OnResult
+		// Set here, not threaded through NewAttempter, for the same reason as
+		// OnResult above: HandlerOptions is finalized after the Attempter is
+		// constructed, and the attempter only ever needs to build a restorer
+		// from a table the request already carries.
+		o.Attempter.privacy = o.Privacy
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The reserved namespace is refused HERE, at the point of harm, rather
@@ -144,9 +154,24 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			return
 		}
 
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+		// maxBodyBytes+1, so an over-limit body is DETECTABLE rather than
+		// silently truncated. This used to read exactly maxBodyBytes and forward
+		// whatever fitted: the client's request was quietly mutilated and sent
+		// anyway, which was always wrong and became a leak the day the privacy
+		// filter learned to pass non-JSON through. A truncated JSON body is
+		// malformed, malformed parses as "not JSON", and "not JSON" is passed
+		// upstream UNFILTERED — so padding a request past the cap was a way to
+		// push the first 64 MiB, secrets included, straight to the provider even
+		// under onScanFailure:closed. Refusing is correct whether or not the
+		// filter is on: nothing good comes of forwarding half a request.
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "Could not read request body")
+			return
+		}
+		if len(body) > maxBodyBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("Request body exceeds aiproxy's %d MiB limit.", maxBodyBytes>>20))
 			return
 		}
 
@@ -184,6 +209,65 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 					})
 				}
 				return
+			}
+		}
+
+		// Redact ONCE, here. Not inside the attempt loop: Attempter replays
+		// req.Body on every retry and RewriteBody rewrites it per attempt for
+		// model mapping, so redacting there would mint different placeholders on
+		// a retry — breaking the prompt cache and leaving the restore table
+		// describing a body that was never sent.
+		//
+		// After the blocked-model check, so routing decisions are made on the
+		// client's own values.
+		if o.Privacy != nil {
+			redacted, table, err := o.Privacy.Redact(r.Context(), req.Body)
+			switch {
+			case err == nil:
+				req.Body = redacted
+				req.Restore = table
+			case o.Privacy.OnScanFailure() == privacy.Closed:
+				o.Log.Error("privacy filter failed; refusing the request", "err", err)
+				// 503 when the model is simply not installed or would not load,
+				// 500 when a scan went wrong. The distinction is the difference
+				// between "run aiproxy privacy install" and "file a bug", and
+				// collapsing both into 500 sends the operator to the wrong one.
+				status, msg := http.StatusInternalServerError,
+					"aiproxy could not scan this request for sensitive data and is configured to fail closed."
+				if errors.Is(err, privacy.ErrModelUnavailable) {
+					status, msg = http.StatusServiceUnavailable,
+						"aiproxy's privacy model is not available. Run \"aiproxy privacy install\", or disable privacy.ner in config."
+				}
+				writeError(w, status, "api_error", msg)
+				if o.OnResult != nil {
+					// Same reasoning as the blocked-model refusal above: a
+					// refusal that reports no result produces no metrics row and
+					// no Activity entry, so the operator sees a 5xx at the client
+					// and nothing whatsoever on the proxy. StartedAt must be
+					// stamped and TTFBMS must be -1 for the same reasons given
+					// there. OutcomeAdmissionError is the established verdict for
+					// a local failure before any request was sent, which is
+					// exactly what this is.
+					o.OnResult(req, Result{
+						Status:    status,
+						Outcome:   provider.OutcomeAdmissionError,
+						StartedAt: time.Now().UnixMilli(),
+						TTFBMS:    -1,
+					})
+				}
+				return
+			default:
+				// The request goes upstream with NO filtering. Filter.Redact has
+				// already recorded the error and incremented SentUnfiltered, so
+				// Status and the TUI both show it — property 7 is what stops this
+				// being indistinguishable from "scanned, found nothing".
+				//
+				// Note that Redact returns on the FIRST detector error and
+				// discards every replacement it had already made, so under open
+				// even Tier 1's findings are lost when the model tier fails. That
+				// is deliberate: a partially redacted body is a body whose
+				// restore table describes something other than what was sent.
+				o.Log.Warn("privacy filter failed; sending unfiltered", "err", err)
 			}
 		}
 
