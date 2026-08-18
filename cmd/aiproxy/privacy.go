@@ -94,7 +94,12 @@ func runPrivacyStatus(out io.Writer, dir string, assets []ner.Asset) int {
 	return updateExitOK
 }
 
+// humanBytes formats n as decimal megabytes (1 MB = 1e6 bytes), the
+// convention download and disk sizes are quoted in — and the one the README
+// uses when it says "~850 MB". Using 1<<20 (MiB) here while labelling the
+// result "MB" would print a number about 5% below what was documented, right
+// when an operator is deciding whether to accept an 800+ MB download.
 func humanBytes(n int64) string {
-	const mb = 1 << 20
+	const mb = 1e6
 	return fmt.Sprintf("~%.0f MB", float64(n)/mb)
 }

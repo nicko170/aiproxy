@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,65 @@ import (
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/privacy/ner"
 )
+
+// TestHumanBytesUsesDecimalMegabytes pins humanBytes to the decimal
+// convention (1 MB = 1e6 bytes) that download and disk sizes are quoted in,
+// and that the README's "~850 MB" figure assumes. Using 1<<20 (MiB) while
+// printing the label "MB" would understate the total by about 5% — the
+// review finding this test guards against.
+func TestHumanBytesUsesDecimalMegabytes(t *testing.T) {
+	cases := []struct {
+		bytes int64
+		want  string
+	}{
+		{1_000_000, "~1 MB"},
+		{847_099_252, "~847 MB"}, // darwin/arm64 total, per Assets
+		{809_061_992, "~809 MB"}, // model_q4f16.onnx_data alone
+	}
+	for _, c := range cases {
+		if got := humanBytes(c.bytes); got != c.want {
+			t.Errorf("humanBytes(%d) = %q, want %q", c.bytes, got, c.want)
+		}
+	}
+}
+
+// TestPrivacyInstallReportsSizeMatchingTheDocumentedFootprint proves the size
+// line "aiproxy privacy install" actually prints, for every platform Assets
+// supports, lands in the ~840-850 MB range the README documents five times —
+// not the ~805-809 MB that printing MiB-computed bytes under an "MB" label
+// would produce.
+func TestPrivacyInstallReportsSizeMatchingTheDocumentedFootprint(t *testing.T) {
+	platforms := [][2]string{
+		{"darwin", "arm64"}, {"darwin", "amd64"}, {"linux", "amd64"}, {"linux", "arm64"},
+	}
+	for _, p := range platforms {
+		goos, goarch := p[0], p[1]
+		assets, err := ner.Assets(goos, goarch)
+		if err != nil {
+			t.Fatalf("Assets(%s, %s): %v", goos, goarch, err)
+		}
+		var total int64
+		for _, a := range assets {
+			total += a.Bytes
+		}
+		got := humanBytes(total)
+		mb := float64(total) / 1e6
+		if mb < 840 || mb > 850 {
+			t.Fatalf("%s/%s: total = %.1f MB, want 840-850 (README says ~850 MB)", goos, goarch, mb)
+		}
+		// Parse the number humanBytes actually printed and check it against
+		// the same 840-850 range, rather than trusting the arithmetic in
+		// isolation: this is what would have caught the MiB-under-MB bug,
+		// since that bug prints ~805-809, outside the range.
+		var printedMB float64
+		if _, err := fmt.Sscanf(got, "~%f MB", &printedMB); err != nil {
+			t.Fatalf("%s/%s: humanBytes(%d) = %q, not parseable as \"~N MB\": %v", goos, goarch, total, got, err)
+		}
+		if printedMB < 840 || printedMB > 850 {
+			t.Errorf("%s/%s: humanBytes printed %q (%.1f MB), want 840-850 to match the README's ~850 MB", goos, goarch, got, printedMB)
+		}
+	}
+}
 
 // TestPrivacyInstallDownloadsAssets proves "aiproxy privacy install" fetches
 // and verifies assets against an arbitrary URL and digest, without touching

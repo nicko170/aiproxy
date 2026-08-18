@@ -102,6 +102,19 @@ they leave your machine, replacing each match with a stable placeholder and
 restoring the original value in the response so the agent never sees the
 substitution. **It is off by default.**
 
+**All four of `privacy.enabled`, `onScanFailure`, `onUnresolvedPlaceholder`,
+and `denylist` take effect on restart, not immediately** — the detector set,
+the cache's salt, and (when the model is configured) its session are all
+built once at startup, the same way `update.checkIntervalHours` is. Flipping
+`enabled` on does **not** turn on protection for the request you send next;
+it schedules protection for after you restart aiproxy. `enabled` and
+`denylist` are editable from the Settings screen, and it marks each one
+`saved · restart to apply` the moment you change it, so you're not left
+guessing there. `onScanFailure` and `onUnresolvedPlaceholder` have no
+Settings-screen row yet — edit them in `config.json` or through
+`POST /_aiproxy/api/v1/settings` — and nothing in the TUI will tell you a
+restart is pending for those two. Either way: restart before you trust it.
+
 ```json
 "privacy": {
   "enabled": false,
