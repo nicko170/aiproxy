@@ -23,6 +23,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/proxy"
 	"github.com/nicko170/aiproxy/internal/tui"
+	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -110,7 +111,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	pruner.Start()
 	defer pruner.Stop()
 
-	handler, pb, vl, err := buildHandler(cfg, store, log, ing)
+	handler, pb, vl, upd, err := buildHandler(cfg, store, log, ing)
 	if err != nil {
 		return err
 	}
@@ -119,6 +120,12 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	// Start/Stop are unconditional exactly like the roller and pruner above.
 	pb.Start()
 	defer pb.Stop()
+
+	// Same shape for the update checker: Start always spawns its goroutine so
+	// Stop is always safe, and a disabled check simply never reaches the
+	// network (see updater.Checker.Start).
+	upd.Start()
+	defer upd.Stop()
 
 	ln, err := listen(cfg.Listen.Addr)
 	if err != nil {
@@ -190,11 +197,11 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 
 // buildHandler wires config into a serving handler. Kept separate from run so
 // tests exercise the real composition without binding a port. The returned
-// *prober.Prober is separate from the handler because its background loop
-// has its own lifecycle (Start/Stop), exactly like the roller and pruner run
-// constructs alongside it; a caller that only wants the handler (most tests)
-// is free to ignore it.
-func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, error) {
+// *prober.Prober and *updater.Checker are separate from the handler because
+// each owns a background loop with its own lifecycle (Start/Stop), exactly
+// like the roller and pruner run constructs alongside them; a caller that
+// only wants the handler (most tests) is free to ignore them.
+func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, *updater.Checker, error) {
 	upstreamClient := &http.Client{
 		Transport: proxy.NewTransport(proxy.TransportOptions{}),
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
@@ -247,6 +254,18 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	pb := prober.New(mgr, providers, time.Duration(cfg.QuotaProbe.IntervalSeconds)*time.Second,
 		prober.WithLogger(log))
 
+	// In-app update checking. The Client is told the version this binary was
+	// stamped with (see main.version); an unstamped "dev" build is never
+	// offered an update, and never makes a request to find one. The Checker's
+	// lifecycle matches the prober's above: constructed here, started and
+	// stopped by run().
+	upd := updater.NewChecker(
+		updater.New(updater.DefaultRepo, version),
+		cfg.Update.CheckEnabled,
+		time.Duration(cfg.Update.CheckIntervalHours)*time.Hour,
+		updater.WithCheckerLogger(log),
+	)
+
 	// The attempt loop enforces retry.headerTimeoutMs itself (see sendWithin in
 	// internal/proxy/attempt.go); the transport's own ResponseHeaderTimeout must
 	// be derived from that same value rather than left at its package default, or
@@ -269,7 +288,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// reads through it rather than computing anything of its own, which is
 	// what lets a future view.HTTP (a detached daemon) replace it without
 	// internal/proxy's routes changing at all.
-	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, nil)
+	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd)
 
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
@@ -318,7 +337,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
 			})
 		},
-	}), pb, vl, nil
+	}), pb, vl, upd, nil
 }
 
 // loginLabel matches spec §6.2's persisted account label convention —
