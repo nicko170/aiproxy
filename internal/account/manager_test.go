@@ -77,6 +77,7 @@ func (s *stubProvider) Authorize(*http.Request, provider.Credential)            
 func (s *stubProvider) RewriteBody(b []byte, _ provider.Account) ([]byte, error) { return b, nil }
 func (s *stubProvider) ClassifyResponse(*http.Response) provider.Outcome         { return provider.Outcome{} }
 func (s *stubProvider) ParseUsage([]byte) (*provider.UsageDelta, bool)           { return nil, false }
+func (s *stubProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)       { return nil, false }
 
 func newTestManager(t *testing.T, p *stubProvider, accts ...config.Account) (*Manager, *[]provider.Credential) {
 	t.Helper()

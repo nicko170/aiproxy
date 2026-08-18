@@ -211,3 +211,26 @@ func (a *Anthropic) ParseUsage(event []byte) (*provider.UsageDelta, bool) {
 	}
 	return nil, false
 }
+
+// nonStreamingUsage is the envelope a complete (non-SSE) message response uses.
+type nonStreamingUsage struct {
+	Usage *usage `json:"usage"`
+}
+
+// ParseUsageBody extracts token counts from a complete response body.
+func (a *Anthropic) ParseUsageBody(body []byte) (*provider.UsageDelta, bool) {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil, false
+	}
+	var env nonStreamingUsage
+	if err := json.Unmarshal(body, &env); err != nil || env.Usage == nil {
+		return nil, false
+	}
+	u := env.Usage
+	return &provider.UsageDelta{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CacheReadInputTokens,
+		CacheWriteTokens: u.CacheCreationInputTokens,
+	}, true
+}

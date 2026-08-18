@@ -156,4 +156,9 @@ type Provider interface {
 	RewriteBody(body []byte, a Account) ([]byte, error)
 	ClassifyResponse(r *http.Response) Outcome
 	ParseUsage(sseEvent []byte) (*UsageDelta, bool)
+	// ParseUsageBody extracts token counts from a complete non-streaming
+	// response body. A streamed response reports usage through ParseUsage
+	// instead; covering only one shape silently loses every non-streaming
+	// request's accounting.
+	ParseUsageBody(body []byte) (*UsageDelta, bool)
 }
