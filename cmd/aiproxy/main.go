@@ -19,6 +19,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/privacy"
+	"github.com/nicko170/aiproxy/internal/privacy/ner"
 	"github.com/nicko170/aiproxy/internal/privacy/rules"
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
@@ -230,7 +231,7 @@ func nonEntropyRules(rs []rules.Rule) []rules.Rule {
 // is disabled — which is the default. Detector ORDER is significant: it is the
 // tiebreak privacy.Resolve uses for identical spans, so the deterministic rules
 // are registered before the model.
-func buildPrivacy(cfg config.Config) (*privacy.Filter, error) {
+func buildPrivacy(cfg config.Config, log *slog.Logger) (*privacy.Filter, error) {
 	if !cfg.Privacy.Enabled {
 		return nil, nil
 	}
@@ -247,9 +248,9 @@ func buildPrivacy(cfg config.Config) (*privacy.Filter, error) {
 		unresolved = privacy.ErrorOut
 	}
 
-	// modelState reports the NER model's readiness once one is wired in
-	// (Task 18 assigns it from the NER detector); nil until then, which
-	// Filter.ModelState reports as "off".
+	// modelState reports the NER model's readiness. It stays nil when no NER
+	// category is enabled, which Filter.ModelState reports as "off" — a filter
+	// running deterministic rules only is fully functional.
 	var modelState func() string
 
 	var dets []privacy.Detector
@@ -270,6 +271,22 @@ func buildPrivacy(cfg config.Config) (*privacy.Filter, error) {
 			return nil, err
 		}
 		dets = append(dets, dl)
+	}
+	// The model goes LAST, so privacy.Resolve's registration-order tiebreak
+	// gives an identical span to a deterministic rule rather than to a
+	// probabilistic one.
+	if cfg.Privacy.NER.Enabled && len(cfg.Privacy.NER.Labels) > 0 {
+		nd, err := ner.New(ner.Options{
+			Dir:          ner.Dir(),
+			Labels:       cfg.Privacy.NER.Labels,
+			MaxScanBytes: cfg.Privacy.NER.MaxScanBytes,
+			Log:          log,
+		})
+		if err != nil {
+			return nil, err
+		}
+		dets = append(dets, nd)
+		modelState = nd.ModelState
 	}
 
 	// The salt carries everything that changes what a scan MEANS, so a toggle or
@@ -380,7 +397,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			HeaderTimeout:   headerTimeout,
 		}, log)
 
-	pf, err := buildPrivacy(cfg)
+	pf, err := buildPrivacy(cfg, log)
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("privacy filter: %w", err)
 	}
