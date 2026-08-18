@@ -204,6 +204,28 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 }
 
+// nonEntropyRules drops every rule that leans on an entropy floor to avoid
+// false positives, for when the operator has turned entropy-based detection
+// off entirely.
+//
+// Dropping only the floor — keeping the rule active but unqualified — is not
+// an option: entropy is what stops the generic "assigned credential" rule
+// from firing on every `password = "changeme"` in every example config
+// (see rules.Builtin's doc comment). Disabling entropy while leaving that
+// rule in place would turn the single most false-positive-prone rule in the
+// table into an unconditional one — a false-positive machine, and strictly
+// worse than leaving entropy on. So "entropy: false" means "do not use
+// entropy-based detection at all," i.e. the rule itself is dropped.
+func nonEntropyRules(rs []rules.Rule) []rules.Rule {
+	out := make([]rules.Rule, 0, len(rs))
+	for _, r := range rs {
+		if r.MinEntropy == 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // buildPrivacy assembles the privacy filter from config, or returns nil when it
 // is disabled — which is the default. Detector ORDER is significant: it is the
 // tiebreak privacy.Resolve uses for identical spans, so the deterministic rules
@@ -232,7 +254,11 @@ func buildPrivacy(cfg config.Config) (*privacy.Filter, error) {
 
 	var dets []privacy.Detector
 	if cfg.Privacy.Rules.BuiltinSecrets {
-		rd, err := rules.New(rules.Builtin(), cfg.Privacy.AllowlistExtra)
+		builtin := rules.Builtin()
+		if !cfg.Privacy.Rules.Entropy {
+			builtin = nonEntropyRules(builtin)
+		}
+		rd, err := rules.New(builtin, cfg.Privacy.AllowlistExtra)
 		if err != nil {
 			return nil, err
 		}

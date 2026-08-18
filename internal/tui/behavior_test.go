@@ -475,3 +475,26 @@ func TestHeaderWarnsOnUnresolvedPlaceholders(t *testing.T) {
 		t.Errorf("header = %q, want it to surface unresolved placeholders", got)
 	}
 }
+
+// When both counters are nonzero the unresolved warning must win outright —
+// not just appear alongside the count — because an unresolved placeholder
+// means the agent received something wrong, which outranks a count of things
+// that worked as intended. A regression that reordered privacySegments'
+// priority would slip past TestHeaderShowsRedactionCount and
+// TestHeaderWarnsOnUnresolvedPlaceholders alone, since neither sets both
+// counters at once.
+func TestHeaderUnresolvedOutranksRedactionCountWhenBothAreSet(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.status.Privacy = view.PrivacyStatus{
+		Enabled: true, ModelState: "ready",
+		Redactions: map[string]int64{"SECRET": 9, "EMAIL": 3},
+		Unresolved: 2,
+	}
+	got := m.viewHeader()
+	if !strings.Contains(got, "2 unresolved") {
+		t.Errorf("header = %q, want it to surface the unresolved warning", got)
+	}
+	if strings.Contains(got, "redacted") {
+		t.Errorf("header = %q, must not also show the redaction count once unresolved is nonzero", got)
+	}
+}
