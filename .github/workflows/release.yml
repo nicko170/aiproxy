@@ -1,0 +1,64 @@
+name: release
+
+# A tag is the only thing that cuts a release: `git tag v0.2.0 && git push
+# --tags`. Nothing publishes off main, so the release list stays a record of
+# deliberate decisions rather than of every merge.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # gh release create writes to this repo
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # --generate-notes diffs against the previous tag, which it cannot
+          # find in a depth-1 clone.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      # A tag that cannot pass its own suite must not become a download.
+      - run: go test ./...
+
+      # One job, no matrix: modernc.org/sqlite is pure Go, so CGO_ENABLED=0
+      # cross-compiles every target from this runner in seconds. Keeping the
+      # four builds together is also what lets checksums.txt below cover the
+      # whole release in a single file, with no artifact round-trip.
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist build
+          for target in darwin/amd64 darwin/arm64 linux/amd64 linux/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            echo "==> $os/$arch"
+            GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X main.version=${version}" \
+              -o build/aiproxy ./cmd/aiproxy
+            # Asset naming is load-bearing: install.sh and the in-app updater
+            # both construct this exact string. Changing it breaks upgrades
+            # for everyone already installed.
+            tar -czf "dist/aiproxy_${version}_${os}_${arch}.tar.gz" \
+              -C build aiproxy \
+              -C "$GITHUB_WORKSPACE" LICENSE README.md
+            rm build/aiproxy
+          done
+
+      - name: Checksums
+        run: cd dist && sha256sum *.tar.gz > checksums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # --verify-tag refuses to invent a release for a tag that is not
+        # actually on the remote.
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --verify-tag

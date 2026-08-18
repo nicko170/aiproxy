@@ -29,13 +29,29 @@ is serving yet.
 ## Install
 
 ```sh
-go install github.com/nicko170/aiproxy/cmd/aiproxy@latest
+curl -fsSL https://raw.githubusercontent.com/nicko170/aiproxy/main/install.sh | sh
 ```
 
-Or from a checkout:
+That fetches the latest release for your platform, verifies it against the
+release's `checksums.txt`, and installs to `/usr/local/bin` — or to
+`~/.local/bin` if the system path isn't writable, rather than reaching for
+`sudo`. Set `BINDIR` to install elsewhere, or `AIPROXY_VERSION` to pin a
+version:
 
 ```sh
-go build -o aiproxy ./cmd/aiproxy
+BINDIR=~/bin AIPROXY_VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/nicko170/aiproxy/main/install.sh | sh
+```
+
+Prebuilt binaries are on the [releases page](https://github.com/nicko170/aiproxy/releases)
+for darwin and linux on amd64 and arm64. They are not codesigned, so a tarball
+downloaded through a *browser* on macOS needs
+`xattr -d com.apple.quarantine aiproxy`; the installer above is unaffected.
+
+With a Go toolchain, either of these works too:
+
+```sh
+go install github.com/nicko170/aiproxy/cmd/aiproxy@latest
+go build -o aiproxy ./cmd/aiproxy   # from a checkout
 ```
 
 ## Quick start
@@ -165,6 +181,18 @@ staticcheck ./...
 
 CI runs vet, staticcheck, and the race suite, and cross-builds for
 darwin/linux on amd64/arm64.
+
+Releases are cut by tag:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` runs the suite, cross-compiles the four
+targets with the version stamped in via `-ldflags`, writes `checksums.txt`,
+and publishes the lot to a GitHub release. The asset naming
+(`aiproxy_<version>_<os>_<arch>.tar.gz`) is load-bearing — `install.sh`
+constructs that exact string.
 
 ## License
 
