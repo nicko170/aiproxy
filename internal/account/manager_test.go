@@ -79,20 +79,45 @@ func (s *stubProvider) ClassifyResponse(*http.Response) provider.Outcome        
 func (s *stubProvider) ParseUsage([]byte) (*provider.UsageDelta, bool)           { return nil, false }
 func (s *stubProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)       { return nil, false }
 
-func newTestManager(t *testing.T, p *stubProvider, accts ...config.Account) (*Manager, *[]provider.Credential) {
+// persistLog records every credential handed to Options.Persist.
+//
+// The lock is not decoration and the accessor is not ceremony. Persist runs on
+// the detached refresh goroutine, whose lifetime is deliberately independent of
+// the EnsureFresh call that started it: a caller that cancels its wait, or one
+// that short-circuits because the credential is already fresh, returns while
+// that goroutine is still on its way to Persist. A test goroutine reading this
+// log therefore has, in general, NO happens-before edge with the write. Handing
+// the test a bare *[]provider.Credential guarded by a mutex it cannot reach made
+// every such read an unsynchronised one — a data race on the slice header, not
+// merely a stale count.
+type persistLog struct {
+	mu    sync.Mutex
+	creds []provider.Credential
+}
+
+func (l *persistLog) add(c provider.Credential) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.creds = append(l.creds, c)
+}
+
+func (l *persistLog) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.creds)
+}
+
+func newTestManager(t *testing.T, p *stubProvider, accts ...config.Account) (*Manager, *persistLog) {
 	t.Helper()
-	var mu sync.Mutex
-	persisted := []provider.Credential{}
+	persisted := &persistLog{}
 	m := New(accts, map[string]provider.Provider{"stub": p}, Options{
 		SwitchThreshold: 0.98,
 		Persist: func(_ string, c provider.Credential) error {
-			mu.Lock()
-			defer mu.Unlock()
-			persisted = append(persisted, c)
+			persisted.add(c)
 			return nil
 		},
 	})
-	return m, &persisted
+	return m, persisted
 }
 
 func expiredOAuth() provider.Credential {
@@ -120,7 +145,7 @@ func TestEnsureFreshRefreshesExpiredCredentialAndPersists(t *testing.T) {
 	if got := acc.Credential.AccessToken; got != "refreshed" {
 		t.Errorf("AccessToken = %q, want refreshed", got)
 	}
-	if n := len(*persisted); n != 1 {
+	if n := persisted.count(); n != 1 {
 		t.Errorf("persisted %d times, want 1", n)
 	}
 }
@@ -202,7 +227,7 @@ func TestEnsureFreshCoalescesConcurrentCallers(t *testing.T) {
 	if n := p.refreshes.Load(); n != 1 {
 		t.Errorf("refreshed %d times, want exactly 1", n)
 	}
-	if n := len(*persisted); n != 1 {
+	if n := persisted.count(); n != 1 {
 		t.Errorf("persisted %d times, want 1", n)
 	}
 }
@@ -479,14 +504,26 @@ func TestEnsureFreshSurvivesTheCancellationOfItsCaller(t *testing.T) {
 
 	// The refresh must still be running and must still complete. A second caller
 	// arriving after it lands sees the new credential.
+	//
+	// Wait for the persist as well as the rotated credential, and note why: this
+	// is the ONE test with no happens-before edge to the refresh goroutine. Every
+	// other caller returns through call.done, which the goroutine closes as its
+	// last act; this caller was cancelled, and the second EnsureFresh below
+	// short-circuits on an already-fresh credential without waiting on anything.
+	// runRefresh publishes the credential under the manager lock and only THEN
+	// calls Persist, so observing the new token through Get proves nothing about
+	// whether the goroutine has reached Persist yet. Taking the rotated token as
+	// the signal left the persist count both racy and, once the race was fixed,
+	// flaky.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		acc, _ := m.Get("a")
-		if acc.Credential.AccessToken == "refreshed" {
+		if acc.Credential.AccessToken == "refreshed" && persisted.count() > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the refresh died with its caller; the credential was never rotated")
+			t.Fatalf("the refresh died with its caller: token = %q, persisted %d times",
+				acc.Credential.AccessToken, persisted.count())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -501,7 +538,7 @@ func TestEnsureFreshSurvivesTheCancellationOfItsCaller(t *testing.T) {
 	if n := p.refreshes.Load(); n != 1 {
 		t.Errorf("refreshed %d times, want exactly 1 — the abandoned refresh was repeated", n)
 	}
-	if n := len(*persisted); n != 1 {
+	if n := persisted.count(); n != 1 {
 		t.Errorf("persisted %d times, want 1", n)
 	}
 }
