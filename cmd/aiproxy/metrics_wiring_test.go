@@ -56,7 +56,7 @@ func TestRequestLandsInTheMetricsStore(t *testing.T) {
 	ing := metrics.NewIngester(db, metrics.IngestOptions{})
 	defer ing.Close()
 
-	h, _, err := buildHandler(cfg, store, quiet(), ing)
+	h, _, _, err := buildHandler(cfg, store, quiet(), ing)
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestMetricsFailureDoesNotFailTheRequest(t *testing.T) {
 	// Close the store out from under the ingester: writes now fail.
 	db.Close()
 
-	h, _, err := buildHandler(cfg, store, quiet(), ing)
+	h, _, _, err := buildHandler(cfg, store, quiet(), ing)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +193,7 @@ func newWiredProxy(t *testing.T, mutate func(*config.Config), scripts ...testuti
 	ing := metrics.NewIngester(db, metrics.IngestOptions{})
 	t.Cleanup(func() { ing.Close() })
 
-	h, _, err := buildHandler(cfg, store, quiet(), ing)
+	h, _, _, err := buildHandler(cfg, store, quiet(), ing)
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}

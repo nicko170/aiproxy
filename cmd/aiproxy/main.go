@@ -22,6 +22,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/proxy"
+	"github.com/nicko170/aiproxy/internal/tui"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -32,7 +33,7 @@ func main() {
 	var (
 		configPath = flag.String("config", "", "path to config.json (default: XDG config dir)")
 		addr       = flag.String("addr", "", "listen address (overrides config)")
-		headless   = flag.Bool("headless", true, "run without a TUI (the only mode in this build)")
+		headless   = flag.Bool("headless", false, "run without the TUI, logging to stderr")
 		logLevel   = flag.String("log-level", "info", "debug, info, warn, or error")
 		showVer    = flag.Bool("version", false, "print version and exit")
 	)
@@ -43,22 +44,38 @@ func main() {
 		return
 	}
 
+	// Under the TUI, slog feeds a ring buffer the Activity screen renders
+	// (spec §8): a full-screen program and stderr text cannot share a
+	// terminal without corrupting each other.
+	var logs *tui.LogRing
 	log := newLogger(*logLevel)
-	if err := run(*configPath, *addr, *headless, log); err != nil {
+	if !*headless {
+		logs = tui.NewLogRing(500)
+		log = slog.New(logs.Handler(parseLevel(*logLevel)))
+	}
+	if err := run(*configPath, *addr, *headless, log, logs); err != nil {
 		log.Error("fatal", "err", err)
+		if !*headless {
+			// The ring died with the TUI; say it where it can still be read.
+			fmt.Fprintln(os.Stderr, "aiproxy:", err)
+		}
 		os.Exit(1)
 	}
 }
 
-func newLogger(level string) *slog.Logger {
+func parseLevel(level string) slog.Level {
 	var l slog.Level
 	if err := l.UnmarshalText([]byte(level)); err != nil {
-		l = slog.LevelInfo
+		return slog.LevelInfo
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: l}))
+	return l
 }
 
-func run(configPath, addrOverride string, headless bool, log *slog.Logger) error {
+func newLogger(level string) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(level)}))
+}
+
+func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs *tui.LogRing) error {
 	if configPath == "" {
 		configPath = config.Path()
 	}
@@ -93,7 +110,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 	pruner.Start()
 	defer pruner.Stop()
 
-	handler, pb, err := buildHandler(cfg, store, log, ing)
+	handler, pb, vl, err := buildHandler(cfg, store, log, ing)
 	if err != nil {
 		return err
 	}
@@ -129,14 +146,44 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 		}
 	}()
 
-	select {
-	case err := <-errCh:
-		return err
-	case <-ctx.Done():
+	shutdown := func() error {
 		log.Info("shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutCtx)
+	}
+
+	if headless {
+		select {
+		case err := <-errCh:
+			return err
+		case <-ctx.Done():
+			return shutdown()
+		}
+	}
+
+	// TUI mode: the program owns the terminal until quit; quitting the TUI
+	// shuts the proxy down with it.
+	tuiErr := make(chan error, 1)
+	go func() {
+		tuiErr <- tui.Run(ctx, vl, version, logs)
+	}()
+	select {
+	case err := <-errCh:
+		stop() // unwinds the TUI via its context before the terminal is gone
+		<-tuiErr
+		return err
+	case <-ctx.Done():
+		<-tuiErr
+		return shutdown()
+	case err := <-tuiErr:
+		if err != nil {
+			err = fmt.Errorf("tui: %w (use --headless when not attached to a terminal)", err)
+		}
+		if serr := shutdown(); serr != nil && err == nil {
+			err = serr
+		}
+		return err
 	}
 }
 
@@ -146,7 +193,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 // has its own lifecycle (Start/Stop), exactly like the roller and pruner run
 // constructs alongside it; a caller that only wants the handler (most tests)
 // is free to ignore it.
-func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, error) {
+func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, error) {
 	upstreamClient := &http.Client{
 		Transport: proxy.NewTransport(proxy.TransportOptions{}),
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
@@ -287,7 +334,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
 			})
 		},
-	}), pb, nil
+	}), pb, vl, nil
 }
 
 // loginLabel matches spec §6.2's persisted account label convention —
