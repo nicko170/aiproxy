@@ -9,6 +9,8 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/prober"
+	"github.com/nicko170/aiproxy/internal/provider"
 )
 
 // statusLatencyWindow bounds how far back ServerStatus looks for its p95
@@ -26,6 +28,7 @@ type Local struct {
 	mgr     *account.Manager
 	metrics *metrics.Store
 	config  *config.Store
+	probe   *prober.Prober
 
 	listenAddr string
 	started    time.Time
@@ -64,8 +67,12 @@ func withClock(now func() time.Time) option {
 
 // NewLocal builds a Local over the given services. dropped may be nil, which
 // Local treats as always reporting zero (matching the pre-stage-3 status
-// handler's convention).
-func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, opts ...option) *Local {
+// handler's convention). pb is the background quota prober ProbeNow
+// delegates to and ServerStatus reports health from; cmd/aiproxy always
+// constructs one (even with quotaProbe.intervalSeconds 0, which disables
+// only its periodic loop — see prober.New's doc comment), so pb is never nil
+// in production.
+func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenAddr string, dropped func() int64, pb *prober.Prober, opts ...option) *Local {
 	if dropped == nil {
 		dropped = func() int64 { return 0 }
 	}
@@ -74,6 +81,7 @@ func NewLocal(mgr *account.Manager, ms *metrics.Store, cs *config.Store, listenA
 		mgr:        mgr,
 		metrics:    ms,
 		config:     cs,
+		probe:      pb,
 		listenAddr: listenAddr,
 		started:    now(),
 		dropped:    dropped,
@@ -113,7 +121,32 @@ func (l *Local) ServerStatus(ctx context.Context) (Status, error) {
 		TTFBP95MS:      lat.TTFBP95,
 		MetricsDropped: l.dropped(),
 		EventsDropped:  l.hub.droppedCount(),
+		Probe:          l.probeStatus(),
 	}, nil
+}
+
+// probeStatus converts the prober's own status type into the view-level
+// shape ServerStatus reports (spec §6.2: "reports probe health in the UI, so
+// a throttled probe is visible rather than silently wrong"). A nil prober
+// (only reachable if a caller builds a Local without one) reports the zero
+// value rather than panicking.
+func (l *Local) probeStatus() ProbeStatus {
+	if l.probe == nil {
+		return ProbeStatus{Accounts: map[string]AccountProbeStatus{}}
+	}
+	st := l.probe.Status()
+	out := ProbeStatus{
+		Running:         st.Running,
+		LastStartedAt:   st.LastStartedAt,
+		LastCompletedAt: st.LastCompletedAt,
+		Accounts:        make(map[string]AccountProbeStatus, len(st.Accounts)),
+	}
+	for id, a := range st.Accounts {
+		out.Accounts[id] = AccountProbeStatus{
+			LastError: a.LastError, LastSuccessAt: a.LastSuccessAt, NextAttemptAt: a.NextAttemptAt,
+		}
+	}
+	return out
 }
 
 func (l *Local) Accounts(ctx context.Context) ([]Account, error) {
@@ -411,4 +444,124 @@ func setAccountField(c *config.Config, accountID string, fn func(*config.Account
 		}
 	}
 	return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
+}
+
+// Login looks up the named provider and returns its login session
+// unaltered. That is deliberately all it does: everything that makes Login
+// safe and useful — never opening a browser itself, verifying state,
+// accepting a pasted code, timing out, cleaning up its listener, and
+// persisting the exchanged credential through config.Store and
+// account.Manager.Add before LoginResult ever reaches this call's caller —
+// already happened inside the provider's own Login (see
+// anthropic.Anthropic.OnLoginSuccess, wired by cmd/aiproxy). Local has
+// nothing to add to that and does not hold l.mu for it: the persistence
+// happens on whatever goroutine the callback or a submitted code arrives on,
+// asynchronously and long after this call returns, so serializing it against
+// SetPriority/RemoveAccount/etc. here would not help and holding a lock
+// across an operation that can take up to two minutes would be actively
+// harmful.
+func (l *Local) Login(ctx context.Context, providerName string) (provider.LoginSession, error) {
+	p, ok := l.mgr.Provider(providerName)
+	if !ok {
+		return provider.LoginSession{}, fmt.Errorf("unknown provider %q", providerName)
+	}
+	return p.Login(ctx)
+}
+
+// ImportCredentials reads accounts from an external credential file (spec
+// §6.3), persists any not already present, and adds them to the live
+// Manager without a restart — the same persist-then-apply order, and the
+// same mu, as every other Source mutation (see Local.mu's doc comment).
+//
+// Deduping happens inside the same config.Store.Update that appends, not
+// before it: re-reading and deciding under one atomic read-modify-write is
+// what makes two concurrent ImportCredentials calls (or an import racing a
+// Login for the same account) unable to both decide "not present yet" and
+// both append it.
+func (l *Local) ImportCredentials(ctx context.Context, source config.ImportSource) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var path string
+	switch source {
+	case config.ImportSourceLegacy:
+		path = config.LegacyPath()
+	case config.ImportSourceClaudeCode:
+		path = config.ClaudeCodePath()
+	default:
+		return 0, fmt.Errorf("unknown import source %q", source)
+	}
+	if path == "" {
+		return 0, fmt.Errorf("no path resolved for import source %q", source)
+	}
+
+	imported, err := config.ImportFile(path, source)
+	if err != nil {
+		return 0, err
+	}
+	if len(imported) == 0 {
+		return 0, nil
+	}
+
+	var added []config.Account
+	if _, err := l.config.Update(func(c *config.Config) error {
+		seen := map[string]bool{}
+		for _, a := range c.Accounts {
+			if key := importDedupeKey(a); key != "" {
+				seen[key] = true
+			}
+		}
+		for _, a := range imported {
+			key := importDedupeKey(a)
+			if key != "" && seen[key] {
+				continue
+			}
+			if key != "" {
+				seen[key] = true
+			}
+			c.Accounts = append(c.Accounts, a)
+			added = append(added, a)
+		}
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+
+	for _, a := range added {
+		if err := l.mgr.Add(a); err != nil {
+			// Persisted but not live: surfaced rather than silently dropped,
+			// though this should not be reachable in practice since Add's
+			// only failure is a duplicate id and every imported account gets
+			// a fresh one (config.NewID / ImportFile).
+			return len(added), fmt.Errorf("account persisted but not added live: %w", err)
+		}
+	}
+	return len(added), nil
+}
+
+// importDedupeKey identifies an account for ImportCredentials' dedupe
+// purposes: the credential's account uuid when known, else its label —
+// exactly the two fields spec calls out ("dedupe on the credential's
+// account uuid, or on the label when no uuid is present"). Empty for an
+// account with neither, which is treated as never a duplicate: there is
+// nothing to key on.
+func importDedupeKey(a config.Account) string {
+	if a.Identity.AccountUUID != "" {
+		return "uuid:" + a.Identity.AccountUUID
+	}
+	if a.Label != "" {
+		return "label:" + a.Label
+	}
+	return ""
+}
+
+// ProbeNow triggers one out-of-band quota-probe cycle (see internal/prober).
+// It does not hold l.mu: a probe cycle only reads accounts and calls
+// mgr.UpdateQuota, never config.Store, so there is nothing here that could
+// interleave with another Source mutation's persist-then-apply pair.
+func (l *Local) ProbeNow(ctx context.Context) error {
+	if l.probe == nil {
+		return fmt.Errorf("quota prober not configured")
+	}
+	return l.probe.ProbeNow(ctx)
 }

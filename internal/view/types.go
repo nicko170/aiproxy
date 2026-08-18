@@ -23,6 +23,30 @@ type Status struct {
 	// Mirrors MetricsDropped's principle: a drop is invisible unless a Status
 	// field says so.
 	EventsDropped int64 `json:"eventsDropped"`
+	// Probe reports the background quota prober's health (spec §6.2): a
+	// throttled probe must be visible in the UI, not silently stale.
+	Probe ProbeStatus `json:"probe"`
+}
+
+// AccountProbeStatus is one account's quota-probe health.
+type AccountProbeStatus struct {
+	// LastError is the most recent quota-read failure for this account, or
+	// "" if the last attempt succeeded (or none has failed yet).
+	LastError string `json:"lastError,omitempty"`
+	// LastSuccessAt is unix ms of the last successful quota read, or 0 if
+	// there has never been one.
+	LastSuccessAt int64 `json:"lastSuccessAt,omitempty"`
+	// NextAttemptAt is unix ms before which this account is skipped due to
+	// exponential backoff after being throttled, or 0 when eligible now.
+	NextAttemptAt int64 `json:"nextAttemptAt,omitempty"`
+}
+
+// ProbeStatus is the background quota prober's overall health.
+type ProbeStatus struct {
+	Running         bool                          `json:"running"`
+	LastStartedAt   int64                         `json:"lastStartedAt,omitempty"`
+	LastCompletedAt int64                         `json:"lastCompletedAt,omitempty"`
+	Accounts        map[string]AccountProbeStatus `json:"accounts"`
 }
 
 // Account is everything about one account that either front-end may show.

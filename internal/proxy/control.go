@@ -14,6 +14,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/view"
 )
 
@@ -300,6 +301,130 @@ func updateSettingsHandler(o HandlerOptions) http.HandlerFunc {
 		// data so a settings screen cannot mistake a pending field for an
 		// applied one.
 		writeJSON(w, applied)
+	})
+}
+
+// loginBeginBody is the request for POST .../accounts/login: which provider
+// to start a PKCE session for (e.g. "anthropic").
+type loginBeginBody struct {
+	Provider string `json:"provider"`
+}
+
+// loginBeginHandler begins a login session (view.Source.Login's one mapped
+// route) and registers it in reg, returning a session id the caller polls
+// and a URL to show the user / open in a browser. Never a credential: the
+// response is built entirely from the session id and sess.URL, neither of
+// which can carry one (see provider.LoginSession's doc comment).
+func loginBeginHandler(o HandlerOptions, reg *loginSessionRegistry) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		var body loginBeginBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Provider == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "provider is required")
+			return
+		}
+		id, url, err := reg.begin(r.Context(), src, body.Provider)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"sessionId": id, "url": url})
+	})
+}
+
+// loginCodeBody is the request for POST .../accounts/login/{sessionId}/code:
+// a pasted authorization code, the fallback for when no browser can reach
+// the loopback callback (spec §6.1) — over SSH, principally.
+type loginCodeBody struct {
+	Code string `json:"code"`
+}
+
+func loginSubmitCodeHandler(o HandlerOptions, reg *loginSessionRegistry) http.HandlerFunc {
+	return controlHandler(o, func(_ view.Source, w http.ResponseWriter, r *http.Request) {
+		st, ok := reg.get(chi.URLParam(r, "sessionId"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found_error", "no such login session")
+			return
+		}
+		var body loginCodeBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+			return
+		}
+		if err := st.submitCode(body.Code); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
+}
+
+// loginPollHandler answers GET .../accounts/login/{sessionId}: the
+// pending/done/error poll shape a raw channel cannot cross HTTP as (see this
+// file's — login_sessions.go's — package doc comment). Never a credential:
+// only status, a Profile (itself credential-free), and an error string ever
+// appear here.
+func loginPollHandler(o HandlerOptions, reg *loginSessionRegistry) http.HandlerFunc {
+	return controlHandler(o, func(_ view.Source, w http.ResponseWriter, r *http.Request) {
+		st, ok := reg.get(chi.URLParam(r, "sessionId"))
+		if !ok {
+			writeError(w, http.StatusNotFound, "not_found_error", "no such login session")
+			return
+		}
+		status, profile, errMsg := st.poll()
+		resp := map[string]any{"status": status}
+		switch status {
+		case "done":
+			resp["profile"] = map[string]any{
+				"email": profile.Email, "displayName": profile.DisplayName,
+				"orgName": profile.OrgName, "plan": profile.Plan,
+			}
+		case "error":
+			resp["error"] = errMsg
+		}
+		writeJSON(w, resp)
+	})
+}
+
+// importBody is the request for POST .../accounts/import: which credential
+// file layout to read (spec §6.3): "legacy" or "claude-code".
+type importBody struct {
+	Source string `json:"source"`
+}
+
+func importCredentialsHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		var body importBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+			return
+		}
+		added, err := src.ImportCredentials(r.Context(), config.ImportSource(body.Source))
+		if err != nil {
+			// Every failure ImportCredentials can report — an unknown source
+			// name, a source file that does not exist — traces back to what
+			// the caller asked for, so this is reported as a bad request
+			// rather than a server fault, mirroring updateSettingsHandler's
+			// validation-error convention.
+			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"added": added})
+	})
+}
+
+// probeNowHandler triggers one out-of-band quota-probe cycle. A throttled
+// account is an ordinary operational condition the prober already backs off
+// on, not a proxy fault, so this always answers 200 and reports the
+// cycle's own error (if any) as data — mirroring the prober's own
+// philosophy that a throttled probe should be visible, not alarming.
+func probeNowHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		err := src.ProbeNow(r.Context())
+		resp := map[string]any{"ok": err == nil}
+		if err != nil {
+			resp["error"] = err.Error()
+		}
+		writeJSON(w, resp)
 	})
 }
 

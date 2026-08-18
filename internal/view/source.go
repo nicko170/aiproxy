@@ -3,6 +3,9 @@ package view
 import (
 	"context"
 	"errors"
+
+	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/provider"
 )
 
 // ErrUnknownAccount is the sentinel every Source mutation that names an
@@ -27,19 +30,13 @@ var ErrUnknownAccount = errors.New("unknown account")
 // into proxy state (see types.go).
 //
 // Every method here has a corresponding route under /_aiproxy/api/v1 (spec
-// §9), enforced by TestEveryLockstepMethodHasARoute — except the three
-// deliberately deferred to stage 4, named in that test's allowlist:
-//
-//   - Login and ImportCredentials drive an interactive credential flow (an
-//     OAuth loopback callback, a paste-the-code prompt) that only the TUI
-//     exists to drive. Building them now means building a caller for them
-//     that does not exist yet.
-//   - ProbeNow triggers an out-of-band quota probe. The background prober it
-//     would signal is stage-4 scope; there is nothing yet for it to prod.
-//
-// They are omitted from Source itself, not merely unrouted, so the absence
-// reads as a decision recorded here rather than something a future stage
-// has to rediscover by noticing a gap.
+// §9), enforced by TestEveryViewSourceMethodHasAControlRoute. Login maps to
+// exactly one route (POST .../accounts/login, "begin a session") like every
+// other method; the control API additionally exposes two routes with no
+// Source method of their own — submit-code and poll — because a raw
+// provider.LoginSession (a channel and funcs) cannot cross HTTP. Those two
+// are the seam doing its job: a future view.HTTP synthesizes the channel
+// back out of polling (see internal/proxy's login session registry).
 type Source interface {
 	ServerStatus(ctx context.Context) (Status, error)
 	Accounts(ctx context.Context) ([]Account, error)
@@ -74,4 +71,28 @@ type Source interface {
 	// Local.UpdateSettings for why that split exists and is returned as data
 	// rather than documented).
 	UpdateSettings(ctx context.Context, s Settings) (Applied, error)
+
+	// Login starts a PKCE OAuth flow for the named provider (e.g.
+	// "anthropic") and returns immediately: the caller shows the returned
+	// session's URL (opening a browser is the caller's job, never Login's —
+	// see provider.LoginSession's doc comment) and observes completion on
+	// its Done channel, or drives SubmitCode for a pasted code. On success
+	// the account is already persisted and serving traffic without a
+	// restart (spec §6.1) — that happens inside the flow itself, before
+	// Done ever fires; Login here is a thin lookup of the named provider.
+	Login(ctx context.Context, providerName string) (provider.LoginSession, error)
+
+	// ImportCredentials reads accounts from an external credential file
+	// (config.ImportSourceLegacy or config.ImportSourceClaudeCode, spec
+	// §6.3), persists any not already present, and adds them to the live
+	// Manager without a restart. added counts only the accounts actually
+	// added; importing the same source twice adds nothing the second time
+	// (deduped on the credential's account uuid, or on label when no uuid is
+	// present).
+	ImportCredentials(ctx context.Context, source config.ImportSource) (added int, err error)
+
+	// ProbeNow triggers one out-of-band quota-probe cycle (see
+	// internal/prober). A cycle already running — the background loop's or
+	// another ProbeNow's — is joined rather than duplicated.
+	ProbeNow(ctx context.Context) error
 }

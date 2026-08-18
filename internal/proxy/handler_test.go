@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/testutil"
@@ -93,6 +95,7 @@ func TestModelMatches(t *testing.T) {
 type routerHarness struct {
 	srv     *httptest.Server
 	up      *testutil.FakeUpstream
+	p       *anthropic.Anthropic
 	mgr     *account.Manager
 	ms      *metrics.Store
 	cs      *config.Store
@@ -106,6 +109,11 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 	up := testutil.NewFakeUpstream(t, scripts...)
 	p := anthropic.New(http.DefaultClient)
 	p.TokenEndpointOverride = fakeTokenEndpoint(t)
+	// Every profile/quota/login read this provider makes must stay off the
+	// public internet, same as the token endpoint above; a test that needs
+	// specific canned responses (e.g. a login flow) points this at its own
+	// FakeUpstream instead.
+	p.BaseURLOverride = up.URL()
 	providers := map[string]provider.Provider{"anthropic": p}
 
 	accts := []config.Account{{
@@ -134,7 +142,29 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 		t.Fatalf("seed config: %v", err)
 	}
 
-	h := &routerHarness{up: up, mgr: mgr, ms: ms, cs: cs}
+	// Mirrors cmd/aiproxy's production wiring (buildHandler): a successful
+	// login persists a fresh account through the config store and adds it to
+	// the live Manager, so a control-API login test exercises the same path
+	// production does rather than a stub that silently drops it.
+	p.OnLoginSuccess = func(_ context.Context, cred provider.Credential, profile provider.Profile) error {
+		acc := config.Account{
+			ID: config.NewID(), Provider: "anthropic", Label: profile.Email + " (" + profile.OrgName + ")",
+			Credential: cred,
+			Identity: config.Identity{
+				AccountUUID: profile.AccountUUID, OrgUUID: profile.OrgUUID,
+				OrgName: profile.OrgName, Plan: profile.Plan,
+			},
+		}
+		if _, err := cs.Update(func(c *config.Config) error {
+			c.Accounts = append(c.Accounts, acc)
+			return nil
+		}); err != nil {
+			return err
+		}
+		return mgr.Add(acc)
+	}
+
+	h := &routerHarness{up: up, p: p, mgr: mgr, ms: ms, cs: cs}
 	ho := HandlerOptions{
 		Attempter: NewAttempter(mgr, providers, NewTransport(TransportOptions{}), defaultRetry(), quietLogger()),
 		Manager:   mgr,
@@ -162,7 +192,8 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 	// Built after opts runs so a test overriding o.Dropped (e.g.
 	// TestRouterStatusReportsMetricsDropped) is reflected in what ServerStatus
 	// reports; view.Local captures the func at construction.
-	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped)
+	pb := prober.New(mgr, providers, time.Hour)
+	vl := view.NewLocal(mgr, ms, cs, "127.0.0.1:3456", ho.Dropped, pb)
 	h.view = vl
 	ho.View = vl
 

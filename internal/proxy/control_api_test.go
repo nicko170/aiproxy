@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -601,5 +602,212 @@ func TestControlAPIEventsStreamsACompletedRequest(t *testing.T) {
 		case <-deadline:
 			t.Fatal("timed out waiting for an SSE event carrying the request's model")
 		}
+	}
+}
+
+// A throttled or failed probe is an ordinary operational condition (spec
+// §6.2), not a proxy fault: this must answer 200 either way and report the
+// cycle's own error, if any, as data.
+func TestControlAPIProbeNowRunsACycleAndReportsSuccess(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	// acct-0 has no quota-endpoint script queued beyond the default "{}" —
+	// BaseURLOverride already points Quota at h.up (see newRouterHarness), so
+	// this exercises probeNowHandler -> view.Local.ProbeNow -> the real
+	// prober -> a real (fake) Quota call end to end, entirely off the public
+	// internet.
+	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/probe", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", res.StatusCode)
+	}
+	var got struct {
+		OK bool `json:"ok"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.OK {
+		t.Error("ok = false, want true: the fake usage endpoint answered 200")
+	}
+}
+
+func TestControlAPIImportCredentialsUnknownSourceReturns400(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/import", "application/json",
+		strings.NewReader(`{"source":"bogus"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an unknown import source", res.StatusCode)
+	}
+}
+
+func TestControlAPIImportCredentialsMissingFileReturns400(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir()) // no teamclaude.json written here
+
+	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/import", "application/json",
+		strings.NewReader(`{"source":"legacy"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 when the source file does not exist", res.StatusCode)
+	}
+}
+
+func TestControlAPILoginUnknownSessionReturns404(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	pollRes, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts/login/does-not-exist")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pollRes.Body.Close()
+	if pollRes.StatusCode != http.StatusNotFound {
+		t.Errorf("poll status = %d, want 404", pollRes.StatusCode)
+	}
+
+	codeRes, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login/does-not-exist/code",
+		"application/json", strings.NewReader(`{"code":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeRes.Body.Close()
+	if codeRes.StatusCode != http.StatusNotFound {
+		t.Errorf("submit-code status = %d, want 404", codeRes.StatusCode)
+	}
+}
+
+func TestControlAPILoginBeginUnknownProviderReturns400(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login", "application/json",
+		strings.NewReader(`{"provider":"does-not-exist"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for an unregistered provider", res.StatusCode)
+	}
+}
+
+// The full begin -> callback -> poll loop through the control API, entirely
+// off the public internet (both the token exchange and the profile read
+// land on h.up), and the single most likely place to leak a credential:
+// every response body along the way — begin's, and poll's while and after
+// completion — must never contain the exchanged tokens or the authorization
+// code.
+func TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial(t *testing.T) {
+	const secretAccess = "sekrit-access-abc123"
+	const secretRefresh = "sekrit-refresh-xyz789"
+	tokenBody, _ := json.Marshal(map[string]any{
+		"access_token": secretAccess, "refresh_token": secretRefresh, "expires_in": 3600,
+	})
+	h := newRouterHarness(t, nil,
+		testutil.Script{Status: 200, Body: string(tokenBody)},
+		testutil.Script{Status: 200, Body: `{"account":{"uuid":"acct-9","email":"login@example.com",
+			"display_name":"Login Test"},"organization":{"uuid":"org-9","name":"Acme"}}`},
+	)
+	// Redirect the login exchange to this test's own two-script fake
+	// upstream instead of the shared refresh-only fakeTokenEndpoint; this
+	// test never proxies a request that would need the latter.
+	h.p.TokenEndpointOverride = h.up.URL()
+
+	beginRes, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login", "application/json",
+		strings.NewReader(`{"provider":"anthropic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginBody, _ := io.ReadAll(beginRes.Body)
+	beginRes.Body.Close()
+	if beginRes.StatusCode != 200 {
+		t.Fatalf("begin status = %d: %s", beginRes.StatusCode, beginBody)
+	}
+	var begin struct {
+		SessionID string `json:"sessionId"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(beginBody, &begin); err != nil {
+		t.Fatalf("decode begin response: %v", err)
+	}
+	if begin.SessionID == "" || begin.URL == "" {
+		t.Fatalf("begin response = %+v, want both fields set", begin)
+	}
+
+	u, err := url.Parse(begin.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	state := u.Query().Get("state")
+	redirectURI := u.Query().Get("redirect_uri")
+	if state == "" || redirectURI == "" {
+		t.Fatalf("authorize URL missing state/redirect_uri: %s", begin.URL)
+	}
+
+	cbRes, err := http.Get(redirectURI + "?code=auth-code-secret&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	cbRes.Body.Close()
+
+	var pollBody []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		pr, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts/login/" + begin.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pollBody, _ = io.ReadAll(pr.Body)
+		pr.Body.Close()
+		var poll struct {
+			Status  string `json:"status"`
+			Profile struct {
+				Email string `json:"email"`
+			} `json:"profile"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(pollBody, &poll); err != nil {
+			t.Fatalf("decode poll response: %v", err)
+		}
+		if poll.Status == "error" {
+			t.Fatalf("poll reported an error: %s", poll.Error)
+		}
+		if poll.Status == "done" {
+			if poll.Profile.Email != "login@example.com" {
+				t.Errorf("profile email = %q, want login@example.com", poll.Profile.Email)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	for _, blob := range []string{string(beginBody), string(pollBody)} {
+		for _, secret := range []string{secretAccess, secretRefresh, "auth-code-secret"} {
+			if strings.Contains(blob, secret) {
+				t.Errorf("control-API response leaked credential material %q: %s", secret, blob)
+			}
+		}
+	}
+
+	// The account must now be live, without a restart: this is the whole
+	// point of Login persisting through OnLoginSuccess before Done fires.
+	accts := h.mgr.All()
+	found := false
+	for _, a := range accts {
+		if a.Label == "login@example.com (Acme)" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("manager accounts = %+v, want the newly logged-in account live", accts)
 	}
 }

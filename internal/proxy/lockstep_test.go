@@ -31,15 +31,18 @@ var routeFor = map[string]struct{ method, pattern string }{
 	"RemoveAccount":       {http.MethodDelete, ReservedPrefix + "/api/v1/accounts/{id}"},
 	"Settings":            {http.MethodGet, ReservedPrefix + "/api/v1/settings"},
 	"UpdateSettings":      {http.MethodPost, ReservedPrefix + "/api/v1/settings"},
+	"Login":               {http.MethodPost, ReservedPrefix + "/api/v1/accounts/login"},
+	"ImportCredentials":   {http.MethodPost, ReservedPrefix + "/api/v1/accounts/import"},
+	"ProbeNow":            {http.MethodPost, ReservedPrefix + "/api/v1/probe"},
 }
 
 // unroutedAllowlist names Source methods deliberately reachable through no
 // route at all, with the reason recorded so the omission reads as a decision.
-// Empty today: Login, ImportCredentials, and ProbeNow are deferred by being
-// left off the Source interface itself (see source.go's doc comment), not by
-// being routeless members of it, so there is nothing to list here yet. A
-// future stage adding one of those methods to Source must add either a route
-// above or an entry here.
+// Empty today: every current Source method has exactly one mapped route
+// above. Login's control-API surface additionally includes two routes with
+// no Source method of their own (submit-code, poll) — that is not the same
+// thing this map guards against, and does not appear here; see router.go's
+// comment on the login routes and Source's doc comment.
 var unroutedAllowlist = map[string]string{}
 
 func TestEveryViewSourceMethodHasAControlRoute(t *testing.T) {
