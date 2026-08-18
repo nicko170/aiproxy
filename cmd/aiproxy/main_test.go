@@ -13,11 +13,29 @@ import (
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// testIngester gives a stage-1-era test a real (in-memory) accounting sink so
+// buildHandler's signature can require one without every unrelated test
+// standing up its own on-disk database.
+func testIngester(t *testing.T) *metrics.Ingester {
+	t.Helper()
+	db, err := metrics.OpenMemory()
+	if err != nil {
+		t.Fatalf("metrics.OpenMemory: %v", err)
+	}
+	ing := metrics.NewIngester(db, metrics.IngestOptions{})
+	t.Cleanup(func() {
+		ing.Close()
+		db.Close()
+	})
+	return ing
+}
 
 // End to end through the real wiring: a config on disk, the real router, a fake
 // upstream. This is the test that says "Claude Code can talk to this".
@@ -47,7 +65,7 @@ func TestEndToEndProxiesAStreamingCompletion(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, err := buildHandler(cfg, store, quiet())
+	h, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -126,7 +144,7 @@ func TestBuildHandlerWiresTransportHeaderTimeoutFromConfig(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, err := buildHandler(cfg, store, quiet())
+	h, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -155,7 +173,7 @@ func TestEndToEndStatusEndpoint(t *testing.T) {
 	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 	cfg, _ := store.Update(func(c *config.Config) error { return nil })
 
-	h, err := buildHandler(cfg, store, quiet())
+	h, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -191,7 +209,7 @@ func TestBuildHandlerPersistsRefreshedCredentials(t *testing.T) {
 		}}
 		return nil
 	})
-	if _, err := buildHandler(cfg, store, quiet()); err != nil {
+	if _, err := buildHandler(cfg, store, quiet(), testIngester(t)); err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
 

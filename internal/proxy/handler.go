@@ -100,6 +100,10 @@ type HandlerOptions struct {
 	Upstream string
 	// PassthroughPrefixes are relayed with the client's own credential.
 	PassthroughPrefixes []string
+	// Dropped reports how many accounting samples have been discarded because
+	// the ingester's buffer was full, so degradation is visible rather than
+	// silent (spec §7.3). Nil is treated as always zero.
+	Dropped func() int64
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.

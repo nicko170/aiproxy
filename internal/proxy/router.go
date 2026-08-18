@@ -95,10 +95,16 @@ func statusHandler(o HandlerOptions) http.HandlerFunc {
 			})
 		}
 
+		var dropped int64
+		if o.Dropped != nil {
+			dropped = o.Dropped()
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"uptimeSeconds": int(time.Since(started).Seconds()),
-			"accounts":      accounts,
+			"uptimeSeconds":  int(time.Since(started).Seconds()),
+			"accounts":       accounts,
+			"metricsDropped": dropped,
 		})
 	}
 }

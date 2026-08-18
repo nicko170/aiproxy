@@ -243,6 +243,30 @@ func TestRouterServesStatusUnderReservedPrefix(t *testing.T) {
 	}
 }
 
+// Spec §7.3: a dropped accounting sample must be visible, not silent. The
+// status endpoint is where it surfaces until the stage-4 TUI takes over.
+func TestRouterStatusReportsMetricsDropped(t *testing.T) {
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		o.Dropped = func() int64 { return 42 }
+	}, testutil.Script{Status: 200, Body: `{}`})
+
+	res, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	var got struct {
+		MetricsDropped int64 `json:"metricsDropped"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.MetricsDropped != 42 {
+		t.Errorf("metricsDropped = %d, want 42", got.MetricsDropped)
+	}
+}
+
 // The reserved prefix must never reach the proxy path, even for an unknown
 // route, or a future control endpoint would be silently forwarded to the
 // upstream and answered by it.

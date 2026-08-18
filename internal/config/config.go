@@ -121,3 +121,6 @@ func Dir() string {
 }
 
 func Path() string { return filepath.Join(Dir(), "config.json") }
+
+// DBPath is the accounting database, a sibling of the config.
+func DBPath() string { return filepath.Join(Dir(), "metrics.db") }

@@ -11,11 +11,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/metrics"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/proxy"
@@ -72,7 +74,24 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 		cfg.Listen.Addr = addrOverride
 	}
 
-	handler, err := buildHandler(cfg, store, log)
+	db, err := metrics.Open(config.DBPath())
+	if err != nil {
+		return fmt.Errorf("open metrics db: %w", err)
+	}
+	defer db.Close()
+
+	ing := metrics.NewIngester(db, metrics.IngestOptions{})
+	defer ing.Close()
+
+	roller := metrics.NewRoller(db, time.Minute, log)
+	roller.Start()
+	defer roller.Stop()
+
+	pruner := metrics.NewPruner(db, time.Duration(cfg.Metrics.RetentionDays)*24*time.Hour, log)
+	pruner.Start()
+	defer pruner.Stop()
+
+	handler, err := buildHandler(cfg, store, log, ing)
 	if err != nil {
 		return err
 	}
@@ -116,7 +135,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger) error
 
 // buildHandler wires config into a serving handler. Kept separate from run so
 // tests exercise the real composition without binding a port.
-func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (http.Handler, error) {
+func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, error) {
 	upstreamClient := &http.Client{
 		Transport: proxy.NewTransport(proxy.TransportOptions{}),
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
@@ -143,6 +162,14 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 				return nil
 			})
 			return err
+		},
+		OnQuota: func(id string, buckets []provider.QuotaBucket, at int64) {
+			for _, b := range buckets {
+				ing.RecordQuota(metrics.QuotaSample{
+					At: at, AccountID: id, Bucket: b.Name,
+					Utilization: b.Utilization, ResetsAt: b.ResetsAt,
+				})
+			}
 		},
 	})
 
@@ -174,6 +201,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 		// credential rather than a rotated account's.
 		Upstream:            anthropic.DefaultBaseURL,
 		PassthroughPrefixes: proxy.DefaultPassthroughPrefixes,
+		Dropped:             ing.Dropped,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "account", res.AccountID, "status", res.Status,
@@ -181,8 +209,33 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger) (htt
 				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
 				"in", res.InputTokens, "out", res.OutputTokens,
 				"cacheRead", res.CacheReadTokens, "cacheWrite", res.CacheWriteTokens)
+
+			ing.Record(metrics.Sample{
+				StartedAt: res.StartedAt, DurationMS: res.DurationMS,
+				TTFBMS: res.TTFBMS, WaitMS: res.WaitMS,
+				AccountID: res.AccountID, Provider: "anthropic",
+				Model: req.Model, SessionID: req.SessionID,
+				Endpoint: endpointOf(req.Path), Status: res.Status,
+				Outcome: res.Outcome.String(), Stream: res.Bytes > 0,
+				Attempts: res.Attempts, Rotated: res.Rotated,
+				InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
+				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
+				CostMicros: metrics.CostMicros(req.Model, metrics.TokenCounts{
+					Input: res.InputTokens, Output: res.OutputTokens,
+					CacheRead: res.CacheReadTokens, CacheWrite: res.CacheWriteTokens,
+				}),
+			})
 		},
 	}), nil
+}
+
+// endpointOf strips the query string so /v1/messages?beta=true and
+// /v1/messages aggregate together.
+func endpointOf(path string) string {
+	if i := strings.IndexByte(path, '?'); i >= 0 {
+		return path[:i]
+	}
+	return path
 }
 
 // firstRunImport adopts existing credentials so a first run does not require

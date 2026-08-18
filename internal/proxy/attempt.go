@@ -110,16 +110,21 @@ type Request struct {
 	SessionID string
 }
 
-// Result is what happened, for logging and (in stage 2) accounting.
+// Result is what happened, for logging and accounting.
 type Result struct {
 	Status    int
 	AccountID string
 	Outcome   provider.OutcomeKind
 	Attempts  int
 	Rotated   bool
-	WaitMS    int64
-	TTFBMS    int64
-	Bytes     int64
+	// StartedAt is unix ms when Do began, stamped once at the top of the loop.
+	StartedAt int64
+	// DurationMS is the whole request's wall-clock time, set in the same
+	// deferred block that sets WaitMS.
+	DurationMS int64
+	WaitMS     int64
+	TTFBMS     int64
+	Bytes      int64
 
 	InputTokens      int64
 	OutputTokens     int64
@@ -172,12 +177,14 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 	sends := map[string]int{}
 	noHintWaits := 0
 	started := time.Now()
+	res.StartedAt = started.UnixMilli()
 	// lastSent is the account the previous attempt in THIS request went to, which
 	// is what makes a rotation onto a different account observable below.
 	lastSent := ""
 
 	defer func() {
 		res.WaitMS = a.cfg.Budget.Milliseconds() - budget.Remaining().Milliseconds()
+		res.DurationMS = time.Since(started).Milliseconds()
 	}()
 
 	for {
