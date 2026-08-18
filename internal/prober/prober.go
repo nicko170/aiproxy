@@ -159,6 +159,18 @@ func (p *Prober) Start() {
 				<-p.stop
 				return
 			}
+			// One cycle immediately, before the ticker. Waiting a full interval
+			// left the proxy with NO quota data for its first interval —
+			// buckets are not persisted across restarts, so this is absent
+			// data rather than merely stale, and selection cannot apply
+			// switchThreshold to an account it knows nothing about. The first
+			// requests after a restart could therefore be sent to an account
+			// that was already spent.
+			//
+			// Inside the goroutine and under stopCtx, so Start stays
+			// non-blocking and a Stop during this first cycle still cancels it.
+			p.runCycle(stopCtx)
+
 			t := time.NewTicker(p.interval)
 			defer t.Stop()
 			for {

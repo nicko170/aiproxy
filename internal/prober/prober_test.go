@@ -386,6 +386,32 @@ func TestIntervalZeroDisablesTheBackgroundLoopButNotProbeNow(t *testing.T) {
 	}
 }
 
+// Start used to wait a full interval before its first cycle, and nothing calls
+// ProbeNow at boot, so with the default 300s interval the proxy spent its first
+// five minutes with no quota data at all. Buckets are not persisted across
+// restarts, so this is not merely stale data but absent data: selection cannot
+// apply switchThreshold to an account it knows nothing about, and the first
+// requests after a restart can be sent to an account that is already spent.
+func TestStartProbesImmediatelyRatherThanWaitingAnInterval(t *testing.T) {
+	fp := &fakeProvider{results: []quotaResult{quotaOK(provider.QuotaBucket{Name: "5h", Utilization: 0.3})}}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, 10*time.Minute)
+
+	p.Start()
+	defer p.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fp.callCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := fp.callCount(); got != 1 {
+		t.Fatalf("callCount = %d, want 1 promptly after Start, not one interval later", got)
+	}
+	if got := mgr.All()[0].Buckets["5h"].Utilization; got != 0.3 {
+		t.Errorf("utilization = %v, want the startup probe to have populated it", got)
+	}
+}
+
 func TestStartTicksAtTheConfiguredIntervalAndStopEndsIt(t *testing.T) {
 	fp := &fakeProvider{results: []quotaResult{quotaOK()}}
 	mgr := newMgr(t, fp, oauthAcct("a"))
