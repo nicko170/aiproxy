@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -761,6 +762,7 @@ func TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial(t *testing.T
 
 	var pollBody []byte
 	deadline := time.Now().Add(5 * time.Second)
+	reachedDone := false
 	for time.Now().Before(deadline) {
 		pr, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts/login/" + begin.SessionID)
 		if err != nil {
@@ -785,9 +787,16 @@ func TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial(t *testing.T
 			if poll.Profile.Email != "login@example.com" {
 				t.Errorf("profile email = %q, want login@example.com", poll.Profile.Email)
 			}
+			reachedDone = true
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+	// Falling out of the loop on the deadline without ever seeing "done" used
+	// to silently skip the profile assertion above instead of failing the
+	// test — a hang here would pass. Make that a hard failure.
+	if !reachedDone {
+		t.Fatalf("poll never reached status \"done\" within the deadline; last poll body: %s", pollBody)
 	}
 
 	for _, blob := range []string{string(beginBody), string(pollBody)} {
@@ -810,4 +819,95 @@ func TestControlAPILoginFlowSucceedsAndNeverLeaksCredentialMaterial(t *testing.T
 	if !found {
 		t.Errorf("manager accounts = %+v, want the newly logged-in account live", accts)
 	}
+}
+
+// C1's exact production path: loginBeginHandler used to hand reg.begin
+// r.Context(), which is cancelled the instant that handler returns —
+// silently defeating the flow's own timeout and leaking the loopback
+// listener forever. This drives the real control API: begin a login, let
+// the begin handler return (http.Post has already read the full response by
+// the time it returns, so the request is over), then assert the flow is
+// still alive and its listener still bound, and finally that it still
+// terminates on its own via the ordinary login timeout.
+func TestControlAPILoginOutlivesTheBeginRequestAndStillTimesOut(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	h.p.LoginTimeoutOverride = 200 * time.Millisecond
+
+	beginRes, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login", "application/json",
+		strings.NewReader(`{"provider":"anthropic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginBody, _ := io.ReadAll(beginRes.Body)
+	beginRes.Body.Close()
+	if beginRes.StatusCode != 200 {
+		t.Fatalf("begin status = %d: %s", beginRes.StatusCode, beginBody)
+	}
+	var begin struct {
+		SessionID string `json:"sessionId"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(beginBody, &begin); err != nil {
+		t.Fatalf("decode begin response: %v", err)
+	}
+
+	// The begin handler has already returned (http.Post only returns once
+	// the whole response is read) — exactly the moment r.Context() used to
+	// be cancelled. The loopback listener embedded in the authorize URL must
+	// still be accepting connections.
+	u, err := url.Parse(begin.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	redirectURI := u.Query().Get("redirect_uri")
+	ru, err := url.Parse(redirectURI)
+	if err != nil {
+		t.Fatalf("parse redirect_uri: %v", err)
+	}
+	conn, err := net.DialTimeout("tcp", ru.Host, time.Second)
+	if err != nil {
+		t.Fatalf("loopback listener not reachable right after the begin request returned: %v", err)
+	}
+	conn.Close()
+
+	// The session must still be "pending", not already killed by the
+	// now-dead request context.
+	pollOnce := func() (status, errMsg string, body []byte) {
+		pr, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts/login/" + begin.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pr.Body.Close()
+		body, _ = io.ReadAll(pr.Body)
+		var poll struct {
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &poll); err != nil {
+			t.Fatalf("decode poll response: %v", err)
+		}
+		return poll.Status, poll.Error, body
+	}
+	if status, errMsg, body := pollOnce(); status != "pending" {
+		t.Fatalf("poll status = %q (%s), want pending: %s", status, errMsg, body)
+	}
+
+	// It must still terminate on its own, bounded by the (short, overridden)
+	// login timeout — proving this is a real, working timeout and not just
+	// "never cancelled at all".
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		status, errMsg, body := pollOnce()
+		if status == "error" {
+			if !strings.Contains(errMsg, "timed out") {
+				t.Errorf("poll error = %q, want a timeout", errMsg)
+			}
+			return
+		}
+		if status == "done" {
+			t.Fatalf("session unexpectedly completed: %s", body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("login session never timed out; it must not have finished on its own")
 }

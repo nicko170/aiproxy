@@ -322,7 +322,10 @@ func loginBeginHandler(o HandlerOptions, reg *loginSessionRegistry) http.Handler
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "provider is required")
 			return
 		}
-		id, url, err := reg.begin(r.Context(), src, body.Provider)
+		// reg.begin deliberately does not take r.Context(): the session it
+		// starts must outlive this handler, not die the instant it returns
+		// (see loginSessionRegistry.begin's doc comment).
+		id, url, err := reg.begin(src, body.Provider)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return

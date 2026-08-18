@@ -13,20 +13,32 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/view"
 )
+
+// defaultSessionTTL bounds how long a session's registry entry survives
+// after it reaches a terminal status ("done" or "error"), so a slow poller
+// still gets a coherent final answer while an abandoned session (nobody
+// ever polls it again) does not sit in the registry for the life of the
+// process.
+const defaultSessionTTL = 5 * time.Minute
 
 // loginSessionRegistry is constructed once per router (see NewRouter) and
 // closed over by the three login handlers.
 type loginSessionRegistry struct {
 	mu       sync.Mutex
 	sessions map[string]*loginSessionState
+
+	// sessionTTL is defaultSessionTTL in production; tests shrink it so
+	// cleanup is observable without a multi-minute sleep.
+	sessionTTL time.Duration
 }
 
 func newLoginSessionRegistry() *loginSessionRegistry {
-	return &loginSessionRegistry{sessions: map[string]*loginSessionState{}}
+	return &loginSessionRegistry{sessions: map[string]*loginSessionState{}, sessionTTL: defaultSessionTTL}
 }
 
 // loginSessionState is one session's poll-able state. sess itself is never
@@ -54,8 +66,17 @@ func randomSessionID() (string, error) {
 // it under a fresh session id, and spawns the one goroutine that drains
 // sess.Done into pollable state. Returns the session id and the authorize
 // URL the caller shows the user.
-func (r *loginSessionRegistry) begin(ctx context.Context, src view.Source, providerName string) (id, url string, err error) {
-	sess, err := src.Login(ctx, providerName)
+//
+// Login runs on a fresh, request-independent context — never the calling
+// handler's r.Context() — because the session's lifetime is its own (bounded
+// by the provider's login timeout, or by a later Cancel/SubmitCode), not the
+// HTTP request that happened to start it. loginBeginHandler used to pass
+// r.Context() straight through, which is cancelled the instant that handler
+// returns; combined with a bug in loginFlow.awaitTimeout (fixed separately)
+// that silently defeated the whole timeout, every started login leaked its
+// loopback listener, its goroutines, and this registry entry forever.
+func (r *loginSessionRegistry) begin(src view.Source, providerName string) (id, url string, err error) {
+	sess, err := src.Login(context.Background(), providerName)
 	if err != nil {
 		return "", "", err
 	}
@@ -72,7 +93,6 @@ func (r *loginSessionRegistry) begin(ctx context.Context, src view.Source, provi
 	go func() {
 		res, ok := <-sess.Done
 		st.mu.Lock()
-		defer st.mu.Unlock()
 		switch {
 		case !ok:
 			st.status = "error"
@@ -84,6 +104,16 @@ func (r *loginSessionRegistry) begin(ctx context.Context, src view.Source, provi
 			st.status = "done"
 			st.profile = res.Profile
 		}
+		st.mu.Unlock()
+
+		// The session has reached a terminal status: release its entry after
+		// sessionTTL rather than never — a session nobody ever polls again
+		// (the flow completed, or the caller navigated away) otherwise stays
+		// in r.sessions for the life of the process.
+		time.Sleep(r.sessionTTL)
+		r.mu.Lock()
+		delete(r.sessions, id)
+		r.mu.Unlock()
 	}()
 
 	return id, sess.URL, nil
