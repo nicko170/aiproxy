@@ -24,6 +24,15 @@ var allowRes = []*regexp.Regexp{
 	// git SHA-1 and SHA-256 object ids, and bare content digests
 	regexp.MustCompile(`(?i)^[0-9a-f]{40}$`),
 	regexp.MustCompile(`(?i)^[0-9a-f]{64}$`),
+	// Algorithm-prefixed digests, e.g. sha256:e3b0c... `checksum/secret:
+	// sha256:...` is a routine Kubernetes annotation used to trigger a pod
+	// restart when a ConfigMap or Secret changes; the assigned-credential rule's
+	// value class (anything 12+ chars with no comma/quote/space/semicolon) does
+	// not exclude the colon, so this shape is otherwise indistinguishable from a
+	// real assignment. Redacting it destroys real context for no privacy gain,
+	// since a digest is not a secret. Anchored at both ends so this cannot
+	// swallow anything else.
+	regexp.MustCompile(`(?i)^[a-z0-9][a-z0-9_-]*:[0-9a-f]{32,128}$`),
 	// semver, with optional prerelease and build metadata
 	regexp.MustCompile(`^v?\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`),
 	// RFC 2606 / RFC 6761 reserved names, and RFC 5737 documentation addresses

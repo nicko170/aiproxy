@@ -103,6 +103,16 @@ func TestRulesDoNotFireOnBenignHighEntropyStrings(t *testing.T) {
 		`API_KEY = "YOUR_API_KEY"`,
 		`password = "changeme"`,
 		`token: "<redacted>"`,
+		// checksum/secret: sha256:... is the standard Kubernetes annotation for
+		// triggering a pod restart when a ConfigMap or Secret changes. The
+		// assigned-credential rule's value class does not exclude ':', so an
+		// algorithm-prefixed digest assigned to a credential-shaped key must be
+		// caught by the allowlist instead.
+		`checksum/secret: sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+		`SECRET=sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`,
+		// Exercise the digest-length range at both ends, not only at sha256's 64.
+		`SECRET=md5:9dd4e461268c8034f5c8564e155c67a6`,
+		`SECRET=sha1:11f6ad8ec52a2984abaafd7c3b516503785c2072`,
 	} {
 		if got := scan(t, text); len(got) != 0 {
 			t.Errorf("false positive on %q: %+v", text, got)
