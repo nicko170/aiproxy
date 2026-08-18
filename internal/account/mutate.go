@@ -1,6 +1,11 @@
 package account
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/provider"
+)
 
 // SetEnabled toggles whether an account participates in selection. The
 // account continues to exist and hold its accumulated state (quota, errors);
@@ -53,6 +58,38 @@ func (m *Manager) Remove(id string) error {
 		}
 	}
 	return nil
+}
+
+// Add registers a brand-new account into the live registry without a
+// restart — the mirror image of Remove. ImportCredentials and a successful
+// Login both persist through config.Store first and then call this, exactly
+// like every other Local mutation (persist, then apply; see
+// view.Local.mu's doc comment): a failed persist must never leave an account
+// live that a restart would not reproduce.
+//
+// A duplicate id is rejected rather than silently overwriting the existing
+// account's accumulated runtime state (quota history, in-flight count,
+// errors) — ids are assigned once and never reused (spec §6.2), so a
+// collision here means a caller reused one, not that this is an update.
+func (m *Manager) Add(c config.Account) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.byID[c.ID]; exists {
+		return fmt.Errorf("account %q already exists", c.ID)
+	}
+	a := fromConfig(c)
+	m.accounts = append(m.accounts, a)
+	m.byID[a.ID] = a
+	return nil
+}
+
+// Provider returns the registered provider.Provider for a name (e.g.
+// "anthropic"), so a caller above Manager — view.Local's Login, specifically
+// — can drive a provider-level operation like Login without Manager having
+// to expose its whole provider registry or import anything above itself.
+func (m *Manager) Provider(name string) (provider.Provider, bool) {
+	p, ok := m.providers[name]
+	return p, ok
 }
 
 // SetSwitchThreshold changes the utilization above which an account is
