@@ -347,6 +347,42 @@ Per-screen keys are shown in the footer: `space` pauses the activity feed,
 (account, model, outcome); on Accounts, `e` toggles enabled, `+`/`-` change
 priority, `x` removes, and `enter` opens detail.
 
+## Warming idle accounts
+
+Anthropic anchors the 5-hour window to an account's **first request**, not to a
+wall clock. Two accounts on the same plan here reset at 21:00 and 00:20, and a
+window that had never been used reported `resetsAt=0` — no clock running at all.
+
+That costs you throughput whenever traffic concentrates on one account. The
+standby's window does not begin until the moment you fail over onto it, so its
+reset is pushed a full five hours past the handover instead of having been
+counting down all along. Over a day that is fewer windows per account than the
+4.8 the limit actually allows.
+
+So when the busiest account passes `warming.threshold` (default 0.5) of its own
+5-hour window, aiproxy sends **one** minimal request to the standby whose clock
+is stopped — cheapest model, `max_tokens: 1`. Measured against the live API that
+is 8 input and 1 output token, and it needs no Claude Code system prompt. The
+response's own rate-limit headers are recorded immediately, which is also what
+stops the next cycle warming the same account again.
+
+Only accounts that need it are touched: OAuth credentials only, only when the
+5-hour window is genuinely unstarted, and the highest-priority standby first —
+the one traffic would actually fail over to. A warm that fails backs off for 15
+minutes, so one dead credential cannot turn into a steady stream of billable
+attempts, and the failure is visible rather than silent.
+
+**This is the one setting that makes aiproxy spend money without a client asking
+it to.** It is on by default because the amount is a fraction of a cent per
+account per five hours and the throughput gain is real, but it is a different
+category from everything else here, so it is worth knowing about rather than
+discovering on a bill. `"warming": {"enabled": false}` turns it off entirely.
+
+Note the interaction with [account selection](#which-account-gets-picked): a
+freshly warmed account has a nearly-full window five hours out, so it ranks
+*low* on expiring allowance and will not steal traffic from the account you are
+deliberately draining. Warming prepares the standby; it does not promote it.
+
 ## Which account gets picked
 
 Selection sorts eligible accounts by, in order: unpaused before paused, then
@@ -433,6 +469,7 @@ that read those values are built once at startup.
   "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [] },
   "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000, "overloadedBudgetMs": 30000 },
   "quotaProbe": { "intervalSeconds": 300 },
+  "warming": { "enabled": true, "threshold": 0.5, "model": "claude-haiku-4-5-20251001" },
   "metrics": { "retentionDays": 90 },
   "mitm": { "enabled": true },
   "update": { "checkEnabled": true, "checkIntervalHours": 24 },

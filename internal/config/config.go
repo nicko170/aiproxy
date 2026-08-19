@@ -74,6 +74,25 @@ type QuotaProbe struct {
 	IntervalSeconds int `json:"intervalSeconds"`
 }
 
+// Warming starts an idle account's five-hour window before that account is
+// needed. Anthropic anchors that window to an account's first request, so an
+// untouched account has no clock running and its reset is pushed a full five
+// hours past whenever you fail over onto it.
+//
+// Threshold is how far through its own window the busiest account must be
+// before a standby is warmed, 0..1. Warming earlier costs no more tokens but
+// commits the standby's window sooner, and a committed window is one already
+// expiring.
+//
+// This is the one setting that makes aiproxy send a billable request no client
+// asked for. It is small — a warm measured 8 input and 1 output token on the
+// cheapest model — but it is not nothing.
+type Warming struct {
+	Enabled   bool    `json:"enabled"`
+	Threshold float64 `json:"threshold"`
+	Model     string  `json:"model"`
+}
+
 type Metrics struct {
 	RetentionDays int `json:"retentionDays"`
 }
@@ -181,6 +200,7 @@ type Config struct {
 	Routing    Routing    `json:"routing"`
 	Retry      Retry      `json:"retry"`
 	QuotaProbe QuotaProbe `json:"quotaProbe"`
+	Warming    Warming    `json:"warming"`
 	Metrics    Metrics    `json:"metrics"`
 	MITM       MITM       `json:"mitm"`
 	Update     Update     `json:"update"`
@@ -203,6 +223,7 @@ func Default() Config {
 			HeaderTimeoutMS: 60000, OverloadedBudgetMS: 30000,
 		},
 		QuotaProbe: QuotaProbe{IntervalSeconds: 300},
+		Warming:    Warming{Enabled: true, Threshold: 0.5, Model: "claude-haiku-4-5-20251001"},
 		Metrics:    Metrics{RetentionDays: 90},
 		MITM:       MITM{Enabled: true},
 		Update:     Update{CheckEnabled: true, CheckIntervalHours: 24},

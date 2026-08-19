@@ -67,7 +67,7 @@ func TestEndToEndProxiesAStreamingCompletion(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestBuildHandlerWiresTransportHeaderTimeoutFromConfig(t *testing.T) {
 		t.Fatalf("config: %v", err)
 	}
 
-	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestEndToEndStatusEndpoint(t *testing.T) {
 		return nil
 	})
 
-	h, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	h, _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
@@ -236,7 +236,7 @@ func TestBuildHandlerPersistsRefreshedCredentials(t *testing.T) {
 		}}
 		return nil
 	})
-	if _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t)); err != nil {
+	if _, _, _, _, _, err := buildHandler(cfg, store, quiet(), testIngester(t)); err != nil {
 		t.Fatalf("buildHandler: %v", err)
 	}
 
@@ -311,7 +311,7 @@ func TestStatusReportsTheRunningVersion(t *testing.T) {
 	cfg.Update.CheckEnabled = false // no outbound request from a test
 	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
 
-	_, _, vl, ck, err := buildHandler(cfg, store, quiet(), testIngester(t))
+	_, _, vl, ck, _, err := buildHandler(cfg, store, quiet(), testIngester(t))
 	if err != nil {
 		t.Fatal(err)
 	}

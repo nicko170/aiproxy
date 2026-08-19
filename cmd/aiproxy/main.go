@@ -28,6 +28,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/tui"
 	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
+	"github.com/nicko170/aiproxy/internal/warmer"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=..."
@@ -121,7 +122,7 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	pruner.Start()
 	defer pruner.Stop()
 
-	handler, pb, vl, upd, err := buildHandler(cfg, store, log, ing)
+	handler, pb, vl, upd, wm, err := buildHandler(cfg, store, log, ing)
 	if err != nil {
 		return err
 	}
@@ -130,6 +131,11 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	// Start/Stop are unconditional exactly like the roller and pruner above.
 	pb.Start()
 	defer pb.Stop()
+	// Warming is enabled by default but sends nothing until an account is past
+	// its threshold AND a standby's window is stopped; Start/Stop stay
+	// unconditional so a disabled warmer is still safe to stop.
+	wm.Start()
+	defer wm.Stop()
 
 	// Same shape for the update checker: Start always spawns its goroutine so
 	// Stop is always safe, and a disabled check simply never reaches the
@@ -325,7 +331,7 @@ func buildPrivacy(cfg config.Config, log *slog.Logger) (*privacy.Filter, error) 
 // each owns a background loop with its own lifecycle (Start/Stop), exactly
 // like the roller and pruner run constructs alongside them; a caller that
 // only wants the handler (most tests) is free to ignore them.
-func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, *updater.Checker, error) {
+func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing *metrics.Ingester) (http.Handler, *prober.Prober, *view.Local, *updater.Checker, *warmer.Warmer, error) {
 	upstreamClient := &http.Client{
 		Transport: proxy.NewTransport(proxy.TransportOptions{}),
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
@@ -378,6 +384,16 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	pb := prober.New(mgr, providers, time.Duration(cfg.QuotaProbe.IntervalSeconds)*time.Second,
 		prober.WithLogger(log))
 
+	// Warming makes a real, billable request that no client asked for, so it
+	// gets its own transport and its own component rather than being folded
+	// into the prober, whose contract is a zero-spend read.
+	wm := warmer.New(mgr, providers, proxy.NewTransport(proxy.TransportOptions{}), warmer.Options{
+		Enabled:   cfg.Warming.Enabled,
+		Threshold: cfg.Warming.Threshold,
+		Model:     cfg.Warming.Model,
+		Log:       log,
+	})
+
 	// In-app update checking. The Client is told the version this binary was
 	// stamped with (see main.version); an unstamped "dev" build is never
 	// offered an update, and never makes a request to find one. The Checker's
@@ -412,7 +428,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 
 	pf, err := buildPrivacy(cfg, log)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("privacy filter: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("privacy filter: %w", err)
 	}
 	if pf != nil {
 		log.Info("privacy filter active",
@@ -476,7 +492,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
 			})
 		},
-	}), pb, vl, upd, nil
+	}), pb, vl, upd, wm, nil
 }
 
 // loginLabel matches spec §6.2's persisted account label convention —
