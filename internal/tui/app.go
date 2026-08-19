@@ -362,6 +362,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.accounts != nil || msg.err == nil {
 			m.accounts = msg.accounts
+			// Recomputed here rather than at each render because the assignment
+			// has to be the same on every screen: an account's colour is how
+			// you follow it from the chart to the legend to the accounts list.
+			ids := make([]string, 0, len(m.accounts))
+			for _, a := range m.accounts {
+				ids = append(ids, a.ID)
+			}
+			m.th.ident = assignIdentities(ids)
 		}
 		m.status = msg.status
 		return m, nil

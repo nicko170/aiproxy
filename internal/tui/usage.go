@@ -364,6 +364,13 @@ func (m Model) viewUsage(h int) string {
 	barW := chartW / ncols
 	cols := chartColumns(u.series.Points, from, to, ncols)
 	groups := chartGroups(cols)
+	// Grouping by account uses the model-wide assignment, so a series keeps the
+	// colour that account has on every other screen. The other groupings have
+	// keys nothing else colours, so they get an assignment of their own rather
+	// than falling back to the bare hash and colliding among themselves.
+	if usageGroups[m.usage.groupIdx] != view.GroupByAccount {
+		th.ident = assignIdentities(groups)
+	}
 	chart := renderChart(cols, groups, chartH, barW, th)
 
 	var b strings.Builder

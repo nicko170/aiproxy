@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/x/term"
@@ -121,6 +122,9 @@ const (
 type theme struct {
 	mode       colorMode
 	hyperlinks bool
+	// ident maps an identity key to its slot in identityCycle. Nil falls back
+	// to the bare hash; see identity.
+	ident map[string]int
 }
 
 func newTheme() theme { return theme{mode: detectColorMode(), hyperlinks: detectHyperlinkSupport()} }
@@ -194,10 +198,58 @@ func (t theme) fill(sev severity, s string) string {
 	return t.sgr(s, "7", t.fgCode(sevColor(sev)))
 }
 
-// identity colours s by a stable hash of key, so an account keeps its colour
-// across frames, restarts, and screens.
-func (t theme) identity(key, s string) string {
+// identitySlot is the cycle slot a key prefers, from a stable hash of it — so
+// an account keeps its colour across frames, restarts, and screens without
+// anything needing to remember an assignment.
+func identitySlot(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
-	return t.fg(identityCycle[h.Sum32()%uint32(len(identityCycle))], s)
+	return int(h.Sum32() % uint32(len(identityCycle)))
+}
+
+// assignIdentities resolves collisions between the keys that will actually be
+// shown together.
+//
+// The hash alone gives stability but says nothing about distinctness, and with
+// six colours a given pair collides one time in six. That is invisible with one
+// account and fatal with two: both series in the usage chart come out the same
+// colour and the chart stops carrying any information at all.
+//
+// Each key still PREFERS its hashed slot, so colours only move when they
+// genuinely clash, and probing runs in sorted key order so the result depends
+// on the set of keys rather than on the order they arrived in. A key whose slot
+// is taken walks forward to the next free one; once every colour is spent the
+// remainder keep their hashed slot and collide as before, which is the honest
+// degradation for a palette that has run out.
+func assignIdentities(keys []string) map[string]int {
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+
+	taken := make([]bool, len(identityCycle))
+	out := make(map[string]int, len(sorted))
+	for _, k := range sorted {
+		if _, dup := out[k]; dup {
+			continue
+		}
+		start := identitySlot(k)
+		slot := start
+		for i := range identityCycle {
+			if c := (start + i) % len(identityCycle); !taken[c] {
+				slot = c
+				break
+			}
+		}
+		taken[slot] = true
+		out[k] = slot
+	}
+	return out
+}
+
+// identity colours s by key, using the collision-resolved assignment when one
+// has been made and the bare hash otherwise.
+func (t theme) identity(key, s string) string {
+	if slot, ok := t.ident[key]; ok && slot >= 0 && slot < len(identityCycle) {
+		return t.fg(identityCycle[slot], s)
+	}
+	return t.fg(identityCycle[identitySlot(key)], s)
 }

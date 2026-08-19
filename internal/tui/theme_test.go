@@ -108,3 +108,59 @@ func TestIdentityColorIsStablePerKey(t *testing.T) {
 	// the empty key.
 	_ = th.identity("", "x")
 }
+
+// Two accounts whose keys hash to the same slot were rendered in the same
+// colour, which in a two-account install makes the usage chart unreadable:
+// every series looks like one series. Hashing alone gives stability but says
+// nothing about distinctness, and with a six-colour cycle a given pair
+// collides one time in six.
+func TestIdentityGivesCollidingKeysDifferentColours(t *testing.T) {
+	// These two collide under the bare hash — that is why they are the fixture.
+	const a, b = "acct-2", "acct-4"
+	if identitySlot(a) != identitySlot(b) {
+		t.Fatalf("fixture no longer collides (%d vs %d); pick another pair",
+			identitySlot(a), identitySlot(b))
+	}
+
+	th := testTheme(t, "256")
+	th.ident = assignIdentities([]string{a, b})
+	if th.identity(a, "x") == th.identity(b, "x") {
+		t.Error("colliding keys still render identically")
+	}
+}
+
+// An account must not change colour because an unrelated account appeared or
+// went away — the colour is how you track one account across screens.
+func TestIdentityKeepsItsColourWhenOtherKeysChange(t *testing.T) {
+	th := testTheme(t, "256")
+	th.ident = assignIdentities([]string{"acct-2", "acct-4"})
+	before := th.identity("acct-2", "x")
+
+	th.ident = assignIdentities([]string{"acct-2", "acct-4", "acct-9"})
+	if got := th.identity("acct-2", "x"); got != before {
+		t.Errorf("acct-2 changed colour when acct-9 arrived: %q -> %q", before, got)
+	}
+}
+
+// More keys than colours must still render rather than fail, falling back to
+// the hash for whatever cannot be given a slot of its own.
+func TestIdentityDegradesWhenKeysOutnumberColours(t *testing.T) {
+	keys := []string{"k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7"}
+	got := assignIdentities(keys)
+	if len(got) != len(keys) {
+		t.Fatalf("assigned %d slots for %d keys", len(got), len(keys))
+	}
+	for _, k := range keys {
+		if got[k] < 0 || got[k] >= len(identityCycle) {
+			t.Errorf("key %q got slot %d, outside the cycle", k, got[k])
+		}
+	}
+	distinct := map[int]bool{}
+	for _, v := range got {
+		distinct[v] = true
+	}
+	if len(distinct) != len(identityCycle) {
+		t.Errorf("used %d of %d colours; every colour should be spent before any repeats",
+			len(distinct), len(identityCycle))
+	}
+}
