@@ -157,16 +157,20 @@ func (errDetector) Scan(context.Context, string) ([]privacy.Finding, error) {
 }
 
 // proxyHandler is registered as the router's NotFound and MethodNotAllowed
-// handler, so it is the catch-all for everything that is not a control route or
-// a passthrough prefix. Before Redact short-circuited on an empty body, enabling
-// the filter turned every GET into a 500 under the DEFAULT failure mode, and
-// upstream saw nothing at all.
+// handler, so it is the catch-all for everything that is not a control route,
+// a passthrough prefix, or the synthetic /v1/models. Before Redact
+// short-circuited on an empty body, enabling the filter turned every GET into
+// a 500 under the DEFAULT failure mode, and upstream saw nothing at all.
+//
+// The path used here is /v1/messages rather than /v1/models: the latter is
+// answered locally now (see models.go) and never reaches the catch-all this
+// test is about.
 func TestPrivacyDoesNotRefuseBodilessRequests(t *testing.T) {
 	h := newRouterHarness(t, func(o *HandlerOptions) {
 		o.Privacy = testFilter(t, privacy.Closed)
 	}, testutil.Script{Status: 200, Body: `{"data":[]}`})
 
-	res, err := http.Get(h.srv.URL + "/v1/models")
+	res, err := http.Get(h.srv.URL + "/v1/messages")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +178,7 @@ func TestPrivacyDoesNotRefuseBodilessRequests(t *testing.T) {
 	io.Copy(io.Discard, res.Body)
 
 	if res.StatusCode != 200 {
-		t.Errorf("GET /v1/models = %d, want 200", res.StatusCode)
+		t.Errorf("GET /v1/messages = %d, want 200", res.StatusCode)
 	}
 	if n := len(h.up.Requests()); n != 1 {
 		t.Fatalf("upstream received %d requests, want 1", n)
