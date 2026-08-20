@@ -91,24 +91,41 @@ func loginUpstream(t *testing.T, accessToken, refreshToken string) *testutil.Fak
 	return testutil.NewFakeUpstream(t, testutil.Script{Status: 200, Body: body})
 }
 
+// ephemeralBindCallback stands in for the real fixed-port callback listener
+// in every test but one (TestLoginBindsTheRegisteredCallbackPortWithFallback
+// below): an ephemeral port behaves identically for everything else these
+// tests exercise (the loopback listener, the callback handler, teardown),
+// and letting each test grab its own free port is what keeps the suite from
+// colliding with — or breaking — a real login already using 1455/1457
+// elsewhere on the same machine when `go test ./...` runs.
+func ephemeralBindCallback() (net.Listener, int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, 0, err
+	}
+	return ln, ln.Addr().(*net.TCPAddr).Port, nil
+}
+
 // newLoginProvider builds an OpenAI pointed entirely at a fake upstream
 // (never the public internet) with a short login timeout so timeout tests
-// run in milliseconds rather than the real two minutes.
+// run in milliseconds rather than the real two minutes, and an ephemeral
+// callback port so the suite never touches the real, registered 1455/1457.
 func newLoginProvider(t *testing.T, up *testutil.FakeUpstream) *OpenAI {
 	t.Helper()
 	p := New(http.DefaultClient)
 	p.TokenEndpointOverride = up.URL()
 	p.LoginTimeoutOverride = 300 * time.Millisecond
+	p.BindCallbackOverride = ephemeralBindCallback
 	return p
 }
 
 // sessionParams extracts the state and redirect_uri Login embedded in the
 // authorize URL, so a test can act as the browser completing the loopback
 // callback without ever fetching the (fake) authorize URL itself. Reading
-// the port out of the URL, rather than assuming callbackPort, is what keeps
-// these tests from depending on 1455 actually being free: Login itself falls
-// back to callbackFallbackPort when it isn't, and the test simply follows
-// whichever one it used.
+// the port out of the URL, rather than assuming a fixed one, is what lets
+// this work identically whether Login bound the real registered port (and
+// its fallback) or, as every test but one arranges via
+// BindCallbackOverride, an ephemeral one.
 func sessionParams(t *testing.T, rawURL string) (state, redirectURI string) {
 	t.Helper()
 	u, err := url.Parse(rawURL)
@@ -151,11 +168,11 @@ func awaitResult(t *testing.T, done <-chan provider.LoginResult) provider.LoginR
 // since finish() may still be a few scheduler ticks from actually closing
 // the socket by the moment Done fires — finish() shuts the server down
 // SYNCHRONOUSLY before sending on Done specifically so this is deterministic;
-// the retry loop is just slack for CI jitter, not a raced assumption. Proving
-// this matters more here than in anthropic's suite: the port is fixed
-// (1455/1457), so a listener left dangling would make every following test
-// in this file fall back to the alternate port, or fail outright if both are
-// held.
+// the retry loop is just slack for CI jitter, not a raced assumption. This
+// matters most in TestLoginBindsTheRegisteredCallbackPortWithFallback below,
+// the one test that binds the real fixed port(s): a listener left dangling
+// there would make a later run of the same test (or a real login elsewhere
+// on the machine) wrongly fall back, or fail outright if both are held.
 func assertListenerClosed(t *testing.T, redirectURI string) {
 	t.Helper()
 	u, _ := url.Parse(redirectURI)
@@ -582,9 +599,8 @@ func TestLoginAuthorizeURLPinsExactProtocolParameters(t *testing.T) {
 	if ru.Path != "/auth/callback" {
 		t.Errorf("redirect_uri path = %q, want /auth/callback", ru.Path)
 	}
-	port := ru.Port()
-	if port != "1455" && port != "1457" {
-		t.Errorf("redirect_uri port = %q, want 1455 or 1457", port)
+	if ru.Port() == "" {
+		t.Error("redirect_uri missing a port")
 	}
 }
 
@@ -638,4 +654,77 @@ func TestLoginSubmitCodeWithFullPastedURLAndWrongStateIsRejected(t *testing.T) {
 	if !errors.Is(result.Err, ErrStateMismatch) {
 		t.Fatalf("Done Err = %v, want ErrStateMismatch", result.Err)
 	}
+}
+
+// TestLoginBindsTheRegisteredCallbackPortWithFallback is the one test in this
+// file that exercises the real fixed-port path (every other test overrides
+// BindCallbackOverride with an ephemeral port precisely to avoid this). The
+// redirect_uri Codex has registered is a literal ("http://localhost:1455/...")
+// that must match exactly, so Login binding 1455 — and falling back to 1457
+// when 1455 is already held — is load-bearing behaviour, not an
+// implementation detail, and deserves one real end-to-end check.
+//
+// It skips cleanly, rather than failing, if it finds the ports genuinely
+// occupied: a developer with Codex (or another aiproxy) mid-login on the same
+// machine must still be able to run `go test ./...` without a spurious
+// failure — the same hazard this whole round of fixes exists to remove from
+// every other test.
+func TestLoginBindsTheRegisteredCallbackPortWithFallback(t *testing.T) {
+	probe1455, err := net.Listen("tcp", "127.0.0.1:1455")
+	if err != nil {
+		t.Skipf("port 1455 already in use (likely a real login elsewhere on this machine): %v", err)
+	}
+	probe1455.Close()
+	probe1457, err := net.Listen("tcp", "127.0.0.1:1457")
+	if err != nil {
+		t.Skipf("port 1457 already in use: %v", err)
+	}
+	probe1457.Close()
+
+	up := loginUpstream(t, loginAccessToken(t), "rt")
+	p := New(http.DefaultClient) // no BindCallbackOverride: exercises the real fixed-port default
+	p.TokenEndpointOverride = up.URL()
+	p.LoginTimeoutOverride = 5 * time.Second
+
+	// Phase 1: with both ports free, Login must bind the registered port
+	// 1455 exactly — it is not interchangeable with the fallback while it is
+	// available.
+	sess1, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	_, redirectURI1 := sessionParams(t, sess1.URL)
+	ru1, err := url.Parse(redirectURI1)
+	if err != nil {
+		t.Fatalf("parse redirect_uri %q: %v", redirectURI1, err)
+	}
+	if ru1.Port() != "1455" {
+		sess1.Cancel()
+		awaitResult(t, sess1.Done)
+		t.Fatalf("redirect_uri port = %q, want 1455 when both ports are free", ru1.Port())
+	}
+
+	// Phase 2: with 1455 now held by sess1's still-open listener, a second
+	// Login must fall back to 1457 rather than fail.
+	sess2, err := p.Login(context.Background())
+	if err != nil {
+		sess1.Cancel()
+		awaitResult(t, sess1.Done)
+		t.Fatalf("Login (expected fallback to 1457): %v", err)
+	}
+	_, redirectURI2 := sessionParams(t, sess2.URL)
+	ru2, err := url.Parse(redirectURI2)
+	if err != nil {
+		t.Fatalf("parse redirect_uri %q: %v", redirectURI2, err)
+	}
+	if ru2.Port() != "1457" {
+		t.Errorf("redirect_uri port = %q, want 1457 (fallback) while 1455 is held", ru2.Port())
+	}
+
+	sess1.Cancel()
+	awaitResult(t, sess1.Done)
+	sess2.Cancel()
+	awaitResult(t, sess2.Done)
+	assertListenerClosed(t, redirectURI1)
+	assertListenerClosed(t, redirectURI2)
 }

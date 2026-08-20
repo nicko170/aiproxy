@@ -8,6 +8,7 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/url"
 	"time"
@@ -47,6 +48,12 @@ type OpenAI struct {
 	ClientVersion string
 	// LoginTimeoutOverride redirects Login's end-to-end timeout in tests.
 	LoginTimeoutOverride time.Duration
+	// BindCallbackOverride replaces Login's fixed-port callback listener
+	// (1455, falling back to 1457) in tests with an ephemeral one, so the
+	// test suite never binds — and can never collide with — the real,
+	// registered port a live Codex or aiproxy login might be using. Empty
+	// takes the default fixed-port-with-fallback behaviour.
+	BindCallbackOverride func() (net.Listener, int, error)
 	// OnLoginSuccess mirrors anthropic.OnLoginSuccess: called once, before the
 	// LoginResult is sent, so cmd/aiproxy can persist the account.
 	OnLoginSuccess func(provider.Credential, provider.Profile)

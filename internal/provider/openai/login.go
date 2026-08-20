@@ -112,9 +112,13 @@ func (o *OpenAI) authorizeURL(port int, challenge, state string) string {
 	return defaultIssuer + "/oauth/authorize?" + q.Encode()
 }
 
-// bindCallback takes the registered port, falling back to the alternate one
-// when it is already held — typically by Codex running its own login.
-func bindCallback() (net.Listener, int, error) {
+// bindCallbackFixed takes the registered port, falling back to the alternate
+// one when it is already held — typically by Codex running its own login.
+// This is the default; tests replace it via OpenAI.BindCallbackOverride with
+// an ephemeral bind so the suite never touches the real, registered port (see
+// that field's doc comment for why a fixed system-wide port is otherwise a
+// flake-by-construction in a test).
+func bindCallbackFixed() (net.Listener, int, error) {
 	for _, p := range []int{callbackPort, callbackFallbackPort} {
 		ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(p))
 		if err == nil {
@@ -123,6 +127,15 @@ func bindCallback() (net.Listener, int, error) {
 	}
 	return nil, 0, fmt.Errorf("openai: ports %d and %d are both in use",
 		callbackPort, callbackFallbackPort)
+}
+
+// bindCallback resolves to BindCallbackOverride when set (tests), or the
+// real fixed-port-with-fallback behaviour otherwise.
+func (o *OpenAI) bindCallback() (net.Listener, int, error) {
+	if o.BindCallbackOverride != nil {
+		return o.BindCallbackOverride()
+	}
+	return bindCallbackFixed()
 }
 
 // Login implements provider.Provider.Login: PKCE with S256, a loopback
@@ -140,7 +153,7 @@ func (o *OpenAI) Login(ctx context.Context) (provider.LoginSession, error) {
 		return provider.LoginSession{}, err
 	}
 
-	ln, port, err := bindCallback()
+	ln, port, err := o.bindCallback()
 	if err != nil {
 		return provider.LoginSession{}, fmt.Errorf("start login callback listener: %w", err)
 	}
