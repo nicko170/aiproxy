@@ -9,11 +9,20 @@ import (
 // modelsHandler answers GET /v1/models from the union of every enabled
 // account's discovered catalogue, rather than relaying upstream.
 //
-// The emitted object carries BOTH vendors' field names: object/owned_by/created
-// for an OpenAI-shaped parser, type/id/display_name for an Anthropic-shaped
-// one. That is a shape neither vendor documents, and it is chosen so the
-// endpoint does not have to guess which client is calling — a guess that would
-// be wrong for any client we have not seen.
+// The emitted object carries BOTH vendors' field names: object/owned_by for
+// an OpenAI-shaped parser, type/id/display_name for an Anthropic-shaped one.
+// That is a shape neither vendor documents, and it is chosen so the endpoint
+// does not have to guess which client is calling — a guess that would be
+// wrong for any client we have not seen.
+//
+// There is deliberately no "created" field, though OpenAI's own /v1/models
+// carries one. provider.Model has no date to populate it from, and only
+// Anthropic-sourced models could ever have one anyway, since the ChatGPT
+// catalogue endpoint exposes no creation date at all — a field present for
+// half the list helps no parser. Omitting it entirely is also the safer
+// failure: an absent integer a client never asked about is tolerated, where
+// created: 0 would assert the entry was created in 1970, which is wrong
+// rather than merely missing.
 func modelsHandler(o HandlerOptions) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Same gate as the proxy and control-API handlers (handler.go,
