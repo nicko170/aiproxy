@@ -378,6 +378,8 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr, "anthropic")
 	oai.OnLoginSuccess = onLoginSuccess(store, mgr, "openai")
 
+	go repairPlaceholderLabels(store, mgr, providers, log)
+
 	// The quota prober (spec §6.2): interval 0 disables only its background
 	// loop (see prober.New's doc comment), never ProbeNow. Constructed here,
 	// alongside mgr and providers, but started/stopped by run() — its
@@ -502,6 +504,79 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	}), pb, vl, upd, wm, nil
 }
 
+// placeholderLabel is what loginLabel falls back to when a profile carried no
+// identity at all. An account wearing it is not identified, only named.
+const placeholderLabel = "logged-in account"
+
+// repairPlaceholderLabels re-reads identity for accounts that were persisted
+// without one, so a label bug fixed in the provider does not require every
+// affected user to log in again.
+//
+// It exists because exactly that happened: the ChatGPT provider read its email
+// claim from the wrong place in the token, so every account it saved was
+// labelled "logged-in account" — permanently, since a label is written once at
+// login. Repairing here rather than on the prober's cycle keeps this a one-off
+// at startup: Profile is a network call, and re-reading it every five minutes
+// for accounts that already have a name would be pure waste.
+//
+// Best effort by construction. It runs in the background, never blocks startup,
+// and a failure leaves the account exactly as it was.
+func repairPlaceholderLabels(store *config.Store, mgr *account.Manager, providers map[string]provider.Provider, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for _, a := range mgr.All() {
+		if a.Label != placeholderLabel && a.Label != "" {
+			continue
+		}
+		prov, ok := providers[a.Provider]
+		if !ok || prov == nil {
+			continue
+		}
+		if err := mgr.EnsureFresh(ctx, a.ID, false); err != nil {
+			continue
+		}
+		fresh, ok := mgr.Get(a.ID)
+		if !ok {
+			continue
+		}
+		profile, err := prov.Profile(ctx, fresh.Credential)
+		if err != nil {
+			log.Debug("could not re-read identity for an unlabelled account",
+				"account", a.ID, "err", err)
+			continue
+		}
+		label := loginLabel(profile)
+		if label == placeholderLabel {
+			continue // still nothing to go on; leave it rather than churn
+		}
+		identity := config.Identity{
+			AccountUUID: profile.AccountUUID, OrgUUID: profile.OrgUUID,
+			OrgName: profile.OrgName, Plan: profile.Plan,
+		}
+		// Persist first, then apply — the same order onLoginSuccess uses, so a
+		// crash between the two leaves the stored config authoritative rather
+		// than a live label that no restart would reproduce.
+		if _, err := store.Update(func(c *config.Config) error {
+			for i := range c.Accounts {
+				if c.Accounts[i].ID == fresh.ID {
+					c.Accounts[i].Label = label
+					c.Accounts[i].Identity = identity
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Debug("could not persist a repaired label", "account", a.ID, "err", err)
+			continue
+		}
+		if err := mgr.UpdateCredential(fresh.ID, fresh.Credential, identity, label); err != nil {
+			log.Debug("could not apply a repaired label", "account", a.ID, "err", err)
+			continue
+		}
+		log.Info("identified a previously unlabelled account", "label", label)
+	}
+}
+
 // loginLabel matches spec §6.2's persisted account label convention —
 // "person@example.com (Org)" — degrading gracefully when a profile is
 // missing one half, so a successful login always gets a usable label rather
@@ -515,7 +590,7 @@ func loginLabel(p provider.Profile) string {
 	case p.DisplayName != "":
 		return p.DisplayName
 	default:
-		return "logged-in account"
+		return placeholderLabel
 	}
 }
 

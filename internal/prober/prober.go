@@ -380,6 +380,17 @@ func (p *Prober) probeQuota(ctx context.Context, prov provider.Provider, a accou
 		return err
 	}
 	p.recordSuccess(a.ID, now)
+	// A read that succeeds but names no window is worth saying out loud. It is
+	// indistinguishable downstream from never having probed at all —
+	// UpdateQuota stores nothing for an empty slice — so the UI reports "no
+	// quota reading yet" for an account that was in fact read successfully
+	// seconds ago. Upstream genuinely does report no windows sometimes (a plan
+	// whose window has not started), but so does a parser that failed to
+	// recognise a payload, and the two must not look the same in a log.
+	if len(q.Buckets) == 0 {
+		p.log.Info("quota read returned no windows",
+			"account", a.Label, "provider", a.Provider)
+	}
 	p.mgr.UpdateQuota(a.ID, q.Buckets)
 	return nil
 }

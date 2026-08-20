@@ -25,6 +25,11 @@ var ErrQuotaThrottled = fmt.Errorf("%w: usage endpoint throttled", provider.ErrQ
 
 const usageBeta = "oauth-2025-04-20"
 
+// apiVersion is the Anthropic API version this client speaks. Normally a
+// client supplies its own and the proxy forwards it; these are aiproxy's own
+// reads, which have no client behind them.
+const apiVersion = "2023-06-01"
+
 func (a *Anthropic) get(ctx context.Context, path string, c provider.Credential, beta bool) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL()+path, nil)
 	if err != nil {
@@ -32,6 +37,17 @@ func (a *Anthropic) get(ctx context.Context, path string, c provider.Credential,
 	}
 	a.Authorize(req, c)
 	req.Header.Set("Accept", "application/json")
+	// Required by every VERSIONED endpoint, and harmless on the internal ones.
+	//
+	// This helper was written for /api/oauth/usage, which is unversioned and
+	// answers happily without it, so its absence went unnoticed until Models
+	// reused the helper for /v1/models — a public endpoint that refuses with
+	// "anthropic-version: header is required" and therefore returned an empty
+	// catalogue for every Anthropic account. Set unconditionally rather than
+	// per-caller so the next endpoint added here cannot repeat that: verified
+	// against the live usage endpoint, which returns byte-identical payloads
+	// with and without it.
+	req.Header.Set("anthropic-version", apiVersion)
 	if beta {
 		req.Header.Set("anthropic-beta", usageBeta)
 	}

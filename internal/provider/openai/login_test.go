@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -116,6 +117,11 @@ func newLoginProvider(t *testing.T, up *testutil.FakeUpstream) *OpenAI {
 	p.TokenEndpointOverride = up.URL()
 	p.LoginTimeoutOverride = 300 * time.Millisecond
 	p.BindCallbackOverride = ephemeralBindCallback
+	// Profile calls /v1/me at the end of the flow. Left unset it would reach
+	// the real api.openai.com and blow the 300ms login deadline above, so it
+	// is pointed at a server that refuses immediately — which also exercises
+	// the claims fallback on every login test.
+	p.BaseURLOverride = refusingServer(t)
 	return p
 }
 
@@ -765,4 +771,15 @@ func TestLoginBindsTheRegisteredCallbackPortWithFallback(t *testing.T) {
 	awaitResult(t, sess2.Done)
 	assertListenerClosed(t, redirectURI1)
 	assertListenerClosed(t, redirectURI2)
+}
+
+// refusingServer answers everything with 404 straight away, standing in for an
+// unreachable identity endpoint without any waiting.
+func refusingServer(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
 }
