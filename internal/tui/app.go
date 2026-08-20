@@ -94,6 +94,7 @@ type Model struct {
 	usage    usageState
 	accts    acctsState
 	settings settingsState
+	overview overviewState
 	login    loginState
 
 	fetchingStatus   bool
@@ -523,6 +524,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startUpdate()
 	default:
 		switch m.screen {
+		case screenOverview:
+			return m.overviewKey(msg)
 		case screenActivity:
 			return m.activityKey(msg)
 		case screenUsage:
@@ -860,7 +863,7 @@ func (m Model) viewFooter() string {
 	default:
 		switch m.screen {
 		case screenOverview:
-			keys = []string{"l login", "p probe", "o dashboard", "u update"}
+			keys = []string{"f force account", "j/k select", "l login", "p probe", "o dashboard", "u update"}
 		case screenActivity:
 			keys = m.activityFooter()
 		case screenUsage:

@@ -466,3 +466,159 @@ func TestBucketAppliesTo(t *testing.T) {
 		}
 	}
 }
+
+// A pin is a live override: it outranks session affinity and the whole
+// expiring-allowance ranking, because the operator has just said "use this one".
+func TestSelectPrefersThePinnedAccountOverRankingAndAffinity(t *testing.T) {
+	m := mgr(t, acct("ranked", 0), acct("pinned", 9))
+	now := time.Now()
+	// "ranked" would win on every existing rule: better priority, and an
+	// allowance about to expire.
+	m.UpdateQuota("ranked", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.1, ResetsAt: now.Add(10 * time.Minute).UnixMilli()},
+	})
+	m.RecordSession("sess", "ranked")
+
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatalf("Pin: %v", err)
+	}
+	got, err := m.Select(SelectRequest{Model: "claude-sonnet-5", SessionID: "sess"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "pinned" {
+		t.Errorf("selected %q, want the pinned account to win outright", got.ID)
+	}
+}
+
+// The retry loop puts an account it has already failed on into Exclude. A pin
+// that ignored that could never rotate — the request would spin against the
+// same failing account until the budget ran out.
+func TestSelectYieldsAPinnedAccountThatIsAlreadyExcluded(t *testing.T) {
+	m := mgr(t, acct("pinned", 0), acct("other", 1))
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Select(SelectRequest{Exclude: map[string]bool{"pinned": true}})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "other" {
+		t.Errorf("selected %q, want rotation away from an excluded pin", got.ID)
+	}
+	// Already-tried is not exhausted. The pin must survive for the next request.
+	if m.Pinned() != "pinned" {
+		t.Errorf("Pinned() = %q; being excluded for one request must not clear it", m.Pinned())
+	}
+}
+
+// The pin is one-shot: spent means done, and it does not come back when the
+// window resets.
+func TestPinClearsWhenTheAccountRunsOutOfQuota(t *testing.T) {
+	m := mgr(t, acct("pinned", 0), acct("other", 1))
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	m.UpdateQuota("pinned", []provider.QuotaBucket{
+		{Name: "5h", Utilization: 0.99, ResetsAt: time.Now().Add(time.Hour).UnixMilli()},
+	})
+
+	got, err := m.Select(SelectRequest{})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "other" {
+		t.Errorf("selected %q, want a fall back once the pin is spent", got.ID)
+	}
+	if m.Pinned() != "" {
+		t.Errorf("Pinned() = %q, want the one-shot pin cleared", m.Pinned())
+	}
+}
+
+// A model this account cannot serve is not exhaustion. Clearing here would kill
+// the pin the first time an unrelated request named a model it lacks.
+func TestPinSurvivesAModelItCannotServe(t *testing.T) {
+	m := mgr(t, acct("pinned", 0), acct("other", 1))
+	m.UpdateModels("pinned", []provider.Model{{ID: "claude-opus-5"}})
+	m.UpdateModels("other", []provider.Model{{ID: "claude-haiku-4-5"}})
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.Select(SelectRequest{Model: "claude-haiku-4-5"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "other" {
+		t.Errorf("selected %q, want the account that serves the model", got.ID)
+	}
+	if m.Pinned() != "pinned" {
+		t.Errorf("Pinned() = %q; a model mismatch is not exhaustion", m.Pinned())
+	}
+}
+
+// A transient hold is not exhaustion either — it clears on its own.
+func TestPinSurvivesATransientRateLimitHold(t *testing.T) {
+	m := mgr(t, acct("pinned", 0), acct("other", 1))
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	m.MarkRateLimited("pinned", time.Minute)
+
+	if _, err := m.Select(SelectRequest{}); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if m.Pinned() != "pinned" {
+		t.Errorf("Pinned() = %q; a rate-limit hold expires on its own", m.Pinned())
+	}
+}
+
+// A model-scoped exhaustion leaves the account useful for everything else, so
+// it must not end an override the operator set for general traffic.
+func TestPinSurvivesAModelScopedExhaustion(t *testing.T) {
+	m := mgr(t, acct("pinned", 0), acct("other", 1))
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	m.UpdateQuota("pinned", []provider.QuotaBucket{
+		{Name: "7d_opus", Utilization: 1, Status: "rejected", ResetsAt: time.Now().Add(time.Hour).UnixMilli()},
+		{Name: "5h", Utilization: 0.2, ResetsAt: time.Now().Add(time.Hour).UnixMilli()},
+	})
+
+	// Ask for the very model whose scoped window is spent. That makes the
+	// account ineligible for THIS request, which is the only way to reach the
+	// exhaustion check at all — asking for an unrelated model leaves the
+	// account eligible and the check never runs.
+	got, err := m.Select(SelectRequest{Model: "claude-opus-5"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "other" {
+		t.Errorf("selected %q, want a fall back for the spent model", got.ID)
+	}
+	if m.Pinned() != "pinned" {
+		t.Errorf("Pinned() = %q; only an account-wide exhaustion ends the pin", m.Pinned())
+	}
+}
+
+func TestPinRejectsAnUnknownAccount(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+	if err := m.Pin("nope"); err == nil {
+		t.Error("Pin on an unknown id must fail rather than silently pin nothing")
+	}
+	if m.Pinned() != "" {
+		t.Errorf("Pinned() = %q", m.Pinned())
+	}
+}
+
+func TestUnpinRestoresNormalRouting(t *testing.T) {
+	m := mgr(t, acct("ranked", 0), acct("pinned", 9))
+	if err := m.Pin("pinned"); err != nil {
+		t.Fatal(err)
+	}
+	m.Unpin()
+	got, _ := m.Select(SelectRequest{})
+	if got.ID != "ranked" {
+		t.Errorf("selected %q, want normal priority order after Unpin", got.ID)
+	}
+}

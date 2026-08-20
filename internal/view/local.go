@@ -141,15 +141,16 @@ func (l *Local) ServerStatus(ctx context.Context) (Status, error) {
 	}
 
 	return Status{
-		ListenAddr:     l.listenAddr,
-		UptimeSeconds:  int64(now.Sub(l.started).Seconds()),
-		InFlight:       inFlight,
-		TTFBP95MS:      lat.TTFBP95,
-		MetricsDropped: l.dropped(),
-		EventsDropped:  l.hub.droppedCount(),
-		Probe:          l.probeStatus(),
-		Update:         l.updateStatus(),
-		Privacy:        l.privacyStatus(),
+		ListenAddr:      l.listenAddr,
+		UptimeSeconds:   int64(now.Sub(l.started).Seconds()),
+		InFlight:        inFlight,
+		TTFBP95MS:       lat.TTFBP95,
+		MetricsDropped:  l.dropped(),
+		EventsDropped:   l.hub.droppedCount(),
+		Probe:           l.probeStatus(),
+		PinnedAccountID: l.mgr.Pinned(),
+		Update:          l.updateStatus(),
+		Privacy:         l.privacyStatus(),
 	}, nil
 }
 
@@ -721,4 +722,21 @@ func (l *Local) ProbeNow(ctx context.Context) error {
 		return fmt.Errorf("quota prober not configured")
 	}
 	return l.probe.ProbeNow(ctx)
+}
+
+// PinAccount forces routing onto one account until it runs out of quota, or
+// clears the override when accountID is empty.
+//
+// Unlike every other account mutation here it does NOT touch the config store,
+// because the pin is deliberately not persisted: it is a live intervention, and
+// one that survived a restart would keep applying long after the operator had
+// forgotten setting it. That also means no lock is needed against the
+// persist-then-apply races the other mutations guard — Manager owns the whole
+// of this state.
+func (l *Local) PinAccount(_ context.Context, accountID string) error {
+	if accountID == "" {
+		l.mgr.Unpin()
+		return nil
+	}
+	return l.mgr.Pin(accountID)
 }

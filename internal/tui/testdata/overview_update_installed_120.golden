@@ -1,13 +1,13 @@
 ! aiproxy  ·  on 127.0.0.1:8118  ·  up 4h12m  ·  2 in flight  ·  p95 1.24s  ·  ^ 0.2.0 installed - restart              
   1 overview   2 activity   3 usage   4 accounts   5 settings                                                           
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-nick@example.com (Personal)   p1 · anthropic                                                         ready · 2 in flight
+▸ nick@example.com (Personal)   p1 · anthropic                                                       ready · 2 in flight
   5h        ░63%░·░resets░16:39░in░2h09m░░░░░░░░░░░░           |            
   7d        ░18%░·░resets 16:30 in 3d2h                        |            
   7d fable  ░9%░░░                                             |            
             ·▅▁▆▂▆▂▇▃█▄█▄·▅▁▆▂▆▂▇▃█▄█▄·▅▁▆▂▆▂▇▃█▄█▄·▅▁▆▂▆▂▇▃█▄█▄·▅▁▆▂▆▂▇  352 req · last hour
 
-ops@example.com (Ops)   p2 · anthropic                                                         rate-limited · back in 4m
+  ops@example.com (Ops)   p2 · anthropic                                                       rate-limited · back in 4m
   5h        ░91%░·░resets░14:41░in░11m░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░      
   7d        ░44%░·░resets░16:30░in░1d2h░                       |            
             ········································▁▂▂▃▄▄▅▆▆▇██········  78 req · last hour
@@ -25,4 +25,4 @@ ops@example.com (Ops)   p2 · anthropic                                         
 
 
 
-  l login  ·  p probe  ·  o dashboard  ·  u update  ·  ? help  ·  q quit                                                
+  f force account  ·  j/k select  ·  l login  ·  p probe  ·  o dashboard  ·  u update  ·  ? help  ·  q quit             

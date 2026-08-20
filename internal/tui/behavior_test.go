@@ -735,3 +735,64 @@ func TestHeaderUnresolvedOutranksStickyFilterFaults(t *testing.T) {
 		t.Errorf("header = %q, want exactly one privacy segment, the most urgent", got)
 	}
 }
+
+// pinRecordingSource answers only PinAccount; see loginRecordingSource for why
+// an embedded nil interface is safe here.
+type pinRecordingSource struct {
+	view.Source
+	gotID  string
+	called bool
+}
+
+func (s *pinRecordingSource) PinAccount(_ context.Context, id string) error {
+	s.gotID = id
+	s.called = true
+	return nil
+}
+
+// f on the overview forces all traffic through the highlighted account. The
+// cursor is what decides which one, so this also pins that j moves it.
+func TestOverviewForceKeyPinsTheHighlightedAccount(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &pinRecordingSource{}
+	m.src = rec
+	if len(m.accounts) < 2 {
+		t.Fatalf("fixture has %d accounts, need at least 2 to prove the cursor matters", len(m.accounts))
+	}
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("j")})
+	m = next.(Model)
+	if m.overview.sel != 1 {
+		t.Fatalf("sel = %d, want the cursor moved to the second account", m.overview.sel)
+	}
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if cmd == nil {
+		t.Fatal("f produced no command")
+	}
+	cmd()
+	if !rec.called {
+		t.Fatal("PinAccount was never called")
+	}
+	if rec.gotID != m.accounts[1].ID {
+		t.Errorf("pinned %q, want the account under the cursor (%q)", rec.gotID, m.accounts[1].ID)
+	}
+}
+
+// f on the account already forced releases it. Without this the only way out
+// of an override would be a key nobody was told about.
+func TestOverviewForceKeyOnThePinnedAccountReleasesIt(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &pinRecordingSource{}
+	m.src = rec
+	m.status.PinnedAccountID = m.accounts[0].ID
+
+	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("f")})
+	if cmd == nil {
+		t.Fatal("f produced no command")
+	}
+	cmd()
+	if rec.gotID != "" {
+		t.Errorf("PinAccount(%q); pressing f on the forced account must clear it, which is the empty id", rec.gotID)
+	}
+}

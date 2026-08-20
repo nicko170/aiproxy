@@ -26,6 +26,11 @@ type Status struct {
 	// Probe reports the background quota prober's health (spec §6.2): a
 	// throttled probe must be visible in the UI, not silently stale.
 	Probe ProbeStatus `json:"probe"`
+	// PinnedAccountID is the account a forced override is routing everything
+	// to, or "" for normal routing. Surfaced because an override you cannot
+	// see is one you will forget is on — and it silently outranks every
+	// routing rule while it lasts.
+	PinnedAccountID string `json:"pinnedAccountId,omitempty"`
 	// Update reports whether a newer release exists, read from the background
 	// checker's cache. It is never a live network call: this rides on Status
 	// for the same reason Probe does — the TUI's existing status poll renders

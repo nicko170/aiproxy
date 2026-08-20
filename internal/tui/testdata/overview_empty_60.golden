@@ -25,4 +25,4 @@ x aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight
                                                             
                                                             
 
-  l login  ·  p probe  ·  o dashboard  ·  ? help  ·  q quit 
+  f force account  ·  j/k select  ·  ? help  ·  q quit      

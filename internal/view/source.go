@@ -51,6 +51,10 @@ type Source interface {
 	Subscribe(ctx context.Context) (<-chan Event, error)
 
 	SetAccountEnabled(ctx context.Context, accountID string, enabled bool) error
+	// PinAccount forces every request onto one account, ahead of session
+	// affinity and the ranking, until that account runs out of quota. Passing
+	// an empty id clears the override and restores normal routing.
+	PinAccount(ctx context.Context, accountID string) error
 	SetPriority(ctx context.Context, accountID string, priority int) error
 	RemoveAccount(ctx context.Context, accountID string) error
 

@@ -56,6 +56,11 @@ type Manager struct {
 	refreshing map[string]*refreshCall
 	// affinity maps a client session id to the account that served it.
 	affinity map[string]string
+	// pinned is an operator override: while set, this account serves every
+	// request it can, ahead of affinity and ranking alike. Deliberately NOT
+	// persisted — a forced override is a live intervention, and one set days
+	// ago silently applying after a restart is a surprise, not a setting.
+	pinned string
 }
 
 func New(accts []config.Account, providers map[string]provider.Provider, opts Options) *Manager {

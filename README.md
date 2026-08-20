@@ -480,6 +480,33 @@ observed buckets scores zero, which is why the probe renews credentials and runs
 once at startup — see `quotaProbe.intervalSeconds` under
 [Configuration](#configuration).
 
+## Forcing one account
+
+Press `f` on the overview to send every request through the highlighted account,
+`j`/`k` or the arrow keys to move the cursor, and `f` again on the forced account
+to release it. The forced account is marked `⇥ forced` in the list, because an
+override you cannot see is one you will forget is on.
+
+The override beats session affinity and the
+[expiring-allowance ranking](#which-account-gets-picked) alike — those rules
+exist to make a good automatic choice, and this is you making it instead.
+
+It does **not** beat eligibility. A forced account still cannot serve a model it
+does not have, or answer while it is rate-limited; those requests fall back to
+normal routing for as long as the condition lasts, and the override stays set.
+Pretending otherwise would turn an override into an outage.
+
+The override is **one-shot**: once the account is genuinely spent — a rejected
+window, or utilization at `routing.switchThreshold` — routing returns to normal
+and the pin clears. It does not come back when the window resets; press `f`
+again if you want it back. Only account-wide quota ends it, so a spent
+model-scoped window (Opus, say) leaves an override set for general traffic
+alone.
+
+It is **not persisted**. A forced override is a live intervention, and one set
+days ago silently applying after a restart is a surprise rather than a setting —
+so restarting is also the way out if you forget it is on.
+
 ## Overloaded upstreams
 
 Anthropic answers `529` with `overloaded_error` when the API itself is out of
