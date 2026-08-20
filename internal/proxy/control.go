@@ -390,7 +390,7 @@ func loginPollHandler(o HandlerOptions, reg *loginSessionRegistry) http.HandlerF
 }
 
 // importBody is the request for POST .../accounts/import: which credential
-// file layout to read (spec §6.3): "legacy" or "claude-code".
+// file layout to read (spec §6.3). "claude-code" is the only source.
 type importBody struct {
 	Source string `json:"source"`
 }

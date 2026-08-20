@@ -93,10 +93,6 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 	store := config.NewStore(configPath)
 
-	if err := firstRunImport(store, log); err != nil {
-		log.Warn("account import skipped", "err", err)
-	}
-
 	cfg, err := store.Load()
 	if err != nil {
 		return err
@@ -519,41 +515,6 @@ func endpointOf(path string) string {
 		return path[:i]
 	}
 	return path
-}
-
-// firstRunImport adopts existing credentials so a first run does not require
-// re-authorizing every account. It is a first-run action only: with accounts
-// already configured it does nothing, so restarts cannot duplicate them.
-func firstRunImport(store *config.Store, log *slog.Logger) error {
-	cfg, err := store.Load()
-	if err != nil {
-		return err
-	}
-	if len(cfg.Accounts) > 0 {
-		return nil
-	}
-	legacy := config.LegacyPath()
-	if legacy == "" {
-		return nil
-	}
-	imported, err := config.ImportFile(legacy, config.ImportSourceLegacy)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if len(imported) == 0 {
-		return nil
-	}
-	if _, err := store.Update(func(c *config.Config) error {
-		c.Accounts = append(c.Accounts, imported...)
-		return nil
-	}); err != nil {
-		return err
-	}
-	log.Info("imported existing accounts", "count", len(imported), "from", legacy)
-	return nil
 }
 
 // listen binds the client-facing socket, setting NoDelay on each accepted

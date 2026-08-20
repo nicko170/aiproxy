@@ -257,52 +257,6 @@ func TestBuildHandlerPersistsRefreshedCredentials(t *testing.T) {
 	}
 }
 
-func TestFirstRunImportAdoptsLegacyAccounts(t *testing.T) {
-	dir := t.TempDir()
-	legacy := filepath.Join(dir, "teamclaude.json")
-	os.WriteFile(legacy, []byte(`{"accounts":[{"name":"carried","type":"apikey","apiKey":"sk-x"}]}`), 0o600)
-	t.Setenv("XDG_CONFIG_HOME", dir)
-
-	store := config.NewStore(filepath.Join(dir, "aiproxy", "config.json"))
-	if err := firstRunImport(store, quiet()); err != nil {
-		t.Fatalf("firstRunImport: %v", err)
-	}
-
-	cfg, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cfg.Accounts) != 1 || cfg.Accounts[0].Label != "carried" {
-		t.Fatalf("accounts = %+v", cfg.Accounts)
-	}
-	if cfg.Accounts[0].ID == "" {
-		t.Error("imported account needs an id")
-	}
-}
-
-// Import must be a first-run action only, never something that duplicates
-// accounts on every start.
-func TestFirstRunImportSkipsWhenAccountsExist(t *testing.T) {
-	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "teamclaude.json"),
-		[]byte(`{"accounts":[{"name":"legacy","type":"apikey","apiKey":"sk-x"}]}`), 0o600)
-	t.Setenv("XDG_CONFIG_HOME", dir)
-
-	store := config.NewStore(filepath.Join(dir, "aiproxy", "config.json"))
-	store.Update(func(c *config.Config) error {
-		c.Accounts = []config.Account{{ID: "existing", Provider: "anthropic", Label: "mine"}}
-		return nil
-	})
-
-	if err := firstRunImport(store, quiet()); err != nil {
-		t.Fatalf("firstRunImport: %v", err)
-	}
-	cfg, _ := store.Load()
-	if len(cfg.Accounts) != 1 || cfg.Accounts[0].Label != "mine" {
-		t.Errorf("accounts = %+v, want the existing one untouched", cfg.Accounts)
-	}
-}
-
 // The status endpoint reports the running version through the seam, so the
 // TUI and a future dashboard both learn it from one place rather than each
 // being handed a version string separately.

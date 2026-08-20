@@ -462,7 +462,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.screen == screenSettings && m.settings.editing {
 		return m.settingsKey(msg)
 	}
-	if m.screen == screenAccounts && (m.accts.confirming || m.accts.importing) {
+	if m.screen == screenAccounts && m.accts.confirming {
 		return m.accountsKey(msg)
 	}
 

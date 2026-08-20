@@ -930,13 +930,11 @@ func writeFileT(t *testing.T, path, body string) {
 func TestImportCredentialsAddsAccountsToManagerWithoutRestart(t *testing.T) {
 	h := newHarness(t)
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	writeFileT(t, config.LegacyPath(), `{"accounts":[
-		{"name":"a@example.com (Acme)","type":"oauth","accessToken":"at-1","refreshToken":"rt-1",
-		 "accountUuid":"uuid-1"}
-	]}`)
+	t.Setenv("HOME", dir)
+	writeFileT(t, config.ClaudeCodePath(),
+		`{"claudeAiOauth":{"accessToken":"at-1","refreshToken":"rt-1","subscriptionType":"max"}}`)
 
-	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceClaudeCode)
 	if err != nil {
 		t.Fatalf("ImportCredentials: %v", err)
 	}
@@ -945,7 +943,7 @@ func TestImportCredentialsAddsAccountsToManagerWithoutRestart(t *testing.T) {
 	}
 
 	all := h.mgr.All()
-	if len(all) != 1 || all[0].Label != "a@example.com (Acme)" {
+	if len(all) != 1 || all[0].Credential.AccessToken != "at-1" {
 		t.Errorf("manager accounts = %+v, want the imported account live", all)
 	}
 	cfg, err := h.cs.Load()
@@ -954,32 +952,6 @@ func TestImportCredentialsAddsAccountsToManagerWithoutRestart(t *testing.T) {
 	}
 	if len(cfg.Accounts) != 1 {
 		t.Errorf("persisted accounts = %+v, want 1", cfg.Accounts)
-	}
-}
-
-// Importing the same source twice must not duplicate accounts: dedupe on
-// the credential's account uuid.
-func TestImportCredentialsTwiceDedupesOnAccountUUID(t *testing.T) {
-	h := newHarness(t)
-	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	writeFileT(t, config.LegacyPath(), `{"accounts":[
-		{"name":"a@example.com","type":"oauth","accessToken":"at-1","refreshToken":"rt-1",
-		 "accountUuid":"uuid-1"}
-	]}`)
-
-	if _, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy); err != nil {
-		t.Fatalf("first ImportCredentials: %v", err)
-	}
-	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
-	if err != nil {
-		t.Fatalf("second ImportCredentials: %v", err)
-	}
-	if added != 0 {
-		t.Errorf("second import added = %d, want 0 (already present)", added)
-	}
-	if len(h.mgr.All()) != 1 {
-		t.Errorf("manager accounts = %+v, want exactly 1 (no duplicate)", h.mgr.All())
 	}
 }
 
@@ -1013,9 +985,9 @@ func TestImportCredentialsTwiceDedupesOnLabelWhenNoUUID(t *testing.T) {
 func TestImportCredentialsMissingFileReturnsErrorAndAddsNothing(t *testing.T) {
 	h := newHarness(t)
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir) // no teamclaude.json written here
+	t.Setenv("HOME", dir) // no credential file written here
 
-	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceLegacy)
+	added, err := h.local.ImportCredentials(context.Background(), config.ImportSourceClaudeCode)
 	if err == nil {
 		t.Error("want an error when the source file does not exist")
 	}

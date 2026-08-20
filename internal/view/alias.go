@@ -27,6 +27,5 @@ type (
 
 // Import sources a front-end may pass to ImportCredentials.
 const (
-	ImportSourceLegacy     = config.ImportSourceLegacy
 	ImportSourceClaudeCode = config.ImportSourceClaudeCode
 )

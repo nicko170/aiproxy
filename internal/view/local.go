@@ -641,8 +641,6 @@ func (l *Local) ImportCredentials(ctx context.Context, source config.ImportSourc
 
 	var path string
 	switch source {
-	case config.ImportSourceLegacy:
-		path = config.LegacyPath()
 	case config.ImportSourceClaudeCode:
 		path = config.ClaudeCodePath()
 	default:

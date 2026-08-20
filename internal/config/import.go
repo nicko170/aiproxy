@@ -15,23 +15,9 @@ import (
 type ImportSource string
 
 const (
-	// ImportSourceLegacy reads a prior tool's config: {"accounts":[...]}.
-	ImportSourceLegacy ImportSource = "legacy"
 	// ImportSourceClaudeCode reads Claude Code's own credential file.
 	ImportSourceClaudeCode ImportSource = "claude-code"
 )
-
-// LegacyPath is the config we can adopt accounts from on a first run.
-func LegacyPath() string {
-	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
-		return filepath.Join(x, "teamclaude.json")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".config", "teamclaude.json")
-}
 
 // ClaudeCodePath is Claude Code's credential file.
 func ClaudeCodePath() string {
@@ -68,26 +54,6 @@ func normalizeExpiresAt(v int64) int64 {
 	return v
 }
 
-type legacyFile struct {
-	Accounts []legacyAccount `json:"accounts"`
-}
-
-type legacyAccount struct {
-	Name         string            `json:"name"`
-	Type         string            `json:"type"`
-	AccessToken  string            `json:"accessToken"`
-	RefreshToken string            `json:"refreshToken"`
-	ExpiresAt    int64             `json:"expiresAt"`
-	APIKey       string            `json:"apiKey"`
-	Priority     int               `json:"priority"`
-	Disabled     bool              `json:"disabled"`
-	AccountUUID  string            `json:"accountUuid"`
-	OrgUUID      string            `json:"orgUuid"`
-	OrgName      string            `json:"orgName"`
-	Upstream     string            `json:"upstream"`
-	ModelMap     map[string]string `json:"modelMap"`
-}
-
 type claudeCodeFile struct {
 	ClaudeAiOauth *struct {
 		AccessToken      string `json:"accessToken"`
@@ -107,21 +73,6 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 	}
 
 	switch src {
-	case ImportSourceLegacy:
-		var f legacyFile
-		if err := json.Unmarshal(raw, &f); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", path, err)
-		}
-		out := make([]Account, 0, len(f.Accounts))
-		for _, la := range f.Accounts {
-			a, ok := fromLegacy(la)
-			if !ok {
-				continue
-			}
-			out = append(out, a)
-		}
-		return out, nil
-
 	case ImportSourceClaudeCode:
 		var f claudeCodeFile
 		if err := json.Unmarshal(raw, &f); err != nil {
@@ -144,40 +95,4 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 		}}, nil
 	}
 	return nil, fmt.Errorf("unknown import source %q", src)
-}
-
-func fromLegacy(la legacyAccount) (Account, bool) {
-	var cred provider.Credential
-	switch la.Type {
-	case "apikey":
-		if la.APIKey == "" {
-			return Account{}, false
-		}
-		cred = provider.Credential{Type: provider.CredentialAPIKey, APIKey: la.APIKey}
-	default: // oauth
-		if la.AccessToken == "" && la.RefreshToken == "" {
-			return Account{}, false
-		}
-		cred = provider.Credential{
-			Type:         provider.CredentialOAuth,
-			AccessToken:  la.AccessToken,
-			RefreshToken: la.RefreshToken,
-			ExpiresAt:    normalizeExpiresAt(la.ExpiresAt),
-		}
-	}
-	return Account{
-		ID:         NewID(),
-		Provider:   "anthropic",
-		Label:      la.Name,
-		Priority:   la.Priority,
-		Disabled:   la.Disabled,
-		Credential: cred,
-		Identity: Identity{
-			AccountUUID: la.AccountUUID,
-			OrgUUID:     la.OrgUUID,
-			OrgName:     la.OrgName,
-		},
-		Upstream: la.Upstream,
-		ModelMap: la.ModelMap,
-	}, true
 }

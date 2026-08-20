@@ -320,11 +320,9 @@ triggering auto-compaction at about 180K. aiproxy relays the Anthropic API and
 preserves the model and beta headers, so the first-party hint is the accurate
 setting here.
 
-On a first run with no accounts configured, aiproxy adopts credentials it can
-already find (`~/.config/teamclaude.json`) so you don't have to re-authorize
-everything. You can also import on demand from the Accounts screen with `i`:
-`c` reads Claude Code's own credential file (`~/.claude/.credentials.json`),
-`g` reads a legacy config.
+You can import an existing credential on demand from the Accounts screen with
+`i`, which reads Claude Code's own file (`~/.claude/.credentials.json`) so you
+don't have to re-authorize an account you have already logged into there.
 
 ## The TUI
 
