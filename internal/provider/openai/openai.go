@@ -7,6 +7,7 @@ package openai
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -54,9 +55,19 @@ type OpenAI struct {
 	// registered port a live Codex or aiproxy login might be using. Empty
 	// takes the default fixed-port-with-fallback behaviour.
 	BindCallbackOverride func() (net.Listener, int, error)
-	// OnLoginSuccess mirrors anthropic.OnLoginSuccess: called once, before the
-	// LoginResult is sent, so cmd/aiproxy can persist the account.
-	OnLoginSuccess func(provider.Credential, provider.Profile)
+	// OnLoginSuccess mirrors anthropic.Anthropic.OnLoginSuccess: called once,
+	// synchronously, when Login's code exchange and Profile lookup both
+	// succeed, and before the resulting LoginResult is ever sent on Done.
+	// cmd/aiproxy sets this to persist the account through config.Store and
+	// add it to the live account.Manager. A nil hook (only in tests that do
+	// not need persistence) means Login completes without persisting
+	// anything.
+	//
+	// Returning an error here becomes LoginResult.Err, e.g. a config-store
+	// write failure; the exchanged credential still cannot leak through that
+	// error, since only the error's text (never the Credential value) is
+	// used.
+	OnLoginSuccess func(ctx context.Context, cred provider.Credential, profile provider.Profile) error
 }
 
 func New(hc *http.Client) *OpenAI {

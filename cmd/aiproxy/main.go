@@ -24,6 +24,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/prober"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
+	"github.com/nicko170/aiproxy/internal/provider/openai"
 	"github.com/nicko170/aiproxy/internal/proxy"
 	"github.com/nicko170/aiproxy/internal/tui"
 	"github.com/nicko170/aiproxy/internal/updater"
@@ -333,8 +334,11 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		Timeout:   60 * time.Second, // control-plane calls only, never the proxy path
 	}
 	anthropicProvider := anthropic.New(upstreamClient)
+	oai := openai.New(&http.Client{Timeout: 30 * time.Second})
+	oai.ClientVersion = cfg.Providers.OpenAI.ClientVersion
 	providers := map[string]provider.Provider{
 		"anthropic": anthropicProvider,
+		"openai":    oai,
 	}
 
 	mgr := account.New(cfg.Accounts, providers, account.Options{
@@ -371,7 +375,8 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// so a successful login persists and goes live without a restart (spec
 	// §6.1). See accounts.go's onLoginSuccess for the full "persist, then
 	// apply" + re-login-dedupe story.
-	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr)
+	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr, "anthropic")
+	oai.OnLoginSuccess = onLoginSuccess(store, mgr, "openai")
 
 	// The quota prober (spec §6.2): interval 0 disables only its background
 	// loop (see prober.New's doc comment), never ProbeNow. Constructed here,

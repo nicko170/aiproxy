@@ -16,6 +16,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/config"
 	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/provider/anthropic"
+	"github.com/nicko170/aiproxy/internal/provider/openai"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -270,6 +271,33 @@ func TestSkipsNonOAuthAccounts(t *testing.T) {
 	}
 	if n := len(u.seen()); n != 0 {
 		t.Errorf("made %d requests, want 0 for an api-key account", n)
+	}
+}
+
+// Whether OpenAI's rate-limit window is first-use-anchored (like Anthropic's)
+// is unverified, so a ChatGPT account must never be warmed regardless of how
+// far past threshold the busy account is: the cost of guessing wrong is a
+// billable request every cycle that buys nothing.
+func TestNeverWarmsAnOpenAIAccount(t *testing.T) {
+	u := newUpstream(t)
+	providers := map[string]provider.Provider{
+		"anthropic": anthropic.New(http.DefaultClient),
+		"openai":    openai.New(http.DefaultClient),
+	}
+	standby := acct("standby", 1, u.srv.URL)
+	standby.Provider = "openai"
+	mgr := account.New([]config.Account{acct("busy", 0, u.srv.URL), standby}, providers, account.Options{
+		SwitchThreshold: 0.98,
+		Persist:         func(string, provider.Credential) error { return nil },
+	})
+	w := New(mgr, providers, http.DefaultTransport, Options{Enabled: true, Threshold: 0.5, Log: quiet()})
+	hot(mgr, "busy", 0.9)
+
+	if err := w.WarmNow(context.Background()); err != nil {
+		t.Fatalf("WarmNow: %v", err)
+	}
+	if n := len(u.seen()); n != 0 {
+		t.Errorf("made %d requests, want 0: an openai account must never be warmed", n)
 	}
 }
 

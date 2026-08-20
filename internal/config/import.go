@@ -17,6 +17,8 @@ type ImportSource string
 const (
 	// ImportSourceClaudeCode reads Claude Code's own credential file.
 	ImportSourceClaudeCode ImportSource = "claude-code"
+	// ImportSourceCodex reads the Codex CLI's own credential file.
+	ImportSourceCodex ImportSource = "codex"
 )
 
 // ClaudeCodePath is Claude Code's credential file.
@@ -26,6 +28,15 @@ func ClaudeCodePath() string {
 		return ""
 	}
 	return filepath.Join(home, ".claude", ".credentials.json")
+}
+
+// CodexPath is the Codex CLI's credential file.
+func CodexPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".codex", "auth.json")
 }
 
 // NewID returns a stable opaque account handle.
@@ -63,6 +74,19 @@ type claudeCodeFile struct {
 	} `json:"claudeAiOauth"`
 }
 
+// codexFile is the Codex CLI's own auth.json layout. Only the chatgpt auth
+// mode carries OAuth tokens; an apikey-mode file has Tokens nil and nothing
+// to adopt.
+type codexFile struct {
+	AuthMode string `json:"auth_mode"`
+	Tokens   *struct {
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		AccountID    string `json:"account_id"`
+	} `json:"tokens"`
+}
+
 // ImportFile reads accounts from an external credential file. Accounts with no
 // usable credential are skipped rather than imported broken. The source file is
 // never modified.
@@ -92,6 +116,31 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 				ExpiresAt:    normalizeExpiresAt(f.ClaudeAiOauth.ExpiresAt),
 			},
 			Identity: Identity{Plan: f.ClaudeAiOauth.SubscriptionType},
+		}}, nil
+
+	case ImportSourceCodex:
+		var f codexFile
+		if err := json.Unmarshal(raw, &f); err != nil {
+			return nil, fmt.Errorf("parse %s: %w", path, err)
+		}
+		if f.Tokens == nil || f.Tokens.AccessToken == "" {
+			return nil, nil
+		}
+		return []Account{{
+			ID:       NewID(),
+			Provider: "openai",
+			Label:    "imported (codex)",
+			Credential: provider.Credential{
+				Type:         provider.CredentialOAuth,
+				AccessToken:  f.Tokens.AccessToken,
+				RefreshToken: f.Tokens.RefreshToken,
+				AccountID:    f.Tokens.AccountID,
+			},
+			// AccountID is the identity the dedupe path keys on (see
+			// importDedupeKey in internal/view): without it here, re-running
+			// the import would append a second account every time rather than
+			// recognising the one already present.
+			Identity: Identity{AccountUUID: f.Tokens.AccountID},
 		}}, nil
 	}
 	return nil, fmt.Errorf("unknown import source %q", src)

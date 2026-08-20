@@ -220,9 +220,10 @@ func TestLoginCallbackWithCorrectStateSucceedsAndPersists(t *testing.T) {
 	var gotCred provider.Credential
 	var gotProfile provider.Profile
 	hookCalled := make(chan struct{})
-	p.OnLoginSuccess = func(cred provider.Credential, profile provider.Profile) {
+	p.OnLoginSuccess = func(ctx context.Context, cred provider.Credential, profile provider.Profile) error {
 		gotCred, gotProfile = cred, profile
 		close(hookCalled)
+		return nil
 	}
 
 	sess, err := p.Login(context.Background())
@@ -251,6 +252,42 @@ func TestLoginCallbackWithCorrectStateSucceedsAndPersists(t *testing.T) {
 	}
 	if gotProfile.Email != "someone@example.com" {
 		t.Errorf("OnLoginSuccess profile = %+v", gotProfile)
+	}
+
+	assertListenerClosed(t, redirectURI)
+}
+
+// A persistence failure inside OnLoginSuccess (e.g. the config store's write
+// failed) must surface as a failed LoginResult, not a successful one: a
+// caller told SUCCESS whose credential never actually made it to disk would
+// vanish on restart with no indication anything went wrong.
+func TestLoginOnLoginSuccessErrorFailsTheLogin(t *testing.T) {
+	up := loginUpstream(t, loginAccessToken(t), "rt")
+	p := newLoginProvider(t, up)
+
+	persistErr := errors.New("write config: disk full")
+	p.OnLoginSuccess = func(context.Context, provider.Credential, provider.Profile) error {
+		return persistErr
+	}
+
+	sess, err := p.Login(context.Background())
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	state, redirectURI := sessionParams(t, sess.URL)
+
+	res, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	res.Body.Close()
+
+	result := awaitResult(t, sess.Done)
+	if result.Err == nil {
+		t.Fatal("LoginResult.Err = nil, want the persistence failure to fail the login")
+	}
+	if !errors.Is(result.Err, persistErr) {
+		t.Errorf("LoginResult.Err = %v, want it to wrap %v", result.Err, persistErr)
 	}
 
 	assertListenerClosed(t, redirectURI)
@@ -508,8 +545,9 @@ func TestLoginCancelMidExchangeNeverPersistsTheAccount(t *testing.T) {
 	p.LoginTimeoutOverride = 5 * time.Second
 
 	var hookCalled atomic.Bool
-	p.OnLoginSuccess = func(provider.Credential, provider.Profile) {
+	p.OnLoginSuccess = func(context.Context, provider.Credential, provider.Profile) error {
 		hookCalled.Store(true)
+		return nil
 	}
 
 	sess, err := p.Login(context.Background())

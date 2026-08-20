@@ -76,6 +76,42 @@ func TestImportMissingFileReportsNotExist(t *testing.T) {
 	}
 }
 
+func TestImportCodexCredentials(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "auth.json", `{
+	  "auth_mode":"chatgpt",
+	  "tokens":{"id_token":"idt","access_token":"at","refresh_token":"rt","account_id":"acc-1"},
+	  "last_refresh":"2026-08-12T04:36:46Z"}`)
+
+	got, err := ImportFile(p, ImportSourceCodex)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %+v, want 1 account", got)
+	}
+	if got[0].Provider != "openai" {
+		t.Errorf("provider = %q, want openai", got[0].Provider)
+	}
+	if got[0].Credential.AccessToken != "at" || got[0].Credential.RefreshToken != "rt" {
+		t.Errorf("credential not carried across: %+v", got[0].Credential)
+	}
+	if got[0].Credential.AccountID != "acc-1" {
+		t.Errorf("AccountID = %q; the chatgpt-account-id header needs it", got[0].Credential.AccountID)
+	}
+}
+
+// An api-key-mode auth.json has no OAuth tokens to adopt.
+func TestImportCodexSkipsApiKeyMode(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "auth.json", `{"auth_mode":"apikey","OPENAI_API_KEY":"sk-x","tokens":null}`)
+	got, err := ImportFile(p, ImportSourceCodex)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want nothing", got)
+	}
+}
+
 func TestNewIDIsUnique(t *testing.T) {
 	seen := map[string]bool{}
 	for i := 0; i < 100; i++ {

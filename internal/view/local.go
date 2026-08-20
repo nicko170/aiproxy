@@ -643,6 +643,8 @@ func (l *Local) ImportCredentials(ctx context.Context, source config.ImportSourc
 	switch source {
 	case config.ImportSourceClaudeCode:
 		path = config.ClaudeCodePath()
+	case config.ImportSourceCodex:
+		path = config.CodexPath()
 	default:
 		return 0, fmt.Errorf("unknown import source %q", source)
 	}

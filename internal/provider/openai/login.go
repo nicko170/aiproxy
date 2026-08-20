@@ -387,7 +387,10 @@ func (f *loginFlow) complete(code string) {
 			return
 		}
 		if f.o.OnLoginSuccess != nil {
-			f.o.OnLoginSuccess(cred, profile)
+			if err := f.o.OnLoginSuccess(context.Background(), cred, profile); err != nil {
+				f.finish(provider.LoginResult{Err: fmt.Errorf("persist login: %w", err)})
+				return
+			}
 		}
 		f.finish(provider.LoginResult{Profile: profile})
 	}()
