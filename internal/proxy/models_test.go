@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -186,6 +189,94 @@ func TestModelsEndpointOmitsDisabledAccounts(t *testing.T) {
 	json.Unmarshal(h.get("/v1/models").Body.Bytes(), &body)
 	if len(body.Data) != 0 {
 		t.Errorf("data = %+v, want nothing from a disabled account", body.Data)
+	}
+}
+
+// refusingProvider refuses every refresh with ErrCredentialRejected, which is
+// what account.Manager sidelines an account on. Only Refresh and Name are
+// reachable from the test below; the rest satisfy the interface.
+type refusingProvider struct{}
+
+func (refusingProvider) Name() string { return "anthropic" }
+func (refusingProvider) Refresh(context.Context, provider.Credential) (provider.Credential, error) {
+	return provider.Credential{}, fmt.Errorf("%w: token revoked", provider.ErrCredentialRejected)
+}
+func (refusingProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
+	return provider.Profile{}, provider.ErrUnsupported
+}
+func (refusingProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
+	return provider.Quota{}, provider.ErrUnsupported
+}
+func (refusingProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
+	return nil, provider.ErrUnsupported
+}
+func (refusingProvider) Login(context.Context) (provider.LoginSession, error) {
+	return provider.LoginSession{}, provider.ErrUnsupported
+}
+func (refusingProvider) Endpoint(provider.Account) *url.URL {
+	u, _ := url.Parse("https://upstream.invalid")
+	return u
+}
+func (refusingProvider) Authorize(*http.Request, provider.Credential)             {}
+func (refusingProvider) RewriteBody(b []byte, _ provider.Account) ([]byte, error) { return b, nil }
+func (refusingProvider) ClassifyResponse(*http.Response) provider.Outcome         { return provider.Outcome{} }
+func (refusingProvider) ParseUsage([]byte) (*provider.UsageDelta, bool)           { return nil, false }
+func (refusingProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)       { return nil, false }
+
+// An account the upstream has REFUSED is sidelined from selection
+// (account.eligibleLocked drops StatusErrored) but stays in the registry, so
+// this endpoint kept advertising models only that account could serve. Every
+// request naming one then failed with "no account ready" against a model the
+// proxy had just listed as available.
+func TestModelsEndpointOmitsErroredAccounts(t *testing.T) {
+	accts := []config.Account{
+		{
+			ID: "dead", Provider: "anthropic", Label: "dead",
+			Credential: provider.Credential{
+				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+				// Already expired, so the forced refresh below is the realistic
+				// path rather than a contrived one.
+				ExpiresAt: time.Now().Add(-time.Hour).UnixMilli(),
+			},
+		},
+		{
+			ID: "live", Provider: "anthropic", Label: "live",
+			Credential: provider.Credential{
+				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+				ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
+			},
+		},
+	}
+	mgr := account.New(accts, map[string]provider.Provider{"anthropic": refusingProvider{}},
+		account.Options{
+			SwitchThreshold: 0.98,
+			Persist:         func(string, provider.Credential) error { return nil },
+		})
+	mgr.UpdateModels("dead", []provider.Model{{ID: "claude-only-on-the-dead-account"}})
+	mgr.UpdateModels("live", []provider.Model{{ID: "claude-opus-5"}})
+
+	// Sideline "dead" the way production does: a refused refresh.
+	if err := mgr.EnsureFresh(context.Background(), "dead", true); err == nil {
+		t.Fatal("want the refused refresh to return an error")
+	}
+	if got, _ := mgr.Get("dead"); got.Status != account.StatusErrored {
+		t.Fatalf("Status = %v, want StatusErrored — the test cannot assert what it is about", got.Status)
+	}
+
+	h := &modelsHarness{t: t, mgr: mgr}
+	h.r = NewRouter(HandlerOptions{Manager: mgr, Log: quietLogger()})
+
+	var body struct{ Data []struct{ ID string } }
+	json.Unmarshal(h.get("/v1/models").Body.Bytes(), &body)
+	ids := map[string]bool{}
+	for _, d := range body.Data {
+		ids[d.ID] = true
+	}
+	if ids["claude-only-on-the-dead-account"] {
+		t.Error("a sidelined account's models must not be advertised: nothing can serve them")
+	}
+	if !ids["claude-opus-5"] {
+		t.Errorf("data = %+v, want the healthy account's catalogue still listed", body.Data)
 	}
 }
 

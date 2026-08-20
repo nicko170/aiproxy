@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+
+	"github.com/nicko170/aiproxy/internal/account"
 )
 
 // modelsHandler answers GET /v1/models from the union of every enabled
@@ -46,7 +48,20 @@ func modelsHandler(o HandlerOptions) http.HandlerFunc {
 		seen := map[string]bool{}
 		out := []entry{}
 		for _, a := range o.Manager.All() {
-			if a.Disabled {
+			// The same two exclusions account.eligibleLocked applies, so this
+			// endpoint cannot advertise a model no request could be routed to.
+			// StatusErrored was missing: an account whose credential the
+			// upstream refused is sidelined from selection but kept in the
+			// registry, so a model only IT could serve stayed on the list and
+			// every request naming it failed with no account ready.
+			//
+			// Deliberately NOT filtered on the transient conditions
+			// eligibleLocked also checks — RateLimitedUntil, a rejected bucket,
+			// utilization over the switch threshold. Those say "not right now",
+			// and a catalogue that shrank and grew as quota moved would make a
+			// client cache the wrong answer for as long as it caches anything.
+			// Disabled and StatusErrored are the two standing conditions.
+			if a.Disabled || a.Status == account.StatusErrored {
 				continue
 			}
 			for _, m := range a.Models {
