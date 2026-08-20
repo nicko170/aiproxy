@@ -38,20 +38,34 @@ func acctWithModels(id, prov string, models ...provider.Model) acctSpec {
 	return acctSpec{id: id, provider: prov, models: models}
 }
 
-// newModelsHarness wires the given accounts, all enabled.
+// newModelsHarness wires the given accounts, all enabled, with no API key
+// configured (Authorized's "no key configured" exemption applies).
 func newModelsHarness(t *testing.T, specs ...acctSpec) *modelsHarness {
 	t.Helper()
-	return newModelsHarnessWith(t, false, specs...)
+	return newModelsHarnessFull(t, false, "", specs...)
 }
 
 // newModelsHarnessDisabled wires the given accounts, all disabled — for
 // asserting that a disabled account's catalogue never surfaces.
 func newModelsHarnessDisabled(t *testing.T, specs ...acctSpec) *modelsHarness {
 	t.Helper()
-	return newModelsHarnessWith(t, true, specs...)
+	return newModelsHarnessFull(t, true, "", specs...)
+}
+
+// newModelsHarnessWithKey wires the given accounts, all enabled, behind the
+// given proxy API key — for exercising the Authorized gate itself, which
+// newModelsHarness's empty key would bypass unconditionally.
+func newModelsHarnessWithKey(t *testing.T, apiKey string, specs ...acctSpec) *modelsHarness {
+	t.Helper()
+	return newModelsHarnessFull(t, false, apiKey, specs...)
 }
 
 func newModelsHarnessWith(t *testing.T, disabled bool, specs ...acctSpec) *modelsHarness {
+	t.Helper()
+	return newModelsHarnessFull(t, disabled, "", specs...)
+}
+
+func newModelsHarnessFull(t *testing.T, disabled bool, apiKey string, specs ...acctSpec) *modelsHarness {
 	t.Helper()
 	accts := make([]config.Account, 0, len(specs))
 	for _, s := range specs {
@@ -80,16 +94,34 @@ func newModelsHarnessWith(t *testing.T, disabled bool, specs ...acctSpec) *model
 	// Log must be non-nil: a bug that mis-registers /v1/models would fall
 	// through to the catch-all proxyHandler, which logs through o.Log before
 	// this test's assertions ever see the resulting response.
-	h.r = NewRouter(HandlerOptions{Manager: mgr, Log: quietLogger()})
+	h.r = NewRouter(HandlerOptions{Manager: mgr, Log: quietLogger(), APIKey: apiKey})
 	return h
 }
 
 // get drives the router directly (no network socket — nothing here needs
 // one) and returns the recorder, matching what the assertions in this file
-// need: res.Code and res.Body.Bytes().
+// need: res.Code and res.Body.Bytes(). The request's RemoteAddr is left at
+// httptest.NewRequest's default ("192.0.2.1:1234"), which is already
+// non-loopback; every test using get() runs with no API key configured, so
+// Authorized's "no key configured" exemption is what actually admits it.
 func (h *modelsHarness) get(path string) *httptest.ResponseRecorder {
 	h.t.Helper()
+	return h.getFrom(path, "", "")
+}
+
+// getFrom is like get, but pins the request's RemoteAddr and an optional
+// x-api-key header — the two inputs Authorized actually keys off — so a test
+// can exercise a specific (loopback-or-not, keyed-or-not) combination
+// directly rather than relying on httptest's default remote address.
+func (h *modelsHarness) getFrom(path, remoteAddr, apiKey string) *httptest.ResponseRecorder {
+	h.t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if remoteAddr != "" {
+		req.RemoteAddr = remoteAddr
+	}
+	if apiKey != "" {
+		req.Header.Set("x-api-key", apiKey)
+	}
 	rec := httptest.NewRecorder()
 	h.r.ServeHTTP(rec, req)
 	return rec
@@ -154,5 +186,35 @@ func TestModelsEndpointOmitsDisabledAccounts(t *testing.T) {
 	json.Unmarshal(h.get("/v1/models").Body.Bytes(), &body)
 	if len(body.Data) != 0 {
 		t.Errorf("data = %+v, want nothing from a disabled account", body.Data)
+	}
+}
+
+// A non-loopback caller with no key must be refused. Without this gate,
+// /v1/models would be the only route in the process that answers an
+// unauthenticated non-loopback caller (proxyHandler, passthroughHandler and
+// controlHandler all check Authorized first) — and what it answers is the
+// union of every logged-in account's models, which leaks plan entitlements
+// and account composition to anyone who can reach the port.
+func TestModelsEndpointRefusesUnauthenticatedNonLoopbackCaller(t *testing.T) {
+	h := newModelsHarnessWithKey(t, "secret",
+		acctWithModels("a", "anthropic", provider.Model{ID: "claude-opus-5"}))
+
+	res := h.getFrom("/v1/models", "203.0.113.7:1234", "")
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 for an unauthenticated non-loopback caller", res.Code)
+	}
+}
+
+// A loopback caller needs no key at all: Authorized's loopback exemption is
+// documented behaviour every other handler already relies on, so a local
+// agent (the TUI, a health check, a script run on the same host) needs no
+// credential to see the model list either.
+func TestModelsEndpointAllowsLoopbackCallerWithNoKey(t *testing.T) {
+	h := newModelsHarnessWithKey(t, "secret",
+		acctWithModels("a", "anthropic", provider.Model{ID: "claude-opus-5"}))
+
+	res := h.getFrom("/v1/models", "127.0.0.1:1234", "")
+	if res.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a loopback caller with no key", res.Code)
 	}
 }

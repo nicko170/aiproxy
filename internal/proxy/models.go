@@ -16,6 +16,16 @@ import (
 // be wrong for any client we have not seen.
 func modelsHandler(o HandlerOptions) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Same gate as the proxy and control-API handlers (handler.go,
+		// control.go): unauthenticated, this is the only route in the process
+		// that would answer a non-loopback caller with no key, and what it
+		// answers is the union of every logged-in account's models — a leak of
+		// plan entitlements and account composition to anyone who can reach
+		// the port.
+		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
+			return
+		}
 		type entry struct {
 			ID            string `json:"id"`
 			Object        string `json:"object"`
