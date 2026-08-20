@@ -143,6 +143,9 @@ func (m *Manager) eligibleLocked(a *Account, req SelectRequest, nowMS int64) boo
 	if !hasCredential(a) {
 		return false
 	}
+	if !servesModel(a, req.Model) {
+		return false
+	}
 	for name, b := range a.Buckets {
 		if !BucketAppliesTo(name, req.Model) {
 			continue
@@ -159,6 +162,21 @@ func (m *Manager) eligibleLocked(a *Account, req SelectRequest, nowMS int64) boo
 
 func hasCredential(a *Account) bool {
 	return a.Credential.AccessToken != "" || a.Credential.RefreshToken != "" || a.Credential.APIKey != ""
+}
+
+// servesModel reports whether this account can reach the requested model. An
+// account with no catalogue yet is treated as able to serve anything: unknown
+// must not mean unusable, or a new account is dead until its first probe.
+func servesModel(a *Account, model string) bool {
+	if model == "" || len(a.Models) == 0 {
+		return true
+	}
+	for _, m := range a.Models {
+		if m.ID == model {
+			return true
+		}
+	}
+	return false
 }
 
 // expiringAllowance scores how much unused allowance an account is on track to

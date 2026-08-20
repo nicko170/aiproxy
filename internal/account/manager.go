@@ -296,6 +296,23 @@ func (m *Manager) isExpiredLocked(a *Account) bool {
 	return m.opts.Now().UnixMilli() >= a.Credential.ExpiresAt
 }
 
+// UpdateModels records a catalogue read.
+//
+// An empty list is ignored rather than stored. Discovery runs against a private
+// endpoint on a timer, and a transient failure that emptied the catalogue would
+// make every model on the account unroutable — an availability outage caused by
+// a monitoring call, which is the wrong direction to fail.
+func (m *Manager) UpdateModels(id string, models []provider.Model) {
+	if len(models) == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if a := m.byID[id]; a != nil {
+		a.Models = append([]provider.Model(nil), models...)
+	}
+}
+
 // UpdateQuota records observed buckets for an account.
 func (m *Manager) UpdateQuota(id string, buckets []provider.QuotaBucket) {
 	m.mu.Lock()

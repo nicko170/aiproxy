@@ -390,6 +390,55 @@ func TestSelectDoesNotRaceWithEnsureFresh(t *testing.T) {
 	wg.Wait()
 }
 
+// Routing follows discovered access: an account that cannot reach a model is
+// not a candidate for it, whatever its priority or quota says.
+func TestSelectSkipsAnAccountWithoutTheModel(t *testing.T) {
+	m := mgr(t, acct("haiku-only", 0), acct("everything", 5))
+	m.UpdateModels("haiku-only", []provider.Model{{ID: "claude-haiku-4-5"}})
+	m.UpdateModels("everything", []provider.Model{{ID: "claude-haiku-4-5"}, {ID: "claude-opus-5"}})
+
+	got, err := m.Select(SelectRequest{Model: "claude-opus-5"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "everything" {
+		t.Errorf("selected %q; only that account can reach claude-opus-5", got.ID)
+	}
+}
+
+// An account whose catalogue has never been read must stay usable. Failing
+// closed would take a freshly added account out of service until its first
+// probe, which is the startup blindness the prober fix removed.
+func TestSelectTreatsAnUnknownCatalogueAsEligible(t *testing.T) {
+	m := mgr(t, acct("unprobed", 0))
+	got, err := m.Select(SelectRequest{Model: "anything-at-all"})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if got.ID != "unprobed" {
+		t.Errorf("selected %q", got.ID)
+	}
+}
+
+func TestSelectReportsNoAccountWhenNobodyHasTheModel(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+	m.UpdateModels("a", []provider.Model{{ID: "claude-haiku-4-5"}})
+	if _, err := m.Select(SelectRequest{Model: "gpt-5.6-sol"}); !errors.Is(err, ErrNoAccount) {
+		t.Errorf("err = %v, want ErrNoAccount", err)
+	}
+}
+
+// A discovery failure must not empty a catalogue: that would silently take
+// every model on the account out of service for a reason unrelated to health.
+func TestUpdateModelsIgnoresAnEmptyList(t *testing.T) {
+	m := mgr(t, acct("a", 0))
+	m.UpdateModels("a", []provider.Model{{ID: "claude-opus-5"}})
+	m.UpdateModels("a", nil)
+	if _, err := m.Select(SelectRequest{Model: "claude-opus-5"}); err != nil {
+		t.Errorf("Select after a failed refresh: %v; the previous catalogue must survive", err)
+	}
+}
+
 func TestBucketAppliesTo(t *testing.T) {
 	cases := []struct {
 		bucket, model string

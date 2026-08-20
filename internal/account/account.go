@@ -41,6 +41,9 @@ type Account struct {
 
 	// Buckets is the most recent quota observation per bucket name.
 	Buckets map[string]provider.QuotaBucket
+	// Models is the most recent catalogue read for this account. Nil means
+	// "not yet known", which is NOT the same as "none" — see eligibleLocked.
+	Models []provider.Model
 	// RateLimitedUntil holds the account out of selection entirely (unix ms).
 	RateLimitedUntil int64
 	// PausedUntil keeps the account selectable but makes Admit wait (unix ms).
@@ -92,5 +95,6 @@ func copyAccount(a *Account) Account {
 	for k, v := range a.Buckets {
 		out.Buckets[k] = v
 	}
+	out.Models = append([]provider.Model(nil), a.Models...)
 	return out
 }
