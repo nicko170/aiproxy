@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/provider"
 )
@@ -65,6 +66,48 @@ func normalizeExpiresAt(v int64) int64 {
 	return v
 }
 
+// importedExpiry is the ExpiresAt an imported credential gets. A file that
+// states an expiry is believed (normalized to millis); a file that states none
+// is treated as EXPIRED AS OF THE IMPORT, so the very next EnsureFresh renews
+// it.
+//
+// This exists because Codex's auth.json carries no expiry at all, and
+// account.Manager.needsRefreshLocked reads ExpiresAt == 0 as "no expiry known,
+// do not churn". The combination is a credential that is never proactively
+// refreshed: once the access token ages out, the prober's EnsureFresh no-ops,
+// Quota answers 401, and a 401 is not a throttling error so it carries no
+// backoff — the proxy then warns every cycle, forever, until an inference
+// request happens to force a refresh on its own path. An imported account
+// silently stops reporting quota and never says why.
+//
+// Two ways to fix it were available: derive an expiry from auth.json's
+// last_refresh plus the observed ~10-day access-token lifetime, or treat an
+// unknown expiry as immediately refreshable. This takes the SECOND, because:
+//
+//   - The 10-day lifetime is observed, not documented. If upstream shortens it,
+//     a derived expiry silently reinstates the exact bug — proactive refresh
+//     stops firing — and does so invisibly. Nothing here should depend on a
+//     number we cannot verify.
+//   - It is self-correcting rather than a standing assumption: the first
+//     refresh returns a real expires_in, Persist writes the real ExpiresAt
+//     back, and this fabricated value is never consulted again.
+//   - It fails in the cheap direction. The cost is one token call shortly
+//     after an import, on a credential the source tool has itself been
+//     refreshing; and it surfaces a dead refresh token at import time, when
+//     the operator is present, instead of ten days later. A failed refresh
+//     does not churn either: EnsureFresh short-circuits on an already-expired
+//     credential that a previous attempt already failed on.
+//
+// Claude Code's file normally does state an expiry, but it goes through the
+// same helper so the two importers cannot drift: one carrying an expiry and
+// the other not is exactly the asymmetry that produced this.
+func importedExpiry(stated int64, now time.Time) int64 {
+	if v := normalizeExpiresAt(stated); v != 0 {
+		return v
+	}
+	return now.UnixMilli()
+}
+
 type claudeCodeFile struct {
 	ClaudeAiOauth *struct {
 		AccessToken      string `json:"accessToken"`
@@ -77,6 +120,10 @@ type claudeCodeFile struct {
 // codexFile is the Codex CLI's own auth.json layout. Only the chatgpt auth
 // mode carries OAuth tokens; an apikey-mode file has Tokens nil and nothing
 // to adopt.
+//
+// There is deliberately no expiry field to read: auth.json states none, only a
+// last_refresh timestamp. See importedExpiry for what is done about that and
+// why last_refresh is not used to derive one.
 type codexFile struct {
 	AuthMode string `json:"auth_mode"`
 	Tokens   *struct {
@@ -113,7 +160,7 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 				Type:         provider.CredentialOAuth,
 				AccessToken:  f.ClaudeAiOauth.AccessToken,
 				RefreshToken: f.ClaudeAiOauth.RefreshToken,
-				ExpiresAt:    normalizeExpiresAt(f.ClaudeAiOauth.ExpiresAt),
+				ExpiresAt:    importedExpiry(f.ClaudeAiOauth.ExpiresAt, time.Now()),
 			},
 			Identity: Identity{Plan: f.ClaudeAiOauth.SubscriptionType},
 		}}, nil
@@ -135,6 +182,11 @@ func ImportFile(path string, src ImportSource) ([]Account, error) {
 				AccessToken:  f.Tokens.AccessToken,
 				RefreshToken: f.Tokens.RefreshToken,
 				AccountID:    f.Tokens.AccountID,
+				// auth.json carries no expiry, so this is stamped as
+				// already-expired and the next EnsureFresh renews it. Without
+				// it, ExpiresAt == 0 means "no expiry known" to
+				// account.Manager and proactive refresh never fires at all.
+				ExpiresAt: importedExpiry(0, time.Now()),
 			},
 			// AccountID is the identity the dedupe path keys on (see
 			// importDedupeKey in internal/view): without it here, re-running

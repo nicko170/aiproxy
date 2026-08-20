@@ -3,7 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 )
 
 func writeFile(t *testing.T, dir, name, body string) string {
@@ -97,6 +99,51 @@ func TestImportCodexCredentials(t *testing.T) {
 	}
 	if got[0].Credential.AccountID != "acc-1" {
 		t.Errorf("AccountID = %q; the chatgpt-account-id header needs it", got[0].Credential.AccountID)
+	}
+}
+
+// IMPORTANT 6. auth.json states no expiry, and account.Manager reads
+// ExpiresAt == 0 as "no expiry known, do not churn" — so a Codex-imported
+// credential was never proactively refreshed at all. After the access token
+// aged out the prober's EnsureFresh no-opped, Quota answered 401, and a 401
+// carries no backoff, so it warned every cycle forever.
+func TestImportCodexStampsAnExpirySoRefreshCanFire(t *testing.T) {
+	before := time.Now().UnixMilli()
+	p := writeFile(t, t.TempDir(), "auth.json", `{
+	  "auth_mode":"chatgpt",
+	  "tokens":{"id_token":"idt","access_token":"at","refresh_token":"rt","account_id":"acc-1"},
+	  "last_refresh":"2026-08-12T04:36:46Z"}`)
+
+	got, err := ImportFile(p, ImportSourceCodex)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	exp := got[0].Credential.ExpiresAt
+	if exp == 0 {
+		t.Fatal("ExpiresAt = 0; account.Manager reads that as 'no expiry known' and never refreshes")
+	}
+	// Stamped as expired-at-import, so the next EnsureFresh renews. Deliberately
+	// not derived from last_refresh plus an assumed 10-day lifetime: see
+	// importedExpiry.
+	if exp < before || exp > time.Now().UnixMilli() {
+		t.Errorf("ExpiresAt = %d, want the import instant (between %d and now)", exp, before)
+	}
+}
+
+// A file that DOES state an expiry is believed rather than overwritten, so the
+// Claude Code path is not made to churn by the fix above.
+func TestImportClaudeCodeKeepsTheStatedExpiry(t *testing.T) {
+	want := time.Now().Add(8 * time.Hour).UnixMilli()
+	p := writeFile(t, t.TempDir(), "creds.json",
+		`{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":`+
+			strconv.FormatInt(want, 10)+`}}`)
+
+	got, err := ImportFile(p, ImportSourceClaudeCode)
+	if err != nil {
+		t.Fatalf("ImportFile: %v", err)
+	}
+	if got[0].Credential.ExpiresAt != want {
+		t.Errorf("ExpiresAt = %d, want %d", got[0].Credential.ExpiresAt, want)
 	}
 }
 
