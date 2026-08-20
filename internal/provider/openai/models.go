@@ -19,6 +19,18 @@ import (
 // the substitute and is per-account, which is what makes plan differences fall
 // out for free.
 func (o *OpenAI) Models(ctx context.Context, c provider.Credential) ([]provider.Model, error) {
+	// The guard anthropic.Models deliberately does NOT have, and the asymmetry
+	// is correct rather than an oversight: anthropic's catalogue lives on
+	// /v1/models, which an API key authenticates perfectly well, while this
+	// one lives on chatgpt.com/backend-api behind a ChatGPT session — an
+	// OpenAI API key cannot reach it at all.
+	//
+	// ErrUnsupported, not an error: callers must read it as "unknown", never as
+	// "none" (an empty catalogue means "serves anything" to
+	// account.servesModel). internal/prober relies on this answer instead of
+	// pre-judging credential types itself, which is why the decision belongs
+	// here — this is the only thing that knows which credentials its endpoint
+	// accepts.
 	if c.Type == provider.CredentialAPIKey {
 		return nil, provider.ErrUnsupported
 	}

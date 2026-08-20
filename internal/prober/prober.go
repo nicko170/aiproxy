@@ -1,7 +1,12 @@
-// Package prober runs a background loop that periodically reads each OAuth
-// account's quota from its provider and feeds the result through
-// account.Manager.UpdateQuota, which already fans out to the metrics OnQuota
-// hook (spec §6.2, §7.3).
+// Package prober runs a background loop that periodically reads each account's
+// quota and model catalogue from its provider, feeding them through
+// account.Manager.UpdateQuota — which already fans out to the metrics OnQuota
+// hook (spec §6.2, §7.3) — and UpdateModels.
+//
+// The two reads are independent: neither gates the other, and neither is
+// gated on the account's credential TYPE. Whether an endpoint supports a given
+// credential is the provider's answer to give (ErrUnsupported), not this
+// package's to guess; see probeAll.
 //
 // It is its own package rather than another file in internal/account because
 // a periodic loop with its own goroutine, ticker, and per-account backoff
@@ -75,8 +80,8 @@ type Status struct {
 	Accounts        map[string]AccountStatus
 }
 
-// Prober periodically reads quota for every OAuth account and feeds it
-// through account.Manager.UpdateQuota. An interval of 0 disables the
+// Prober periodically reads quota and the model catalogue for every account and
+// feeds them through account.Manager. An interval of 0 disables the
 // background loop entirely; ProbeNow still works on demand regardless (spec:
 // "An interval of 0 disables it" refers to the periodic schedule, not a
 // manual trigger).
@@ -111,7 +116,7 @@ type accountState struct {
 
 // New builds a Prober over mgr and the same provider registry cmd/aiproxy
 // already constructed. interval is how often the background loop (Start)
-// reads every OAuth account's quota; 0 disables that loop.
+// reads every account's quota and catalogue; 0 disables that loop.
 func New(mgr *account.Manager, providers map[string]provider.Provider, interval time.Duration, opts ...Option) *Prober {
 	p := &Prober{
 		mgr: mgr, providers: providers, interval: interval,
@@ -269,12 +274,21 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 	current := make(map[string]bool, len(live))
 	for _, a := range live {
 		current[a.ID] = true
-		// API-key accounts have no usage endpoint at all (spec §4.4); skip
-		// them without even asking the provider, so this never logs a
-		// spurious error every cycle for an account that can never answer.
-		if a.Credential.Type != provider.CredentialOAuth {
-			continue
-		}
+		// NOT filtered by credential type here. It used to skip anything that
+		// was not OAuth, on the grounds that an API key has no usage endpoint
+		// (spec §4.4) — true for Quota, and Quota still answers ErrUnsupported
+		// for one, which this loop treats as "nothing to read" without logging.
+		// But it is NOT true for Models: anthropic.Models works perfectly with
+		// an API key (it authenticates the same /v1/models call with x-api-key),
+		// so this pre-judgement left an API-key-only deployment with a
+		// permanently empty catalogue — /v1/models answered nothing, and an
+		// empty catalogue also disables account.servesModel filtering silently,
+		// since "unknown" must mean "can serve anything".
+		//
+		// Deciding which credential types an endpoint supports is the
+		// provider's job — it is the only thing that knows — and both providers
+		// already return ErrUnsupported when they cannot. The prober asks and
+		// honours the answer.
 		prov, ok := p.providers[a.Provider]
 		if !ok || prov == nil {
 			continue
@@ -314,42 +328,24 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 			a = fresh
 		}
 
-		q, err := prov.Quota(ctx, a.Credential)
-		if err != nil {
-			if errors.Is(err, provider.ErrUnsupported) {
-				// Defensive: the credential-type check above already filters
-				// these out for every provider that follows the same
-				// convention as anthropic's.
-				continue
-			}
-			p.recordError(a.ID, err, now)
-			// Logged in addition to being recorded in Status(): a headless
-			// instance (spec §1: runs `--headless` with logging to stderr) has
-			// no UI polling Status at all, so this is the only place a
-			// throttled or failing probe is visible for it. err is always
-			// either provider.ErrQuotaThrottled or a transport failure, never
-			// anything containing credential material (see anthropic's Quota
-			// and this package's doc comment on that guarantee).
-			p.log.Warn("quota probe failed", "account", a.Label, "id", a.ID, "err", err)
+		// Quota and the catalogue are read INDEPENDENTLY, on the same cycle and
+		// the same freshly renewed credential. Neither gates the other: the
+		// quota read used to `continue` on any error, so once wham/usage started
+		// failing — which spec §10 explicitly anticipates, it is a private
+		// endpoint — the catalogue was never refreshed again even though
+		// wham/models was perfectly healthy. They are different endpoints on
+		// different hosts and fail for different reasons.
+		//
+		// The eligible() backoff above still gates BOTH, deliberately: it arms
+		// only on ErrQuotaThrottled, and a host that is throttling us is
+		// throttling the catalogue endpoint beside it. A plain failure — the
+		// case spec §10 anticipates — arms no backoff at all, so the catalogue
+		// keeps refreshing every cycle through it; a throttle delays the
+		// catalogue by at most maxBackoff rather than stopping it.
+		if err := p.probeQuota(ctx, prov, a, now); err != nil {
 			errs = append(errs, fmt.Errorf("probe account %s: %w", a.ID, err))
-			continue
 		}
-		p.recordSuccess(a.ID, now)
-		p.mgr.UpdateQuota(a.ID, q.Buckets)
-
-		// Catalogue on the same cycle and the same freshly renewed credential.
-		// A failure here is logged but does NOT fail the cycle or clear the
-		// stored catalogue: UpdateModels ignores an empty list, so the last
-		// known good list survives a bad read.
-		models, err := prov.Models(ctx, a.Credential)
-		switch {
-		case errors.Is(err, provider.ErrUnsupported):
-			// Nothing to discover for this provider.
-		case err != nil:
-			p.log.Warn("model catalogue read failed", "account", a.Label, "err", err)
-		default:
-			p.mgr.UpdateModels(a.ID, models)
-		}
+		p.probeModels(ctx, prov, a)
 	}
 	// An account removed from mgr between cycles otherwise stays in
 	// p.accounts (and so in Status().Accounts) forever — a ghost entry for
@@ -357,6 +353,54 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 	// cycle actually saw.
 	p.pruneAccounts(current)
 	return errs
+}
+
+// probeQuota reads one account's quota and records the outcome. A returned
+// error is the cycle's error for this account; nil covers both a successful
+// read and a provider that has no usage endpoint for this credential.
+func (p *Prober) probeQuota(ctx context.Context, prov provider.Provider, a account.Account, now time.Time) error {
+	q, err := prov.Quota(ctx, a.Credential)
+	switch {
+	case errors.Is(err, provider.ErrUnsupported):
+		// No usage endpoint for this credential — an API key, typically (spec
+		// §4.4). Neither a success nor a failure: there is nothing to read, so
+		// recording an error here would log the same non-event every cycle
+		// forever, and recording a success would reset a real backoff.
+		return nil
+	case err != nil:
+		p.recordError(a.ID, err, now)
+		// Logged in addition to being recorded in Status(): a headless
+		// instance (spec §1: runs `--headless` with logging to stderr) has
+		// no UI polling Status at all, so this is the only place a
+		// throttled or failing probe is visible for it. err is always
+		// either provider.ErrQuotaThrottled or a transport failure, never
+		// anything containing credential material (see anthropic's Quota
+		// and this package's doc comment on that guarantee).
+		p.log.Warn("quota probe failed", "account", a.Label, "id", a.ID, "err", err)
+		return err
+	}
+	p.recordSuccess(a.ID, now)
+	p.mgr.UpdateQuota(a.ID, q.Buckets)
+	return nil
+}
+
+// probeModels refreshes one account's catalogue.
+//
+// A failure is logged but does NOT fail the cycle, is NOT recorded as the
+// account's probe error, and does NOT clear the stored catalogue: UpdateModels
+// ignores an empty list, so the last known good list survives a bad read.
+// Keeping it out of recordError matters — AccountStatus.LastError is the quota
+// read's health, and a models failure must not arm the quota backoff.
+func (p *Prober) probeModels(ctx context.Context, prov provider.Provider, a account.Account) {
+	models, err := prov.Models(ctx, a.Credential)
+	switch {
+	case errors.Is(err, provider.ErrUnsupported):
+		// Nothing to discover for this provider and this credential type.
+	case err != nil:
+		p.log.Warn("model catalogue read failed", "account", a.Label, "err", err)
+	default:
+		p.mgr.UpdateModels(a.ID, models)
+	}
 }
 
 // pruneAccounts drops every entry in p.accounts whose id is not in current,
