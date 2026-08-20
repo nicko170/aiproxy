@@ -437,6 +437,15 @@ func TestUpdateModelsIgnoresAnEmptyList(t *testing.T) {
 	if _, err := m.Select(SelectRequest{Model: "claude-opus-5"}); err != nil {
 		t.Errorf("Select after a failed refresh: %v; the previous catalogue must survive", err)
 	}
+	// The discriminating half: claude-opus-5 alone cannot tell "catalogue
+	// survived" from "catalogue was wiped to nil", because a nil catalogue is
+	// eligible for every model too. A model that was never in the original
+	// catalogue only succeeds if the empty update actually replaced it with
+	// nil; if the guard held, "a" still serves only claude-opus-5 and this
+	// must fail with ErrNoAccount.
+	if _, err := m.Select(SelectRequest{Model: "claude-haiku-4-5"}); !errors.Is(err, ErrNoAccount) {
+		t.Errorf("err = %v, want ErrNoAccount; the empty update must not have wiped the catalogue to nil", err)
+	}
 }
 
 func TestBucketAppliesTo(t *testing.T) {
