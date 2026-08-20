@@ -14,7 +14,9 @@ import (
 //
 // The units differ from the JSON endpoint — minutes here, seconds there — so
 // both are normalised to the same QuotaBucket before anything else sees them.
-func parseCodexBuckets(h http.Header) []provider.QuotaBucket {
+// When limitReached is true, all emitted buckets are marked "rejected", matching
+// the JSON path: a single limit flag applies to every window.
+func parseCodexBuckets(h http.Header, limitReached bool) []provider.QuotaBucket {
 	var out []provider.QuotaBucket
 	for _, w := range []string{"primary", "secondary"} {
 		pct, okPct := headerFloat(h, "x-codex-"+w+"-used-percent")
@@ -27,11 +29,15 @@ func parseCodexBuckets(h http.Header) []provider.QuotaBucket {
 		if name == "" {
 			continue
 		}
-		out = append(out, provider.QuotaBucket{
+		b := provider.QuotaBucket{
 			Name:        name,
 			Utilization: pct / 100,
 			ResetsAt:    reset * 1000,
-		})
+		}
+		if limitReached {
+			b.Status = "rejected"
+		}
+		out = append(out, b)
 	}
 	return out
 }
@@ -55,14 +61,15 @@ func headerInt(h http.Header, k string) (int64, bool) {
 }
 
 func (o *OpenAI) ClassifyResponse(r *http.Response) provider.Outcome {
-	out := provider.Outcome{Buckets: parseCodexBuckets(r.Header)}
+	limitReached := r.Header.Get("x-codex-rate-limit-reached-type") != ""
+	out := provider.Outcome{Buckets: parseCodexBuckets(r.Header, limitReached)}
 
 	switch {
 	case r.StatusCode == http.StatusTooManyRequests:
 		// A named reached-type means the plan's allowance is spent, which is a
 		// different thing from being asked to slow down: it holds the account
 		// rather than pausing it, so rotation happens instead of waiting.
-		if r.Header.Get("x-codex-rate-limit-reached-type") != "" {
+		if limitReached {
 			out.Kind = provider.OutcomeQuotaRejected
 			return out
 		}

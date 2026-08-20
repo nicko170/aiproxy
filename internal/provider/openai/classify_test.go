@@ -36,7 +36,7 @@ func TestParseCodexBucketsMatchesTheUsageEndpointShape(t *testing.T) {
 		"x-codex-primary-window-minutes": "10080",
 		"x-codex-primary-reset-at":       strconv.FormatInt(reset, 10),
 	})
-	got := parseCodexBuckets(res.Header)
+	got := parseCodexBuckets(res.Header, false)
 	if len(got) != 1 {
 		t.Fatalf("buckets = %+v, want 1", got)
 	}
@@ -72,5 +72,38 @@ func TestClassify401IsCredentialStale(t *testing.T) {
 func TestClassify5xxIsServerError(t *testing.T) {
 	if got := New(http.DefaultClient).ClassifyResponse(hdrStatus(503, nil)).Kind; got != provider.OutcomeServerError {
 		t.Errorf("kind = %v, want server_error", got)
+	}
+}
+
+// Buckets from the header path must carry Status == "rejected" when the rate
+// limit is reached, matching the JSON path. This ensures holdFor() and account
+// selection see a rejected bucket and behave correctly.
+func TestParseCodexBucketsMarksRejectedWhenLimitReached(t *testing.T) {
+	reset := time.Now().Add(2 * time.Hour).Unix()
+	res := hdr(map[string]string{
+		"x-codex-primary-used-percent":    "29",
+		"x-codex-primary-window-minutes":  "10080",
+		"x-codex-primary-reset-at":        strconv.FormatInt(reset, 10),
+		"x-codex-rate-limit-reached-type": "usage_limit_reached",
+	})
+	got := parseCodexBuckets(res.Header, true)
+	if len(got) != 1 {
+		t.Fatalf("buckets = %+v, want 1", got)
+	}
+	if got[0].Status != "rejected" {
+		t.Errorf("Status = %q, want rejected", got[0].Status)
+	}
+}
+
+// A 429 with Retry-After must return the duration from the header, not just
+// classify as throttled with hint.
+func TestOutcomeThrottledWithHintReturnsRetryAfter(t *testing.T) {
+	res := hdrStatus(429, map[string]string{"Retry-After": "60"})
+	out := New(http.DefaultClient).ClassifyResponse(res)
+	if out.Kind != provider.OutcomeThrottledWithHint {
+		t.Errorf("kind = %v, want throttled_with_hint", out.Kind)
+	}
+	if out.RetryAfter != 60*time.Second {
+		t.Errorf("RetryAfter = %v, want 60s", out.RetryAfter)
 	}
 }
