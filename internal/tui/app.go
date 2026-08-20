@@ -465,7 +465,18 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.screen == screenSettings && m.settings.editing {
 		return m.settingsKey(msg)
 	}
-	if m.screen == screenAccounts && m.accts.confirming {
+	// A MODAL prompt on the Accounts screen owns the keyboard, exactly like the
+	// login and settings inputs above. Both prompts must be listed: importing
+	// was added alongside confirming but not added here, so a global key pressed
+	// with the import prompt open ran the GLOBAL action and left importing set.
+	// Press i, then p (probe fires, prompt still armed), then x — the documented
+	// remove key — and the next keystroke imported from Codex instead. Same for
+	// l, o, u, 1-5, tab and ?.
+	//
+	// This is a whitelist of modes, so a third prompt has the same hazard. It is
+	// left as a list rather than a helper because the screen check differs per
+	// mode above; behavior_test.go pins the leak shut.
+	if m.screen == screenAccounts && (m.accts.confirming || m.accts.importing) {
 		return m.accountsKey(msg)
 	}
 
