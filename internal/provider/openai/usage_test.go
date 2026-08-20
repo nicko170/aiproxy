@@ -96,6 +96,63 @@ func TestQuotaMarksRejectedWhenTheLimitIsReached(t *testing.T) {
 	}
 }
 
+// IMPORTANT 4, the JSON half. rate_limit.limit_reached is a SINGLE flag for the
+// whole account, and it used to mark every window rejected. account.Manager
+// merges buckets by name and never deletes one, eligibleLocked disqualifies an
+// account on any rejected bucket, and spec section 5 says secondary_window is
+// routinely null on later readings — so a 5h exhaustion held 7d permanently and
+// one 429 could remove the account until restart.
+func TestQuotaScopesRejectionToTheSpentWindow(t *testing.T) {
+	body := `{"rate_limit":{"allowed":false,"limit_reached":true,
+	  "primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":1787282195},
+	  "secondary_window":{"used_percent":31,"limit_window_seconds":604800,"reset_at":1787882195}}}`
+	srv := usageServer(t, 200, body)
+	o := New(http.DefaultClient)
+	o.ChatGPTBaseURLOverride = srv.URL
+
+	got, err := o.Quota(context.Background(), provider.Credential{AccessToken: "at"})
+	if err != nil {
+		t.Fatalf("Quota: %v", err)
+	}
+	byName := map[string]provider.QuotaBucket{}
+	for _, b := range got.Buckets {
+		byName[b.Name] = b
+	}
+	if len(byName) != 2 {
+		t.Fatalf("buckets = %+v, want 5h and 7d", got.Buckets)
+	}
+	if byName["5h"].Status != "rejected" {
+		t.Errorf("5h status = %q, want rejected — it is the window at 100%%", byName["5h"].Status)
+	}
+	if byName["7d"].Status != "" {
+		t.Errorf("7d status = %q, want empty — 31%% used, and nothing would ever clear a stale rejection once secondary_window goes null",
+			byName["7d"].Status)
+	}
+}
+
+// An exhaustion flag with no window at 100 must still hold something, or a real
+// 429 is silently ignored. It holds exactly one window: the most-used.
+func TestQuotaHoldsTheMostUsedWindowWhenNeitherReachedTheLimit(t *testing.T) {
+	body := `{"rate_limit":{"allowed":false,"limit_reached":true,
+	  "primary_window":{"used_percent":22,"limit_window_seconds":18000,"reset_at":1787282195},
+	  "secondary_window":{"used_percent":99.9,"limit_window_seconds":604800,"reset_at":1787882195}}}`
+	srv := usageServer(t, 200, body)
+	o := New(http.DefaultClient)
+	o.ChatGPTBaseURLOverride = srv.URL
+
+	got, _ := o.Quota(context.Background(), provider.Credential{AccessToken: "at"})
+	byName := map[string]provider.QuotaBucket{}
+	for _, b := range got.Buckets {
+		byName[b.Name] = b
+	}
+	if byName["7d"].Status != "rejected" {
+		t.Errorf("7d status = %q, want rejected — it is the most-used window", byName["7d"].Status)
+	}
+	if byName["5h"].Status != "" {
+		t.Errorf("5h status = %q, want empty — 22%% used", byName["5h"].Status)
+	}
+}
+
 // The endpoint is private and undocumented. A 429 on it is throttling of the
 // probe itself, which internal/prober already backs off on.
 func TestQuotaReportsThrottling(t *testing.T) {

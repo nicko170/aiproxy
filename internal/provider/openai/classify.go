@@ -3,6 +3,7 @@ package openai
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/provider"
@@ -14,9 +15,12 @@ import (
 //
 // The units differ from the JSON endpoint — minutes here, seconds there — so
 // both are normalised to the same QuotaBucket before anything else sees them.
-// When limitReached is true, all emitted buckets are marked "rejected", matching
-// the JSON path: a single limit flag applies to every window.
-func parseCodexBuckets(h http.Header, limitReached bool) []provider.QuotaBucket {
+//
+// Status is left empty here; the caller applies markSpent when the reached-type
+// header is present, so the header path and the JSON path scope an exhaustion
+// identically. See markSpent for why marking every window rejected off one flag
+// strands accounts.
+func parseCodexBuckets(h http.Header) []provider.QuotaBucket {
 	var out []provider.QuotaBucket
 	for _, w := range []string{"primary", "secondary"} {
 		pct, okPct := headerFloat(h, "x-codex-"+w+"-used-percent")
@@ -29,21 +33,23 @@ func parseCodexBuckets(h http.Header, limitReached bool) []provider.QuotaBucket 
 		if name == "" {
 			continue
 		}
-		b := provider.QuotaBucket{
+		out = append(out, provider.QuotaBucket{
 			Name:        name,
 			Utilization: pct / 100,
 			ResetsAt:    reset * 1000,
-		}
-		if limitReached {
-			b.Status = "rejected"
-		}
-		out = append(out, b)
+		})
 	}
 	return out
 }
 
+// headerFloat and headerInt TrimSpace before parsing, matching
+// anthropic.retryAfter. Without it a padded "Retry-After: 3" — legal, and
+// emitted by real intermediaries — fails to parse and silently degrades a
+// hinted throttle to OutcomeThrottledNoHint, where the proxy guesses a backoff
+// instead of honouring the one it was given. Two providers reading the same
+// header two different ways is its own defect.
 func headerFloat(h http.Header, k string) (float64, bool) {
-	raw := h.Get(k)
+	raw := strings.TrimSpace(h.Get(k))
 	if raw == "" {
 		return 0, false
 	}
@@ -52,7 +58,7 @@ func headerFloat(h http.Header, k string) (float64, bool) {
 }
 
 func headerInt(h http.Header, k string) (int64, bool) {
-	raw := h.Get(k)
+	raw := strings.TrimSpace(h.Get(k))
 	if raw == "" {
 		return 0, false
 	}
@@ -62,7 +68,10 @@ func headerInt(h http.Header, k string) (int64, bool) {
 
 func (o *OpenAI) ClassifyResponse(r *http.Response) provider.Outcome {
 	limitReached := r.Header.Get("x-codex-rate-limit-reached-type") != ""
-	out := provider.Outcome{Buckets: parseCodexBuckets(r.Header, limitReached)}
+	out := provider.Outcome{Buckets: parseCodexBuckets(r.Header)}
+	if limitReached {
+		markSpent(out.Buckets)
+	}
 
 	switch {
 	case r.StatusCode == http.StatusTooManyRequests:
