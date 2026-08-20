@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -301,7 +302,7 @@ func TestRenderChartKeepsWidthAndShowsSmallColumns(t *testing.T) {
 
 func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	m := fixtureModel(100, 30)
-	res, _ := m.startLogin()
+	res, _ := m.startLogin("anthropic")
 	m = res.(Model)
 	m, _ = m.updateLogin(loginStartedMsg{sess: view.LoginSession{URL: "https://example.test/authorize?x=1"}})
 	out := m.View()
@@ -316,6 +317,177 @@ func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	}
 	if m.login.err == "" {
 		t.Error("a resultless close must say something happened")
+	}
+}
+
+// loginRecordingSource is a view.Source that only implements Login, over an
+// embedded nil interface — every other method is unreachable from these
+// tests and would nil-panic if called, which is fine: nothing here touches
+// them. It exists to answer one question a golden frame cannot: which
+// provider name actually reached Source.Login.
+type loginRecordingSource struct {
+	view.Source
+	gotProvider string
+}
+
+func (s *loginRecordingSource) Login(ctx context.Context, providerName string) (view.LoginSession, error) {
+	s.gotProvider = providerName
+	return view.LoginSession{}, nil
+}
+
+// The bug this guards against: internal/tui/login.go used to hardcode
+// src.Login(ctx, "anthropic") with no picker in front of it, so the entire
+// OpenAI Login implementation was unreachable from any path a user could
+// trigger. "l" must now ask which provider, and picking ChatGPT's key must
+// reach Source.Login with "openai" — never silently falling back to
+// "anthropic".
+func TestLoginPickerChatGPTChoiceCallsLoginWithOpenAI(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &loginRecordingSource{}
+	m.src = rec
+
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = next.(Model)
+	if !m.login.picking {
+		t.Fatalf("login = %+v, want picking after 'l'", m.login)
+	}
+	if cmd != nil {
+		t.Error("'l' must only open the picker, not start a flow yet")
+	}
+
+	next, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = next.(Model)
+	if m.login.picking {
+		t.Error("choosing a provider must close the picker")
+	}
+	if !m.login.active {
+		t.Error("choosing a provider must start the flow")
+	}
+	if cmd == nil {
+		t.Fatal("choosing a provider must return the command that calls Login")
+	}
+	cmd() // runs src.Login synchronously; loginRecordingSource does no I/O
+
+	if rec.gotProvider != "openai" {
+		t.Errorf("Login called with provider %q, want %q", rec.gotProvider, "openai")
+	}
+}
+
+// importRecordingSource records every ImportCredentials call, over an embedded
+// nil view.Source for the same reason loginRecordingSource does: the tests
+// below touch nothing else on the seam.
+type importRecordingSource struct {
+	view.Source
+	sources []view.ImportSource
+}
+
+func (s *importRecordingSource) ImportCredentials(_ context.Context, src view.ImportSource) (int, error) {
+	s.sources = append(s.sources, src)
+	return 1, nil
+}
+
+func (s *importRecordingSource) ProbeNow(context.Context) error { return nil }
+
+// IMPORTANT 7. handleKey intercepted m.accts.confirming before the global key
+// switch but NOT the new m.accts.importing, so a global key pressed with the
+// import prompt open ran the global action and left the prompt armed. The
+// documented sequence that broke: on Accounts press i, then p (the probe fires,
+// importing is still set), then x — the documented REMOVE key — and it imported
+// from Codex instead of removing anything.
+func TestGlobalKeyWithTheImportPromptOpenDoesNotLeakIntoAnImport(t *testing.T) {
+	// Every global key the switch below handles, so a future one added without
+	// re-checking this guard is caught here too.
+	for _, k := range []string{"p", "l", "o", "u", "1", "2", "3", "4", "5", "tab", "?"} {
+		t.Run(k, func(t *testing.T) {
+			m := fixtureModel(120, 28)
+			rec := &importRecordingSource{}
+			m.src = rec
+			m.screen = screenAccounts
+
+			next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+			m = next.(Model)
+			if !m.accts.importing {
+				t.Fatalf("accts = %+v, want the import prompt open after 'i'", m.accts)
+			}
+
+			// The prompt owns the keyboard: an unrecognised key cancels it, and
+			// the global action must not run behind it either.
+			next, _ = m.handleKey(keyFor(k))
+			m = next.(Model)
+			if m.accts.importing {
+				t.Fatalf("%q left the import prompt armed; the next keystroke would import", k)
+			}
+
+			// The keystroke the operator actually meant: x removes.
+			next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+			m = next.(Model)
+			if cmd != nil {
+				cmd()
+			}
+			if len(rec.sources) != 0 {
+				t.Errorf("ImportCredentials called with %v after %q then x; x must never import", rec.sources, k)
+			}
+			if !m.accts.confirming {
+				t.Errorf("x did not open the remove confirmation; accts = %+v", m.accts)
+			}
+		})
+	}
+}
+
+// The prompt still does its job: x on an OPEN prompt imports from Codex.
+func TestImportPromptStillImportsFromCodex(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &importRecordingSource{}
+	m.src = rec
+	m.screen = screenAccounts
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("i")})
+	m = next.(Model)
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = next.(Model)
+	if m.accts.importing {
+		t.Error("choosing a source must close the prompt")
+	}
+	if cmd == nil {
+		t.Fatal("choosing Codex must return the command that imports")
+	}
+	cmd()
+	if len(rec.sources) != 1 || rec.sources[0] != view.ImportSourceCodex {
+		t.Errorf("ImportCredentials sources = %v, want one Codex import", rec.sources)
+	}
+}
+
+// keyFor turns a key name into the tea.KeyMsg handleKey matches on.
+func keyFor(k string) tea.KeyMsg {
+	switch k {
+	case "tab":
+		return tea.KeyMsg{Type: tea.KeyTab}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
+}
+
+// esc on the picker must cancel without ever calling Login — matching how
+// the Accounts screen's import picker treats any unrecognised key as cancel.
+func TestLoginPickerEscCancelsWithoutLogin(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &loginRecordingSource{}
+	m.src = rec
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = next.(Model)
+
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.login.picking || m.login.active {
+		t.Errorf("login = %+v, want cleared after esc", m.login)
+	}
+	if cmd != nil {
+		t.Error("esc on the picker must not return a command")
+	}
+	if rec.gotProvider != "" {
+		t.Errorf("Login must never be called on cancel, got provider %q", rec.gotProvider)
 	}
 }
 

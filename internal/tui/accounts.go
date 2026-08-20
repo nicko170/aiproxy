@@ -15,6 +15,7 @@ type acctsState struct {
 	sel        int
 	detail     bool
 	confirming bool // remove asks first
+	importing  bool // import source menu open
 
 	history    []view.QuotaPoint
 	historyFor string
@@ -97,6 +98,34 @@ func (m Model) accountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if s.importing {
+		var source view.ImportSource
+		switch key {
+		case "c":
+			source = view.ImportSourceClaudeCode
+		case "x":
+			source = view.ImportSourceCodex
+		default:
+			s.importing = false
+			return m, nil
+		}
+		s.importing = false
+		src := m.src
+		parent := m.ctx
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(parent, fetchTimeout)
+			defer cancel()
+			added, err := src.ImportCredentials(ctx, source)
+			if err != nil {
+				return actionMsg{fail: "import", err: err}
+			}
+			if added == 0 {
+				return actionMsg{did: "nothing new to import"}
+			}
+			return actionMsg{did: fmt.Sprintf("imported %d account(s)", added)}
+		}
+	}
+
 	switch key {
 	case "j", "down":
 		if s.sel < len(m.accounts)-1 {
@@ -143,21 +172,7 @@ func (m Model) accountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			s.confirming = true
 		}
 	case "i":
-		// Claude Code is the only source, so there is no menu to open.
-		src := m.src
-		parent := m.ctx
-		return m, func() tea.Msg {
-			ctx, cancel := context.WithTimeout(parent, fetchTimeout)
-			defer cancel()
-			added, err := src.ImportCredentials(ctx, view.ImportSourceClaudeCode)
-			if err != nil {
-				return actionMsg{fail: "import", err: err}
-			}
-			if added == 0 {
-				return actionMsg{did: "nothing new to import"}
-			}
-			return actionMsg{did: fmt.Sprintf("imported %d account(s)", added)}
-		}
+		s.importing = true
 	}
 	return m, nil
 }
@@ -180,6 +195,9 @@ func (m Model) accountsFooter() []string {
 	if m.accts.confirming {
 		return []string{"y remove", "any other key keeps it"}
 	}
+	if m.accts.importing {
+		return []string{"c from Claude Code", "x from Codex", "esc cancel"}
+	}
 	// Ordered so the footer sheds from the right when narrow: navigation
 	// hints go before the mutations do.
 	return []string{"l login", "i import", "e enable/disable", "+/- priority", "x remove", "enter detail", "j/k select"}
@@ -191,9 +209,12 @@ func (m Model) viewAccounts(h int) string {
 		body := strings.Join([]string{
 			th.bold("no accounts yet"),
 			"",
-			"  " + th.accent("l") + "  log in with Anthropic",
-			"  " + th.accent("i") + "  import credentials from Claude Code",
+			"  " + th.accent("l") + "  log in — Anthropic or ChatGPT",
+			"  " + th.accent("i") + "  import from Claude Code or Codex",
 		}, "\n")
+		if m.accts.importing {
+			body += "\n\n" + th.dim("import from:  ") + th.accent("c") + " Claude Code  " + th.accent("x") + " Codex  " + th.dim("esc cancel")
+		}
 		return overlay(body, m.width, h)
 	}
 
@@ -237,6 +258,8 @@ func (m Model) viewAccounts(h int) string {
 			b.WriteString("\n  " + th.bad("remove "+a.Label+"?") + th.dim("  its history stays in the ledger; its credential is deleted. ") +
 				th.accent("y") + th.dim(" remove · any other key keeps it") + "\n")
 		}
+	} else if m.accts.importing {
+		b.WriteString("\n  " + th.dim("import from:  ") + th.accent("c") + " Claude Code  " + th.accent("x") + " Codex  " + th.dim("esc cancel") + "\n")
 	}
 
 	if m.accts.detail {

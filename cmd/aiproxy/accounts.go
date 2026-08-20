@@ -8,11 +8,14 @@ import (
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
-// onLoginSuccess builds the anthropic.Anthropic.OnLoginSuccess hook: the
-// only place a PKCE login's exchanged credential exists after the exchange
-// (provider.LoginResult never carries one — see its doc comment), so this is
-// where it is persisted through store and applied to mgr, "persist, then
-// apply" like every other mutation.
+// onLoginSuccess builds the OnLoginSuccess hook shared by every provider's
+// Login (anthropic.Anthropic.OnLoginSuccess and openai.OpenAI.OnLoginSuccess
+// have the same signature for exactly this reason): the only place a PKCE
+// login's exchanged credential exists after the exchange (provider.LoginResult
+// never carries one — see its doc comment), so this is where it is persisted
+// through store and applied to mgr, "persist, then apply" like every other
+// mutation. providerName is stamped onto the persisted account (config.Account
+// carries no notion of "which provider built this hook" on its own).
 //
 // A re-login for an account already configured (its refresh token expired
 // and the user re-ran the login flow, or they simply logged in again by
@@ -26,10 +29,10 @@ import (
 // matched entry's Credential/Identity/Label are replaced in the store AND
 // pushed into the live Manager via UpdateCredential; mgr.Add would instead
 // create the exact duplicate this fix exists to avoid.
-func onLoginSuccess(store *config.Store, mgr *account.Manager) func(context.Context, provider.Credential, provider.Profile) error {
+func onLoginSuccess(store *config.Store, mgr *account.Manager, providerName string) func(context.Context, provider.Credential, provider.Profile) error {
 	return func(_ context.Context, cred provider.Credential, profile provider.Profile) error {
 		acc := config.Account{
-			ID: config.NewID(), Provider: "anthropic", Label: loginLabel(profile),
+			ID: config.NewID(), Provider: providerName, Label: loginLabel(profile),
 			Credential: cred,
 			Identity: config.Identity{
 				AccountUUID: profile.AccountUUID, OrgUUID: profile.OrgUUID,

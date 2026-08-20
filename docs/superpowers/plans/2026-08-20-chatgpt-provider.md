@@ -90,6 +90,13 @@ import (
 )
 
 const (
+	// CORRECTION (post-implementation): this value is WRONG and was caught by
+	// the final whole-branch review. It must be the bare host,
+	// "https://api.openai.com", because internal/proxy/attempt.go appends the
+	// client's full request path — see anthropic's DefaultBaseURL, which is
+	// bare for the same reason. With the /v1 here, every request became
+	// /v1/v1/responses and 404'd. Left in place as the historical record of
+	// what the plan said, with this note so nobody copies it back.
 	defaultAPIBase     = "https://api.openai.com/v1"
 	defaultChatGPTBase = "https://chatgpt.com/backend-api"
 	defaultIssuer      = "https://auth.openai.com"

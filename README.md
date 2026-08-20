@@ -302,9 +302,10 @@ have.
 aiproxy
 ```
 
-That starts the proxy and opens the TUI. Press `l` to log in — a browser opens
-for the OAuth flow, and if it can't reach one you can paste the authorization
-code back in. Repeat for each account you want in the rotation.
+That starts the proxy and opens the TUI. Press `l` to log in, choose a
+provider (Anthropic or ChatGPT) — a browser opens for the OAuth flow, and if
+it can't reach one you can paste the authorization code back in. Repeat for
+each account you want in the rotation, across either or both providers.
 
 Then point your agent at it:
 
@@ -321,8 +322,10 @@ preserves the model and beta headers, so the first-party hint is the accurate
 setting here.
 
 You can import an existing credential on demand from the Accounts screen with
-`i`, which reads Claude Code's own file (`~/.claude/.credentials.json`) so you
-don't have to re-authorize an account you have already logged into there.
+`i`, then a second key for the source: `c` reads Claude Code's own file
+(`~/.claude/.credentials.json`), `x` reads Codex's (`~/.codex/auth.json`) —
+see [ChatGPT accounts](#chatgpt-accounts) for the latter. Either way you don't
+have to re-authorize an account you have already logged into there.
 
 ## The TUI
 
@@ -335,9 +338,9 @@ don't have to re-authorize an account you have already logged into there.
 | `5` | Settings | edit runtime settings in place |
 
 `tab` / `shift+tab` cycle screens. `?` opens help, `q` quits (and shuts the
-proxy down with it). `l` starts a login, `p` forces a quota probe, `o`
-opens the dashboard, and `u` installs an available update (see
-[Updating](#updating)).
+proxy down with it). `l` asks which provider (`a` Anthropic, `c` ChatGPT) and
+starts that login, `p` forces a quota probe, `o` opens the dashboard, and `u`
+installs an available update (see [Updating](#updating)).
 
 Per-screen keys are shown in the footer: `space` pauses the activity feed,
 `a`/`m`/`c` filter it by account/model/outcome and `v` toggles the log view;
@@ -380,6 +383,70 @@ Note the interaction with [account selection](#which-account-gets-picked): a
 freshly warmed account has a nearly-full window five hours out, so it ranks
 *low* on expiring allowance and will not steal traffic from the account you are
 deliberately draining. Warming prepares the standby; it does not promote it.
+
+ChatGPT accounts are never warmed, even when idle and past threshold. Whether
+OpenAI's own rate-limit window is anchored to first use the same way
+Anthropic's is has not been verified, and warming a window that turns out to
+be fixed to a wall clock would just be a billable request every cycle for
+nothing.
+
+## ChatGPT accounts
+
+Codex CLI subscriptions work the same way Anthropic accounts do: log in once,
+and aiproxy rotates, tracks quota, and ranks the account alongside whatever
+else is configured.
+
+`l`, from anywhere in the TUI, now asks which provider before starting the
+OAuth flow — `a` Anthropic, `c` ChatGPT — and the ChatGPT choice is a native
+login, not a workaround: it drives the same PKCE flow and callback listener
+Anthropic's does, just against `auth.openai.com`.
+
+You can also adopt the credential Codex CLI already has, instead of logging in
+again: log in with `codex login` as usual, then from the Accounts screen press
+`i`, then `x`, to read `~/.codex/auth.json` (an `apikey`-mode file, with no
+OAuth tokens to adopt, is skipped rather than imported broken). `c` on the
+same menu still imports from Claude Code's own credential file, as before.
+
+Point Codex at the proxy by adding a provider to `~/.codex/config.toml`:
+
+```toml
+model_provider = "aiproxy"
+[model_providers.aiproxy]
+base_url = "http://127.0.0.1:3456/v1"
+wire_api = "responses"
+env_key = "AIPROXY_API_KEY"
+```
+
+`env_key` names an environment variable Codex insists on finding set, even
+though aiproxy does not enforce its own API key for loopback callers (see
+[Configuration](#configuration)) — `export AIPROXY_API_KEY=unused` before
+running Codex is enough.
+
+`GET /v1/models` is synthetic: aiproxy does not relay it anywhere. It answers
+with the union of every enabled account's own discovered catalogue —
+Anthropic's from `/v1/models`, ChatGPT's from the private
+`wham/models?client_version=...` endpoint (there is no public one an OAuth
+token has scope to call) — deduplicated by model id and shaped to satisfy
+both an Anthropic-style and an OpenAI-style parser at once, so neither client
+needs to be sniffed. `providers.openai.clientVersion` (default `"0.147.0"`,
+see [Configuration](#configuration)) is sent on that private catalogue
+request, which otherwise rejects the call outright; it is configurable
+because a server-side version gate is a plausible way for catalogue discovery
+to break between releases with no code change on this end to explain it.
+
+Routing follows what each account's own catalogue says it can reach, not a
+hardcoded table: a request naming a model gets routed only to accounts whose
+discovered catalogue actually lists it, so plan differences (a model your
+ChatGPT plan cannot see) are handled without any per-model configuration.
+
+One consequence is deliberate rather than an oversight: routing decides which
+account to use by model name alone, so a Messages-format request (the shape
+Claude Code sends) that happens to name a GPT model will still select a
+ChatGPT account — and then fail once it reaches the upstream Responses API,
+which does not speak that shape. There is no Messages↔Responses translation
+yet; Codex already speaks Responses and Claude Code already speaks Messages,
+so each is served natively by the matching vendor's account today, and
+cross-protocol routing is a separate piece of future work.
 
 ## Which account gets picked
 
@@ -471,7 +538,8 @@ that read those values are built once at startup.
   "metrics": { "retentionDays": 90 },
   "mitm": { "enabled": true },
   "update": { "checkEnabled": true, "checkIntervalHours": 24 },
-  "privacy": { "enabled": false }
+  "privacy": { "enabled": false },
+  "providers": { "openai": { "clientVersion": "0.147.0" } }
 }
 ```
 
@@ -506,6 +574,9 @@ that read those values are built once at startup.
   the checker's ticker is built once at startup. See [Updating](#updating).
 - **`privacy`** is shown collapsed above; every key in it, and the fact that all
   of them are restart-gated, is in [Privacy filter](#privacy-filter).
+- **`providers.openai.clientVersion`** is sent on every ChatGPT model-catalogue
+  read; see [ChatGPT accounts](#chatgpt-accounts) for why it exists and what
+  breaks without it.
 
 ## Flags
 

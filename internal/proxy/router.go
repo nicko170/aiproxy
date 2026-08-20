@@ -81,6 +81,10 @@ func NewRouter(o HandlerOptions) http.Handler {
 		}
 	}
 
+	// Answered locally, not relayed: the union of every account's catalogue is
+	// something no single upstream can produce.
+	r.Get("/v1/models", modelsHandler(o))
+
 	r.NotFound(proxyHandler(o))
 	r.MethodNotAllowed(proxyHandler(o))
 	return r

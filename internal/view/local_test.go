@@ -118,6 +118,9 @@ func (stubProvider) Profile(context.Context, provider.Credential) (provider.Prof
 func (stubProvider) Quota(context.Context, provider.Credential) (provider.Quota, error) {
 	return provider.Quota{}, provider.ErrUnsupported
 }
+func (stubProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
+	return nil, provider.ErrUnsupported
+}
 func (stubProvider) Login(context.Context) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }

@@ -28,4 +28,5 @@ type (
 // Import sources a front-end may pass to ImportCredentials.
 const (
 	ImportSourceClaudeCode = config.ImportSourceClaudeCode
+	ImportSourceCodex      = config.ImportSourceCodex
 )

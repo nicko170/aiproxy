@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -45,6 +46,14 @@ type fakeProvider struct {
 	refreshTo  provider.Credential
 	refreshErr error
 	refreshes  atomic.Int32
+
+	// models and modelsErr control the Models method's return value.
+	// modelCalls counts them, which is what lets a test assert that catalogue
+	// discovery ran at all — the thing that silently stopped happening whenever
+	// the quota read failed.
+	models     []provider.Model
+	modelsErr  error
+	modelCalls atomic.Int32
 }
 
 type quotaResult struct {
@@ -63,6 +72,13 @@ func (f *fakeProvider) Refresh(context.Context, provider.Credential) (provider.C
 func (f *fakeProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
 	return provider.Profile{}, provider.ErrUnsupported
 }
+func (f *fakeProvider) Models(_ context.Context, _ provider.Credential) ([]provider.Model, error) {
+	f.modelCalls.Add(1)
+	if f.modelsErr != nil {
+		return nil, f.modelsErr
+	}
+	return f.models, nil
+}
 func (f *fakeProvider) Login(context.Context) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
@@ -78,6 +94,12 @@ func (f *fakeProvider) ParseUsageBody([]byte) (*provider.UsageDelta, bool)      
 
 func (f *fakeProvider) Quota(ctx context.Context, c provider.Credential) (provider.Quota, error) {
 	f.calls.Add(1)
+	// Both real providers answer ErrUnsupported for an API key rather than
+	// relying on the caller to know they would; the prober now honours that
+	// answer instead of pre-judging it, so the fake has to give it.
+	if c.Type == provider.CredentialAPIKey {
+		return provider.Quota{}, provider.ErrUnsupported
+	}
 	if f.requireToken != "" && c.AccessToken != f.requireToken {
 		return provider.Quota{}, errors.New("usage: HTTP 401")
 	}
@@ -104,8 +126,9 @@ func (f *fakeProvider) Quota(ctx context.Context, c provider.Credential) (provid
 	return f.results[i].quota, f.results[i].err
 }
 
-func (f *fakeProvider) callCount() int    { return int(f.calls.Load()) }
-func (f *fakeProvider) refreshCount() int { return int(f.refreshes.Load()) }
+func (f *fakeProvider) callCount() int      { return int(f.calls.Load()) }
+func (f *fakeProvider) modelCallCount() int { return int(f.modelCalls.Load()) }
+func (f *fakeProvider) refreshCount() int   { return int(f.refreshes.Load()) }
 
 func oauthAcct(id string) config.Account {
 	return config.Account{
@@ -169,18 +192,90 @@ func TestProbeNowUpdatesManagerQuotaForEachOAuthAccount(t *testing.T) {
 	}
 }
 
-// API-key accounts have no usage endpoint at all; the absent case a suite
-// that only tests OAuth accounts cannot catch.
-func TestProbeNowSkipsAPIKeyAccountsWithoutCallingQuotaOrErroring(t *testing.T) {
-	fp := &fakeProvider{results: []quotaResult{quotaOK()}}
+// An API-key account has no usage endpoint, and the PROVIDER is what says so:
+// it answers ErrUnsupported, which is neither a success nor a failure and must
+// not be recorded as either — a recorded error would log the same non-event
+// every cycle forever.
+//
+// The prober no longer refuses to ask. It used to skip non-OAuth accounts
+// outright, which also skipped the catalogue read, so an API-key-only
+// deployment had a permanently empty /v1/models — even though anthropic.Models
+// authenticates perfectly well with an API key. Deciding what a credential can
+// reach belongs to the provider; the prober asks and honours the answer.
+func TestProbeNowTreatsUnsupportedQuotaAsANonEventButStillReadsModels(t *testing.T) {
+	fp := &fakeProvider{
+		results: []quotaResult{quotaOK()},
+		models:  []provider.Model{{ID: "claude-opus-5", DisplayName: "Opus"}},
+	}
 	mgr := newMgr(t, fp, apiKeyAcct("k"))
 	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
 
 	if err := p.ProbeNow(context.Background()); err != nil {
 		t.Fatalf("ProbeNow: %v", err)
 	}
-	if fp.callCount() != 0 {
-		t.Errorf("callCount = %d, want 0: an API-key account has no usage endpoint", fp.callCount())
+	if got := p.Status().Accounts["k"].LastError; got != "" {
+		t.Errorf("LastError = %q, want empty: ErrUnsupported is not a probe failure", got)
+	}
+	if got := p.Status().Accounts["k"].LastSuccessAt; got != 0 {
+		t.Errorf("LastSuccessAt = %d, want 0: nothing was read, so nothing succeeded", got)
+	}
+	if fp.modelCallCount() != 1 {
+		t.Fatalf("Models calls = %d, want 1: an API key can still have a catalogue", fp.modelCallCount())
+	}
+	a, _ := mgr.Get("k")
+	if len(a.Models) != 1 || a.Models[0].ID != "claude-opus-5" {
+		t.Errorf("catalogue = %+v, want the discovered model", a.Models)
+	}
+}
+
+// IMPORTANT 5. A failing quota read used to `continue` before Models was ever
+// called, so once wham/usage started failing — which spec §10 anticipates, it
+// is a private endpoint — the catalogue was never refreshed again even though
+// wham/models was healthy. An empty catalogue also silently disables
+// account.servesModel filtering, since "unknown" has to mean "serves anything".
+func TestProbeNowReadsModelsEvenWhenTheQuotaReadFails(t *testing.T) {
+	fp := &fakeProvider{
+		results: []quotaResult{quotaThrottled()},
+		models:  []provider.Model{{ID: "gpt-5-codex", DisplayName: "Codex"}},
+	}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err == nil {
+		t.Fatal("want the throttled quota read to still be reported as the cycle's error")
+	}
+	if fp.modelCallCount() != 1 {
+		t.Fatalf("Models calls = %d, want 1: the catalogue read must not depend on the quota read", fp.modelCallCount())
+	}
+	a, _ := mgr.Get("a")
+	if len(a.Models) != 1 || a.Models[0].ID != "gpt-5-codex" {
+		t.Errorf("catalogue = %+v, want the discovered model despite the quota failure", a.Models)
+	}
+}
+
+// A failing catalogue read must not be mistaken for a failing quota read: it is
+// not recorded as the account's probe error and must not arm the quota backoff.
+func TestProbeNowKeepsAModelsFailureOutOfTheQuotaBackoff(t *testing.T) {
+	fp := &fakeProvider{
+		results:   []quotaResult{quotaOK(provider.QuotaBucket{Name: "5h", Utilization: 0.2})},
+		modelsErr: errors.New("models: HTTP 500"),
+	}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour, WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	st := p.Status().Accounts["a"]
+	if st.LastError != "" {
+		t.Errorf("LastError = %q, want empty: the quota read succeeded", st.LastError)
+	}
+	if st.NextAttemptAt != 0 {
+		t.Errorf("NextAttemptAt = %d, want 0: a models failure must not arm the quota backoff", st.NextAttemptAt)
+	}
+	a, _ := mgr.Get("a")
+	if a.Buckets["5h"].Utilization != 0.2 {
+		t.Errorf("Buckets = %+v, want the successful quota read preserved", a.Buckets)
 	}
 }
 
@@ -647,5 +742,34 @@ func TestProbeRecordsARefreshFailureWithoutCallingQuota(t *testing.T) {
 	st := p.Status().Accounts["a"]
 	if !strings.Contains(st.LastError, "refresh") {
 		t.Errorf("LastError = %q, want it to name the refresh failure", st.LastError)
+	}
+}
+
+// The catalogue is read on the same cycle as quota: both are per-account facts
+// that go stale, and both are read from the same credential we just renewed.
+func TestProbeRefreshesTheModelCatalogue(t *testing.T) {
+	fp := &fakeProvider{
+		results: []quotaResult{quotaOK()},
+		models:  []provider.Model{{ID: "gpt-5.6-sol"}},
+	}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if got := mgr.All()[0].Models; len(got) != 1 || got[0].ID != "gpt-5.6-sol" {
+		t.Errorf("models = %+v, want the discovered catalogue", got)
+	}
+}
+
+// A provider with no catalogue endpoint must not make the cycle look failed.
+func TestProbeToleratesUnsupportedModels(t *testing.T) {
+	fp := &fakeProvider{results: []quotaResult{quotaOK()}, modelsErr: provider.ErrUnsupported}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Errorf("ProbeNow: %v; an unsupported catalogue is not a probe failure", err)
 	}
 }

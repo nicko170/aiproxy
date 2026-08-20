@@ -24,7 +24,7 @@ func TestOnLoginSuccessAddsANewAccountButDedupesARelogin(t *testing.T) {
 		Persist:         func(string, provider.Credential) error { return nil },
 	})
 
-	hook := onLoginSuccess(store, mgr)
+	hook := onLoginSuccess(store, mgr, "anthropic")
 
 	profile1 := provider.Profile{
 		Email: "a@example.com", OrgName: "Acme", AccountUUID: "uuid-1", OrgUUID: "org-1", Plan: "pro",

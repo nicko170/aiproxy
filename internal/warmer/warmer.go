@@ -258,6 +258,13 @@ func (w *Warmer) usable(a account.Account) bool {
 	if a.Credential.Type != provider.CredentialOAuth {
 		return false
 	}
+	// Warming assumes a window that starts on first use, which is confirmed for
+	// Anthropic and unverified for OpenAI. Until it is established, a ChatGPT
+	// account is not warmed: the cost of being wrong is a billable request
+	// every cycle that buys nothing.
+	if a.Provider != "anthropic" {
+		return false
+	}
 	p := w.providers[a.Provider]
 	return p != nil
 }

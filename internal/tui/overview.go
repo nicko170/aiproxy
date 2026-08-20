@@ -154,10 +154,10 @@ func (m Model) viewNoAccounts(h int) string {
 	body := strings.Join([]string{
 		th.bold("no accounts yet"),
 		"",
-		"aiproxy rotates requests across Anthropic accounts as each",
+		"aiproxy rotates requests across accounts as each",
 		"one's quota burns down. Add the first account:",
 		"",
-		"  " + th.accent("l") + "  log in with Anthropic",
+		"  " + th.accent("l") + "  log in — Anthropic or ChatGPT",
 		"  " + th.accent("4") + "  open accounts to import from Claude Code",
 		"",
 		th.dim("then export both before starting Claude Code:"),

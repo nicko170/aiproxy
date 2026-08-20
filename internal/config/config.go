@@ -194,6 +194,19 @@ type Privacy struct {
 	NER                     PrivacyNER   `json:"ner"`
 }
 
+// Providers holds per-provider settings that are not per-account.
+type Providers struct {
+	OpenAI OpenAIProvider `json:"openai"`
+}
+
+// OpenAIProvider configures the ChatGPT provider. ClientVersion is sent to the
+// private model-catalogue endpoint, which rejects a request without one; it is
+// configurable because a server-side version gate is a plausible way for
+// catalogue discovery to break between releases.
+type OpenAIProvider struct {
+	ClientVersion string `json:"clientVersion"`
+}
+
 type Config struct {
 	Listen     Listen     `json:"listen"`
 	Accounts   []Account  `json:"accounts"`
@@ -205,6 +218,7 @@ type Config struct {
 	MITM       MITM       `json:"mitm"`
 	Update     Update     `json:"update"`
 	Privacy    Privacy    `json:"privacy"`
+	Providers  Providers  `json:"providers"`
 }
 
 // Default returns the configuration for a fresh install.
@@ -238,6 +252,7 @@ func Default() Config {
 			CacheEntries:            50000,
 			NER:                     PrivacyNER{Enabled: false, Labels: []string{}, MaxScanBytes: 4096},
 		},
+		Providers: Providers{OpenAI: OpenAIProvider{ClientVersion: "0.147.0"}},
 	}
 }
 
