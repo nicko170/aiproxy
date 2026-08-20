@@ -204,6 +204,16 @@ type UsageDelta struct {
 	StartsMessage bool
 }
 
+// Model is one model an account can reach. Discovered per account rather than
+// configured, because access varies by plan: two accounts on the same provider
+// routinely differ, and a static table would have to be maintained against
+// every plan change.
+type Model struct {
+	ID            string
+	DisplayName   string
+	ContextWindow int
+}
+
 // Account is the subset of account state a provider needs. Defined here rather
 // than imported from internal/account so providers do not depend on the
 // registry.
@@ -274,6 +284,10 @@ type Provider interface {
 	Refresh(ctx context.Context, c Credential) (Credential, error)
 	Profile(ctx context.Context, c Credential) (Profile, error)
 	Quota(ctx context.Context, c Credential) (Quota, error)
+	// Models lists what this credential can reach. A provider with no
+	// discovery endpoint returns ErrUnsupported, which callers treat as
+	// "unknown", never as "none".
+	Models(ctx context.Context, c Credential) ([]Model, error)
 	// Login starts a PKCE OAuth flow: a loopback callback listener on an
 	// ephemeral port, and an authorize URL carrying its challenge (spec
 	// §6.1). It returns immediately; the flow completes asynchronously on

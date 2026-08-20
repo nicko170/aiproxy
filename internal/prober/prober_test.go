@@ -63,6 +63,9 @@ func (f *fakeProvider) Refresh(context.Context, provider.Credential) (provider.C
 func (f *fakeProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
 	return provider.Profile{}, provider.ErrUnsupported
 }
+func (f *fakeProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
+	return nil, provider.ErrUnsupported
+}
 func (f *fakeProvider) Login(context.Context) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
