@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -158,9 +159,23 @@ type Request struct {
 type Result struct {
 	Status    int
 	AccountID string
-	Outcome   provider.OutcomeKind
-	Attempts  int
-	Rotated   bool
+	// Provider is the name of the provider that served the request — the
+	// account's, read from the account actually selected, not a constant.
+	//
+	// It is on Result rather than re-derived by the caller because the caller
+	// cannot: OnResult receives a Request and a Result and has no account
+	// registry to look the ID up in. Without this field cmd/aiproxy stamped
+	// every metrics sample "anthropic", so every ChatGPT request was persisted
+	// under the wrong provider for the whole retention window, and any
+	// per-provider breakdown read as a single-provider deployment.
+	//
+	// Empty when no account was ever selected (an admission failure, or no
+	// account ready) — there is then no provider to name, and naming one would
+	// attribute a request to an upstream that was never contacted.
+	Provider string
+	Outcome  provider.OutcomeKind
+	Attempts int
+	Rotated  bool
 	// StartedAt is unix ms when Do began, stamped once at the top of the loop.
 	StartedAt int64
 	// DurationMS is the whole request's wall-clock time, set in the same
@@ -299,6 +314,11 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			return res
 		}
 		res.AccountID = acct.ID
+		// Stamped with the account, not at the end: a rotation onto a different
+		// provider must leave this naming whichever one the LAST attempt used,
+		// and a request that dies mid-loop must still report the provider it
+		// last reached rather than the empty string.
+		res.Provider = acct.Provider
 
 		prov := a.providers[acct.Provider]
 		if prov == nil {
@@ -630,6 +650,23 @@ func (c *cancelOnCloseBody) Close() error {
 	return err
 }
 
+// upstreamTarget joins a provider's base URL to the CLIENT's request URI.
+//
+// The convention is append, not resolve: path is whatever the client asked for,
+// version prefix and query string included, and the base contributes scheme,
+// host, and any gateway prefix an operator put in front of it. A provider's base
+// must therefore NOT repeat a prefix the client path already carries — a base of
+// "https://api.example.com/v1" turns POST /v1/responses into /v1/v1/responses,
+// which 404s on every single request.
+//
+// It is a named function, and the one the seam's tests assert through, precisely
+// because that mistake shipped: the provider's own test asserted its constant
+// against itself, this package's tests only ever ran the join against a bare
+// httptest URL, and the pair between them was never exercised at all.
+func upstreamTarget(base *url.URL, path string) string {
+	return strings.TrimSuffix(base.String(), "/") + path
+}
+
 // send builds and performs one upstream attempt. acct is taken by value: see the
 // note in Do about why the manager never hands out a pointer.
 func (a *Attempter) send(ctx context.Context, prov provider.Provider, acct account.Account, req Request) (*http.Response, error) {
@@ -639,7 +676,7 @@ func (a *Attempter) send(ctx context.Context, prov provider.Provider, acct accou
 		return nil, err
 	}
 
-	target := strings.TrimSuffix(prov.Endpoint(pa).String(), "/") + req.Path
+	target := upstreamTarget(prov.Endpoint(pa), req.Path)
 
 	var reader io.Reader
 	if len(body) > 0 && req.Method != http.MethodGet && req.Method != http.MethodHead {

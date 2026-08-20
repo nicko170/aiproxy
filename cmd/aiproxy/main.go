@@ -460,7 +460,8 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		Privacy:             pf,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
-				"model", req.Model, "account", res.AccountID, "status", res.Status,
+				"model", req.Model, "account", res.AccountID,
+				"provider", res.Provider, "status", res.Status,
 				"outcome", res.Outcome.String(), "attempts", res.Attempts,
 				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
 				"in", res.InputTokens, "out", res.OutputTokens,
@@ -469,7 +470,12 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			ing.Record(metrics.Sample{
 				StartedAt: res.StartedAt, DurationMS: res.DurationMS,
 				TTFBMS: res.TTFBMS, WaitMS: res.WaitMS,
-				AccountID: res.AccountID, Provider: "anthropic",
+				// The provider the request was ACTUALLY served by, carried on
+				// Result from the selected account. This was hardcoded
+				// "anthropic" because Result had no provider to read, so every
+				// ChatGPT request was persisted under the wrong provider for
+				// the whole retention window.
+				AccountID: res.AccountID, Provider: res.Provider,
 				Model: req.Model, SessionID: req.SessionID,
 				Endpoint: endpointOf(req.Path), Status: res.Status,
 				Outcome: res.Outcome.String(), Stream: res.Stream,

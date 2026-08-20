@@ -348,3 +348,87 @@ SELECT outcome, status, stream, started_at, ttfb_ms FROM requests ORDER BY id DE
 		t.Errorf("TTFB p50 = %d over a window whose only row produced no first byte, want 0 (excluded)", lat.TTFBP50)
 	}
 }
+
+// IMPORTANT 3 from the final branch review: the Provider column was hardcoded
+// "anthropic" here, so a ChatGPT request was persisted under an upstream it
+// never touched — for the whole retention window, and invisibly, since nothing
+// asserted the column. This drives a real ChatGPT request through the real
+// wiring and reads the column back.
+func TestChatGPTRequestIsPersistedUnderItsOwnProvider(t *testing.T) {
+	up := testutil.NewFakeUpstream(t, testutil.Script{
+		Status: 200,
+		Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		SSE: []testutil.SSEChunk{
+			{Data: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":" +
+				"{\"usage\":{\"input_tokens\":64,\"output_tokens\":9}}}\n\n"},
+		},
+	})
+
+	dir := t.TempDir()
+	store := config.NewStore(filepath.Join(dir, "config.json"))
+	cfg, err := store.Update(func(c *config.Config) error {
+		c.Accounts = []config.Account{{
+			// Upstream is BARE, the convention the core's join requires.
+			ID: "o1", Provider: "openai", Label: "codex", Upstream: up.URL(),
+			Credential: provider.Credential{
+				Type: provider.CredentialOAuth, AccessToken: "at", RefreshToken: "rt",
+				ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), AccountID: "acct_wiring",
+			},
+		}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := metrics.Open(filepath.Join(dir, "metrics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ing := metrics.NewIngester(db, metrics.IngestOptions{})
+	defer ing.Close()
+
+	h, _, _, _, _, err := buildHandler(cfg, store, quiet(), ing)
+	if err != nil {
+		t.Fatalf("buildHandler: %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	res, err := http.Post(srv.URL+"/v1/responses", "application/json",
+		strings.NewReader(`{"model":"gpt-5-codex","stream":true,"input":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, res.Body)
+	res.Body.Close()
+
+	if err := ing.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	var prov, account string
+	var in, out int64
+	err = db.DB().QueryRow(
+		`SELECT provider, account_id, input_tokens, output_tokens FROM requests ORDER BY id DESC LIMIT 1`).
+		Scan(&prov, &account, &in, &out)
+	if err != nil {
+		t.Fatalf("no row was written: %v", err)
+	}
+	if prov != "openai" {
+		t.Errorf("provider = %q, want openai", prov)
+	}
+	if account != "o1" {
+		t.Errorf("account_id = %q, want o1", account)
+	}
+	// And the same row proves the streamed usage survived the whole path.
+	if in != 64 || out != 9 {
+		t.Errorf("tokens = %d/%d, want 64/9", in, out)
+	}
+	// The upstream must have been asked for exactly what the client asked for.
+	seen := up.Requests()
+	if len(seen) != 1 || seen[0].Path != "/v1/responses" {
+		t.Errorf("upstream requests = %+v, want one at /v1/responses", seen)
+	}
+}

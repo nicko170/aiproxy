@@ -12,13 +12,21 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/provider"
 )
 
 const (
-	defaultAPIBase     = "https://api.openai.com/v1"
+	// defaultAPIBase is deliberately BARE — no /v1 — because the core appends
+	// the client's own request URI to it rather than resolving against it
+	// (proxy.upstreamTarget, called from Attempter.send). The client already
+	// sends POST /v1/responses, so a base ending in /v1 produces
+	// /v1/v1/responses and every single ChatGPT request 404s.
+	// anthropic.DefaultBaseURL is bare for the identical reason; the two
+	// providers must not diverge on this, and openai_test.go pins it.
+	defaultAPIBase     = "https://api.openai.com"
 	defaultChatGPTBase = "https://chatgpt.com/backend-api"
 	defaultIssuer      = "https://auth.openai.com"
 
@@ -186,15 +194,40 @@ func (u *responsesUsage) delta() *provider.UsageDelta {
 // once, at the end, rather than accumulating per delta — so every other event
 // must report !ok. Returning a zero delta for them would be indistinguishable
 // from a genuinely free request.
+//
+// The argument is a whole SSE event BLOCK, not a JSON document: proxy's relay
+// splits the stream on the blank-line terminator and hands over everything
+// between, which for the Responses API is
+//
+//	event: response.completed
+//	data: {"type":"response.completed","response":{"usage":{...}}}
+//
+// So the frame has to be stripped before unmarshalling, exactly as
+// anthropic.ParseUsage does. json.Unmarshalling the raw block instead is a
+// syntax error on every real event — the whole streamed path then reports no
+// usage at all, and since the Responses API streams by default that is every
+// Codex request recorded as free. A test that feeds bare unframed JSON cannot
+// see it; openai_test.go now feeds the framing.
+//
+// Every data: line in the block is tried, and the first that yields usage wins.
+// A single event may legally be split across multiple data: lines, and a block
+// carrying an id: or retry: line alongside data: is normal SSE.
 func (o *OpenAI) ParseUsage(sseEvent []byte) (*provider.UsageDelta, bool) {
-	var env usageEnvelope
-	if err := json.Unmarshal(sseEvent, &env); err != nil {
-		return nil, false
+	for _, line := range strings.Split(string(sseEvent), "\n") {
+		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
+		if !ok {
+			continue
+		}
+		var env usageEnvelope
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &env); err != nil {
+			continue
+		}
+		if env.Type != "response.completed" || env.Response == nil || env.Response.Usage == nil {
+			continue
+		}
+		return env.Response.Usage.delta(), true
 	}
-	if env.Type != "response.completed" || env.Response == nil || env.Response.Usage == nil {
-		return nil, false
-	}
-	return env.Response.Usage.delta(), true
+	return nil, false
 }
 
 func (o *OpenAI) ParseUsageBody(body []byte) (*provider.UsageDelta, bool) {

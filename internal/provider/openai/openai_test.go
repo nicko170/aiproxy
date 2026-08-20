@@ -14,15 +14,36 @@ func TestNameIsOpenAI(t *testing.T) {
 	}
 }
 
+// The default base must be BARE. The proxy core appends the client's own
+// request URI to whatever Endpoint returns (proxy.upstreamTarget, called from
+// Attempter.send); the client already sends POST /v1/responses, so a base
+// ending in /v1 makes every request /v1/v1/responses and nothing works.
+//
+// The equality check alone is what let the doubled base ship: it asserted the
+// constant against a copy of itself, which is true no matter what the constant
+// says. So the join the core performs is reproduced here as well, and a base
+// carrying the version prefix fails on the second assertion even if someone
+// updates the first one to match. internal/proxy's
+// TestOpenAIDefaultBaseJoinsToTheResponsesPath asserts the same thing through
+// the core's real function, which is the check that cannot drift.
+func TestDefaultEndpointOmitsTheVersionPrefix(t *testing.T) {
+	o := New(http.DefaultClient)
+	base := o.Endpoint(provider.Account{}).String()
+	if base != "https://api.openai.com" {
+		t.Errorf("default endpoint = %q, want https://api.openai.com (bare, no /v1)", base)
+	}
+	// The core's join, reproduced: base + the client's full request URI.
+	if got := strings.TrimSuffix(base, "/") + "/v1/responses"; got != "https://api.openai.com/v1/responses" {
+		t.Errorf("client POST /v1/responses would reach %q; the base must not repeat /v1", got)
+	}
+}
+
 // The account's Upstream override wins so a test (and an operator behind a
 // gateway) can point one account somewhere else without touching the others.
 func TestEndpointPrefersTheAccountOverride(t *testing.T) {
 	o := New(http.DefaultClient)
-	if got := o.Endpoint(provider.Account{}).String(); got != "https://api.openai.com/v1" {
-		t.Errorf("default endpoint = %q", got)
-	}
-	got := o.Endpoint(provider.Account{Upstream: "http://127.0.0.1:9/v1"}).String()
-	if got != "http://127.0.0.1:9/v1" {
+	got := o.Endpoint(provider.Account{Upstream: "http://127.0.0.1:9"}).String()
+	if got != "http://127.0.0.1:9" {
 		t.Errorf("override endpoint = %q", got)
 	}
 }
@@ -45,12 +66,19 @@ func TestAuthorizeSetsBearerAndClearsForeignAuth(t *testing.T) {
 }
 
 // Usage arrives on the terminal response.completed SSE event, not per-delta.
-func TestParseUsageReadsResponseCompleted(t *testing.T) {
+//
+// Fed a REAL SSE event block — the "event: <name>\ndata: {...}" pair the proxy's
+// relay actually splits out of the stream and hands over — and not bare JSON.
+// The earlier version of this test passed a naked JSON document, so it kept
+// passing against a ParseUsage that json.Unmarshalled the frame and failed on
+// every genuine event: all streamed ChatGPT accounting read zero.
+func TestParseUsageReadsAFramedResponseCompletedEvent(t *testing.T) {
 	o := New(http.DefaultClient)
-	ev := []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":7,"input_tokens_details":{"cached_tokens":4}}}}`)
+	ev := []byte("event: response.completed\n" +
+		`data: {"type":"response.completed","response":{"usage":{"input_tokens":11,"output_tokens":7,"input_tokens_details":{"cached_tokens":4}}}}`)
 	got, ok := o.ParseUsage(ev)
 	if !ok {
-		t.Fatal("ParseUsage returned !ok for a response.completed event")
+		t.Fatal("ParseUsage returned !ok for a framed response.completed event")
 	}
 	if got.InputTokens != 11 || got.OutputTokens != 7 || got.CacheReadTokens != 4 {
 		t.Errorf("usage = %+v, want in=11 out=7 cacheRead=4", got)
@@ -59,10 +87,20 @@ func TestParseUsageReadsResponseCompleted(t *testing.T) {
 
 // Anything that is not the terminal event carries no usage, and reporting a
 // zero delta as if it were real is how token accounting silently reads free.
-func TestParseUsageIgnoresOtherEvents(t *testing.T) {
+// Framed, for the same reason as above.
+func TestParseUsageIgnoresANonTerminalEvent(t *testing.T) {
 	o := New(http.DefaultClient)
-	if _, ok := o.ParseUsage([]byte(`{"type":"response.output_text.delta","delta":"hi"}`)); ok {
+	ev := []byte("event: response.output_text.delta\n" +
+		`data: {"type":"response.output_text.delta","delta":"hi"}`)
+	if _, ok := o.ParseUsage(ev); ok {
 		t.Error("a text delta must not report usage")
+	}
+	// Neither may the frame alone, nor a comment-only keep-alive block.
+	if _, ok := o.ParseUsage([]byte("event: response.completed")); ok {
+		t.Error("an event line with no data must not report usage")
+	}
+	if _, ok := o.ParseUsage([]byte(": keep-alive")); ok {
+		t.Error("an SSE comment must not report usage")
 	}
 }
 
