@@ -50,6 +50,11 @@ type Credential struct {
 	RefreshToken string         `json:"refreshToken,omitempty"`
 	APIKey       string         `json:"apiKey,omitempty"`
 	ExpiresAt    int64          `json:"expiresAt,omitempty"` // unix ms
+	// AccountID is the provider-side account this credential belongs to, when
+	// the provider needs it on the wire. ChatGPT requires it as the
+	// chatgpt-account-id header on every Responses call; Anthropic has no
+	// equivalent and leaves this empty.
+	AccountID string `json:"accountId,omitempty"`
 }
 
 // Profile identifies who a credential belongs to.

@@ -89,3 +89,12 @@ func TestRewriteBodyAppliesTheAccountModelMap(t *testing.T) {
 		t.Errorf("body = %s, want the rest of the body preserved", got)
 	}
 }
+
+func TestAuthorizeSetsTheAccountHeader(t *testing.T) {
+	o := New(http.DefaultClient)
+	r, _ := http.NewRequest("POST", "http://x/v1/responses", nil)
+	o.Authorize(r, provider.Credential{Type: provider.CredentialOAuth, AccessToken: "at", AccountID: "acc-1"})
+	if got := r.Header.Get("chatgpt-account-id"); got != "acc-1" {
+		t.Errorf("chatgpt-account-id = %q", got)
+	}
+}

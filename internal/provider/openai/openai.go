@@ -106,6 +106,9 @@ func (o *OpenAI) Authorize(r *http.Request, c provider.Credential) {
 		r.Header.Set("Authorization", "Bearer "+c.AccessToken)
 	}
 	r.Header.Set("originator", originator)
+	if c.AccountID != "" {
+		r.Header.Set("chatgpt-account-id", c.AccountID)
+	}
 }
 
 // RewriteBody applies the account's model map. Only the "model" key is decoded;
