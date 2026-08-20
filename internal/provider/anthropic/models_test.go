@@ -15,6 +15,12 @@ func TestModelsReadsTheAnthropicList(t *testing.T) {
 		if r.URL.Path != "/v1/models" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
+		// The live endpoint refuses without this with "anthropic-version:
+		// header is required", which is exactly how every Anthropic account
+		// came to report an empty catalogue.
+		if got := r.Header.Get("anthropic-version"); got == "" {
+			t.Error("anthropic-version header missing; /v1/models rejects the request without it")
+		}
 		w.Header().Set("content-type", "application/json")
 		io.WriteString(w, `{"data":[
 		  {"type":"model","id":"claude-opus-5","display_name":"Claude Opus 5","max_input_tokens":1000000},

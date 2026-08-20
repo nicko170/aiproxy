@@ -79,7 +79,14 @@ func (m Model) viewOverview(h int) string {
 				m.th.gauge(gw, u, m.settings.current.SwitchThreshold, text) + "\n")
 		}
 		if len(a.Buckets) == 0 {
-			b.WriteString("  " + th.dim("no quota reading yet — press p to probe now") + "\n")
+			// Distinguish "never read" from "read, and upstream named no
+			// window". Telling someone to press p when a probe has already
+			// succeeded sends them to do the one thing that will not help.
+			msg := "no quota reading yet — press p to probe now"
+			if ps, ok := m.status.Probe.Accounts[a.ID]; ok && ps.LastSuccessAt > 0 {
+				msg = "probed, but no limit window reported yet"
+			}
+			b.WriteString("  " + th.dim(msg) + "\n")
 		}
 
 		if showSparklines(m.width) {
