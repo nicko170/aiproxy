@@ -6,6 +6,8 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"time"
@@ -90,4 +92,96 @@ func (o *OpenAI) Endpoint(a provider.Account) *url.URL {
 		u, _ = url.Parse(defaultAPIBase)
 	}
 	return u
+}
+
+func (o *OpenAI) Authorize(r *http.Request, c provider.Credential) {
+	// Cleared, not overwritten: a client may have sent its own credentials to
+	// the proxy and they must never travel upstream.
+	r.Header.Del("Authorization")
+	r.Header.Del("x-api-key")
+	switch c.Type {
+	case provider.CredentialAPIKey:
+		r.Header.Set("Authorization", "Bearer "+c.APIKey)
+	default:
+		r.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	}
+	r.Header.Set("originator", originator)
+}
+
+// RewriteBody applies the account's model map. Only the "model" key is decoded;
+// everything else stays raw bytes, so a large input array is never re-encoded.
+func (o *OpenAI) RewriteBody(body []byte, a provider.Account) ([]byte, error) {
+	if len(a.ModelMap) == 0 || len(bytes.TrimSpace(body)) == 0 {
+		return body, nil
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		return body, nil // not a JSON object: pass through untouched
+	}
+	raw, ok := top["model"]
+	if !ok {
+		return body, nil
+	}
+	var model string
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return body, nil
+	}
+	mapped, ok := a.ModelMap[model]
+	if !ok || mapped == model {
+		return body, nil
+	}
+	next, err := json.Marshal(mapped)
+	if err != nil {
+		return body, nil
+	}
+	top["model"] = next
+	return json.Marshal(top)
+}
+
+type usageEnvelope struct {
+	Type     string `json:"type"`
+	Response *struct {
+		Usage *responsesUsage `json:"usage"`
+	} `json:"response"`
+}
+
+type responsesUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	InputDetails *struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"input_tokens_details"`
+}
+
+func (u *responsesUsage) delta() *provider.UsageDelta {
+	d := &provider.UsageDelta{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
+	if u.InputDetails != nil {
+		d.CacheReadTokens = u.InputDetails.CachedTokens
+	}
+	return d
+}
+
+// ParseUsage reads the terminal response.completed event. Usage is reported
+// once, at the end, rather than accumulating per delta — so every other event
+// must report !ok. Returning a zero delta for them would be indistinguishable
+// from a genuinely free request.
+func (o *OpenAI) ParseUsage(sseEvent []byte) (*provider.UsageDelta, bool) {
+	var env usageEnvelope
+	if err := json.Unmarshal(sseEvent, &env); err != nil {
+		return nil, false
+	}
+	if env.Type != "response.completed" || env.Response == nil || env.Response.Usage == nil {
+		return nil, false
+	}
+	return env.Response.Usage.delta(), true
+}
+
+func (o *OpenAI) ParseUsageBody(body []byte) (*provider.UsageDelta, bool) {
+	var top struct {
+		Usage *responsesUsage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &top); err != nil || top.Usage == nil {
+		return nil, false
+	}
+	return top.Usage.delta(), true
 }
