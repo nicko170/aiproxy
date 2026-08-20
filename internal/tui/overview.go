@@ -1,7 +1,10 @@
 package tui
 
 import (
+	"context"
+
 	"fmt"
+	tea "github.com/charmbracelet/bubbletea"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -56,11 +59,22 @@ func (m Model) viewOverview(h int) string {
 		if m.width < 90 {
 			partic = ""
 		}
-		labelMax := m.width - lipgloss.Width(right) - len(partic) - 2
+		// The cursor and the forced marker are separate things and must look
+		// separate: one is where you are pointing, the other is what is
+		// actually overriding the router right now.
+		cursor := "  "
+		if i == m.overview.sel {
+			cursor = th.accent("▸ ")
+		}
+		forced := ""
+		if m.status.PinnedAccountID == a.ID {
+			forced = th.warn(" ⇥ forced")
+		}
+		labelMax := m.width - lipgloss.Width(right) - len(partic) - lipgloss.Width(forced) - 4
 		if labelMax < 12 {
 			labelMax = 12
 		}
-		left := th.identity(a.ID, th.bold(truncate(a.Label, labelMax))) + th.dim(partic)
+		left := cursor + th.identity(a.ID, th.bold(truncate(a.Label, labelMax))) + th.dim(partic) + forced
 		b.WriteString(spread(left, right, m.width) + "\n")
 
 		if a.LastError != "" && a.Status != "active" {
@@ -183,4 +197,53 @@ func spread(left, right string, width int) string {
 		gap = 1
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// overviewState is the forced-override cursor. It exists only on this screen:
+// the Accounts screen has its own selection for a different purpose, and
+// sharing one would make j/k mean two things depending on where you came from.
+type overviewState struct {
+	sel int // index into m.accounts
+}
+
+// overviewKey drives the forced-account override.
+//
+// Arrow keys move a cursor and f pins the account under it, so the whole
+// interaction is "point at the one you want, say use that one". f on the
+// account already pinned clears the override, which makes the same key the way
+// out as well as the way in — there is no separate unpin to remember.
+func (m Model) overviewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := &m.overview
+	switch msg.String() {
+	case "j", "down":
+		if s.sel < len(m.accounts)-1 {
+			s.sel++
+		}
+	case "k", "up":
+		if s.sel > 0 {
+			s.sel--
+		}
+	case "f":
+		if s.sel >= len(m.accounts) {
+			return m, nil
+		}
+		a := m.accounts[s.sel]
+		target := a.ID
+		verb := "forced all traffic to " + a.Label
+		if m.status.PinnedAccountID == a.ID {
+			target = "" // f on the pinned account is how you release it
+			verb = "released the forced account"
+		}
+		src := m.src
+		parent := m.ctx
+		return m, func() tea.Msg {
+			ctx, cancel := context.WithTimeout(parent, fetchTimeout)
+			defer cancel()
+			if err := src.PinAccount(ctx, target); err != nil {
+				return actionMsg{fail: "force", err: err}
+			}
+			return actionMsg{did: verb}
+		}
+	}
+	return m, nil
 }

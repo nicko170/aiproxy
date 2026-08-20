@@ -2,6 +2,7 @@ package account
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -86,6 +87,11 @@ func (m *Manager) Select(req SelectRequest) (Account, error) {
 	defer m.mu.Unlock()
 
 	nowMS := m.opts.Now().UnixMilli()
+
+	// The operator override comes first: ahead of affinity, ahead of ranking.
+	if a := m.pinnedChoiceLocked(req, nowMS); a != nil {
+		return copyAccount(a), nil
+	}
 
 	if m.opts.SessionAffinity && req.SessionID != "" {
 		if id, ok := m.affinity[req.SessionID]; ok {
@@ -249,4 +255,94 @@ func windowHours(name string) float64 {
 		return float64(n) * 24 * 7
 	}
 	return 1
+}
+
+// Pin forces every request onto one account, ahead of session affinity and the
+// ranking. It is the operator saying "use this one now", so it outranks rules
+// that exist to make a good automatic choice.
+//
+// It does NOT outrank eligibility. An account cannot serve a model it lacks, or
+// answer while rate-limited, and pretending otherwise would turn an override
+// into an outage. What the pin overrides is preference, not possibility.
+func (m *Manager) Pin(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.byID[id] == nil {
+		return fmt.Errorf("unknown account %q", id)
+	}
+	m.pinned = id
+	return nil
+}
+
+// Unpin restores normal routing.
+func (m *Manager) Unpin() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pinned = ""
+}
+
+// Pinned reports the forced account, or "" when routing is normal.
+func (m *Manager) Pinned() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pinned
+}
+
+// pinnedChoiceLocked resolves the override for one request. It returns the
+// account to use, or nil to fall through to normal routing, and clears a pin
+// that has served its purpose.
+//
+// The distinction that matters here is between "cannot serve THIS request" and
+// "is finished". Only the second ends the override:
+//
+//   - Ineligible — a model it lacks, a transient rate-limit hold, or already in
+//     Exclude because the retry loop just failed on it. Rotate, but KEEP the
+//     pin: all three resolve on their own, and cancelling an operator's
+//     override because one unrelated request named the wrong model, or because
+//     a single 401 arrived, would make the feature untrustworthy.
+//   - Exhausted — see pinExhaustedLocked. The pin is one-shot, so this is where
+//     it ends.
+//
+// Exclusion needs no branch of its own: eligibleLocked already rejects an
+// excluded account, and an account that is both excluded and genuinely spent
+// should still end the pin. An explicit early return here would have preserved
+// a pin on a spent account purely because this request had already tried it.
+func (m *Manager) pinnedChoiceLocked(req SelectRequest, nowMS int64) *Account {
+	if m.pinned == "" {
+		return nil
+	}
+	a := m.byID[m.pinned]
+	if a == nil {
+		m.pinned = "" // removed from the config entirely
+		return nil
+	}
+	if m.eligibleLocked(a, req, nowMS) {
+		return a
+	}
+	if m.pinExhaustedLocked(a, nowMS) {
+		m.pinned = ""
+	}
+	return nil
+}
+
+// pinExhaustedLocked reports whether a pinned account is finished rather than
+// merely unavailable for one request.
+//
+// Only ACCOUNT-WIDE quota counts. A model-scoped window can be spent while the
+// account still serves everything else, and ending an override set for general
+// traffic because one model family ran out would be surprising. Disabled and
+// errored also count, since neither recovers without someone intervening.
+func (m *Manager) pinExhaustedLocked(a *Account, nowMS int64) bool {
+	if a.Disabled || a.Status == StatusErrored {
+		return true
+	}
+	for name, b := range a.Buckets {
+		if _, scoped := cutModelScope(name); scoped {
+			continue
+		}
+		if b.Status == "rejected" || b.Utilization >= m.opts.SwitchThreshold {
+			return true
+		}
+	}
+	return false
 }

@@ -39,6 +39,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Delete("/api/v1/accounts/{id}", removeAccountHandler(o))
 		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))
+		cp.Post("/api/v1/accounts/pin", pinAccountHandler(o))
 		cp.Post("/api/v1/probe", probeNowHandler(o))
 		cp.Post("/api/v1/update", applyUpdateHandler(o))
 		cp.Post("/api/v1/accounts/import", importCredentialsHandler(o))

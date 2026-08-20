@@ -223,6 +223,32 @@ type enabledBody struct {
 	Enabled bool `json:"enabled"`
 }
 
+// pinAccountHandler forces routing onto one account, or clears the override.
+//
+// POST with an empty id clears it, which is why the id lives in the BODY rather
+// than the path: "no account" has to be expressible, and a route with an empty
+// path segment is not.
+func pinAccountHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		var body pinBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+			return
+		}
+		if err := src.PinAccount(r.Context(), body.AccountID); err != nil {
+			writeMutationError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
+}
+
+// pinBody is the request for POST .../accounts/pin. An empty accountId clears
+// the override.
+type pinBody struct {
+	AccountID string `json:"accountId"`
+}
+
 func setAccountEnabledHandler(o HandlerOptions) http.HandlerFunc {
 	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
