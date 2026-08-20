@@ -45,6 +45,10 @@ type fakeProvider struct {
 	refreshTo  provider.Credential
 	refreshErr error
 	refreshes  atomic.Int32
+
+	// models and modelsErr control the Models method's return value.
+	models    []provider.Model
+	modelsErr error
 }
 
 type quotaResult struct {
@@ -64,7 +68,10 @@ func (f *fakeProvider) Profile(context.Context, provider.Credential) (provider.P
 	return provider.Profile{}, provider.ErrUnsupported
 }
 func (f *fakeProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
-	return nil, provider.ErrUnsupported
+	if f.modelsErr != nil {
+		return nil, f.modelsErr
+	}
+	return f.models, nil
 }
 func (f *fakeProvider) Login(context.Context) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
@@ -650,5 +657,34 @@ func TestProbeRecordsARefreshFailureWithoutCallingQuota(t *testing.T) {
 	st := p.Status().Accounts["a"]
 	if !strings.Contains(st.LastError, "refresh") {
 		t.Errorf("LastError = %q, want it to name the refresh failure", st.LastError)
+	}
+}
+
+// The catalogue is read on the same cycle as quota: both are per-account facts
+// that go stale, and both are read from the same credential we just renewed.
+func TestProbeRefreshesTheModelCatalogue(t *testing.T) {
+	fp := &fakeProvider{
+		results: []quotaResult{quotaOK()},
+		models:  []provider.Model{{ID: "gpt-5.6-sol"}},
+	}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Fatalf("ProbeNow: %v", err)
+	}
+	if got := mgr.All()[0].Models; len(got) != 1 || got[0].ID != "gpt-5.6-sol" {
+		t.Errorf("models = %+v, want the discovered catalogue", got)
+	}
+}
+
+// A provider with no catalogue endpoint must not make the cycle look failed.
+func TestProbeToleratesUnsupportedModels(t *testing.T) {
+	fp := &fakeProvider{results: []quotaResult{quotaOK()}, modelsErr: provider.ErrUnsupported}
+	mgr := newMgr(t, fp, oauthAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	if err := p.ProbeNow(context.Background()); err != nil {
+		t.Errorf("ProbeNow: %v; an unsupported catalogue is not a probe failure", err)
 	}
 }

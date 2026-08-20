@@ -336,6 +336,20 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 		}
 		p.recordSuccess(a.ID, now)
 		p.mgr.UpdateQuota(a.ID, q.Buckets)
+
+		// Catalogue on the same cycle and the same freshly renewed credential.
+		// A failure here is logged but does NOT fail the cycle or clear the
+		// stored catalogue: UpdateModels ignores an empty list, so the last
+		// known good list survives a bad read.
+		models, err := prov.Models(ctx, a.Credential)
+		switch {
+		case errors.Is(err, provider.ErrUnsupported):
+			// Nothing to discover for this provider.
+		case err != nil:
+			p.log.Warn("model catalogue read failed", "account", a.Label, "err", err)
+		default:
+			p.mgr.UpdateModels(a.ID, models)
+		}
 	}
 	// An account removed from mgr between cycles otherwise stays in
 	// p.accounts (and so in Status().Accounts) forever — a ghost entry for
