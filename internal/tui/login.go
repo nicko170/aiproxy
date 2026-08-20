@@ -16,10 +16,42 @@ import (
 // that is persisted inside the flow and does not pass through this package
 // at all (view.LoginResult carries only a profile).
 type loginState struct {
-	active bool
-	sess   view.LoginSession
-	code   textinput.Model
-	err    string
+	// picking is true between pressing "l" and choosing a provider: the
+	// picker in front of the flow itself, mirroring how the Accounts
+	// screen's "i" opens a source picker before ImportCredentials runs (see
+	// acctsState.importing). Nothing else in loginState is meaningful while
+	// this is true.
+	picking  bool
+	active   bool
+	provider string
+	sess     view.LoginSession
+	code     textinput.Model
+	err      string
+}
+
+// loginProviders is the fixed set of providers the login picker offers, in
+// display order. This is a short literal rather than a list read back
+// through view.Source: doing that properly needs a new Source method (and
+// its own control-API route, per TestEveryViewSourceMethodHasAControlRoute)
+// to expose what's actually registered, which is a larger change than one
+// confined to the TUI. Keep this mirrored against cmd/aiproxy's providers
+// map if a third provider ever lands.
+var loginProviders = []struct{ key, label, name string }{
+	{"a", "Anthropic", "anthropic"},
+	{"c", "ChatGPT", "openai"},
+}
+
+// providerDisplayName is loginProviders' name→label lookup, used once a
+// provider has already been chosen and the flow needs to talk about it (the
+// panel title). Falls back to the raw name so an unrecognised provider
+// still renders something rather than an empty title.
+func providerDisplayName(name string) string {
+	for _, p := range loginProviders {
+		if p.name == name {
+			return p.label
+		}
+	}
+	return name
 }
 
 type loginStartedMsg struct {
@@ -32,7 +64,10 @@ type loginDoneMsg struct {
 	ok  bool // false: the channel closed without a result — not a success
 }
 
-func (m Model) startLogin() (tea.Model, tea.Cmd) {
+// startLogin begins the PKCE flow for providerName, which the caller has
+// already chosen (see loginPickKey). A picking prompt in progress is not
+// this function's concern — the caller clears it before calling in.
+func (m Model) startLogin(providerName string) (tea.Model, tea.Cmd) {
 	if m.login.active {
 		return m, nil
 	}
@@ -41,7 +76,7 @@ func (m Model) startLogin() (tea.Model, tea.Cmd) {
 	ti.Placeholder = "paste the code here"
 	ti.CharLimit = 400
 	ti.Focus()
-	m.login = loginState{active: true, code: ti}
+	m.login = loginState{active: true, code: ti, provider: providerName}
 	src := m.src
 	// The flow's context lifetime is the session, not this call: src.Login
 	// returns as soon as its loopback listener is bound, long before the
@@ -59,7 +94,7 @@ func (m Model) startLogin() (tea.Model, tea.Cmd) {
 	// itself survives.
 	ctx := m.ctx
 	return m, func() tea.Msg {
-		sess, err := src.Login(ctx, "anthropic")
+		sess, err := src.Login(ctx, providerName)
 		return loginStartedMsg{sess: sess, err: err}
 	}
 }
@@ -115,6 +150,22 @@ func (m Model) updateLogin(msg tea.Msg) (Model, tea.Cmd) {
 	return m, nil
 }
 
+// loginPickKey handles a keypress while the provider picker is open —
+// exactly the shape of accounts.go's import-source picker (s.importing):
+// a recognised key clears the prompt and acts, anything else (including
+// esc) clears it and does nothing, so cancelling never starts a login.
+func (m Model) loginPickKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	key := msg.String()
+	for _, p := range loginProviders {
+		if p.key == key {
+			m.login = loginState{}
+			return m.startLogin(p.name)
+		}
+	}
+	m.login = loginState{}
+	return m, nil
+}
+
 func (m Model) loginKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
@@ -160,11 +211,26 @@ func openURL(url string) tea.Cmd {
 	}
 }
 
+// viewLoginPick renders the provider picker, in the same visual language as
+// the Accounts screen's import-source picker (see viewAccounts's "import
+// from:" line): a dim label followed by each choice's accented key.
+func (m Model) viewLoginPick(h int) string {
+	th := m.th
+	var b strings.Builder
+	b.WriteString(th.bold("log in") + "\n\n")
+	b.WriteString(th.dim("log in with:  "))
+	for _, p := range loginProviders {
+		b.WriteString(th.accent(p.key) + " " + p.label + "  ")
+	}
+	b.WriteString(th.dim("esc cancel") + "\n")
+	return overlay(b.String(), m.width, h)
+}
+
 func (m Model) viewLogin(h int) string {
 	th := m.th
 	l := m.login
 	var b strings.Builder
-	b.WriteString(th.bold("log in with Anthropic") + "\n\n")
+	b.WriteString(th.bold("log in with "+providerDisplayName(l.provider)) + "\n\n")
 	if l.sess.URL == "" && l.err == "" {
 		b.WriteString(th.dim("starting the login flow…") + "\n")
 	} else if l.sess.URL != "" {

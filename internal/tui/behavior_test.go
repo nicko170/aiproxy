@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -301,7 +302,7 @@ func TestRenderChartKeepsWidthAndShowsSmallColumns(t *testing.T) {
 
 func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	m := fixtureModel(100, 30)
-	res, _ := m.startLogin()
+	res, _ := m.startLogin("anthropic")
 	m = res.(Model)
 	m, _ = m.updateLogin(loginStartedMsg{sess: view.LoginSession{URL: "https://example.test/authorize?x=1"}})
 	out := m.View()
@@ -316,6 +317,82 @@ func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	}
 	if m.login.err == "" {
 		t.Error("a resultless close must say something happened")
+	}
+}
+
+// loginRecordingSource is a view.Source that only implements Login, over an
+// embedded nil interface — every other method is unreachable from these
+// tests and would nil-panic if called, which is fine: nothing here touches
+// them. It exists to answer one question a golden frame cannot: which
+// provider name actually reached Source.Login.
+type loginRecordingSource struct {
+	view.Source
+	gotProvider string
+}
+
+func (s *loginRecordingSource) Login(ctx context.Context, providerName string) (view.LoginSession, error) {
+	s.gotProvider = providerName
+	return view.LoginSession{}, nil
+}
+
+// The bug this guards against: internal/tui/login.go used to hardcode
+// src.Login(ctx, "anthropic") with no picker in front of it, so the entire
+// OpenAI Login implementation was unreachable from any path a user could
+// trigger. "l" must now ask which provider, and picking ChatGPT's key must
+// reach Source.Login with "openai" — never silently falling back to
+// "anthropic".
+func TestLoginPickerChatGPTChoiceCallsLoginWithOpenAI(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &loginRecordingSource{}
+	m.src = rec
+
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = next.(Model)
+	if !m.login.picking {
+		t.Fatalf("login = %+v, want picking after 'l'", m.login)
+	}
+	if cmd != nil {
+		t.Error("'l' must only open the picker, not start a flow yet")
+	}
+
+	next, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = next.(Model)
+	if m.login.picking {
+		t.Error("choosing a provider must close the picker")
+	}
+	if !m.login.active {
+		t.Error("choosing a provider must start the flow")
+	}
+	if cmd == nil {
+		t.Fatal("choosing a provider must return the command that calls Login")
+	}
+	cmd() // runs src.Login synchronously; loginRecordingSource does no I/O
+
+	if rec.gotProvider != "openai" {
+		t.Errorf("Login called with provider %q, want %q", rec.gotProvider, "openai")
+	}
+}
+
+// esc on the picker must cancel without ever calling Login — matching how
+// the Accounts screen's import picker treats any unrecognised key as cancel.
+func TestLoginPickerEscCancelsWithoutLogin(t *testing.T) {
+	m := fixtureModel(120, 28)
+	rec := &loginRecordingSource{}
+	m.src = rec
+
+	next, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = next.(Model)
+
+	next, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyEsc})
+	m = next.(Model)
+	if m.login.picking || m.login.active {
+		t.Errorf("login = %+v, want cleared after esc", m.login)
+	}
+	if cmd != nil {
+		t.Error("esc on the picker must not return a command")
+	}
+	if rec.gotProvider != "" {
+		t.Errorf("Login must never be called on cancel, got provider %q", rec.gotProvider)
 	}
 }
 

@@ -302,9 +302,10 @@ have.
 aiproxy
 ```
 
-That starts the proxy and opens the TUI. Press `l` to log in — a browser opens
-for the OAuth flow, and if it can't reach one you can paste the authorization
-code back in. Repeat for each account you want in the rotation.
+That starts the proxy and opens the TUI. Press `l` to log in, choose a
+provider (Anthropic or ChatGPT) — a browser opens for the OAuth flow, and if
+it can't reach one you can paste the authorization code back in. Repeat for
+each account you want in the rotation, across either or both providers.
 
 Then point your agent at it:
 
@@ -337,9 +338,9 @@ have to re-authorize an account you have already logged into there.
 | `5` | Settings | edit runtime settings in place |
 
 `tab` / `shift+tab` cycle screens. `?` opens help, `q` quits (and shuts the
-proxy down with it). `l` starts a login, `p` forces a quota probe, `o`
-opens the dashboard, and `u` installs an available update (see
-[Updating](#updating)).
+proxy down with it). `l` asks which provider (`a` Anthropic, `c` ChatGPT) and
+starts that login, `p` forces a quota probe, `o` opens the dashboard, and `u`
+installs an available update (see [Updating](#updating)).
 
 Per-screen keys are shown in the footer: `space` pauses the activity feed,
 `a`/`m`/`c` filter it by account/model/outcome and `v` toggles the log view;
@@ -395,12 +396,16 @@ Codex CLI subscriptions work the same way Anthropic accounts do: log in once,
 and aiproxy rotates, tracks quota, and ranks the account alongside whatever
 else is configured.
 
-There is no in-TUI OAuth flow for ChatGPT yet — only Anthropic's `l` does that.
-Instead, import the credential Codex already has: log in with `codex login` as
-usual, then from the Accounts screen press `i`, then `x`, to read
-`~/.codex/auth.json` (an `apikey`-mode file, with no OAuth tokens to adopt, is
-skipped rather than imported broken). `c` on the same menu still imports from
-Claude Code's own credential file, as before.
+`l`, from anywhere in the TUI, now asks which provider before starting the
+OAuth flow — `a` Anthropic, `c` ChatGPT — and the ChatGPT choice is a native
+login, not a workaround: it drives the same PKCE flow and callback listener
+Anthropic's does, just against `auth.openai.com`.
+
+You can also adopt the credential Codex CLI already has, instead of logging in
+again: log in with `codex login` as usual, then from the Accounts screen press
+`i`, then `x`, to read `~/.codex/auth.json` (an `apikey`-mode file, with no
+OAuth tokens to adopt, is skipped rather than imported broken). `c` on the
+same menu still imports from Claude Code's own credential file, as before.
 
 Point Codex at the proxy by adding a provider to `~/.codex/config.toml`:
 

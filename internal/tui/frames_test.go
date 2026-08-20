@@ -219,8 +219,13 @@ func frameCases() map[string]func(w, h int) Model {
 		},
 		"login": func(w, h int) Model {
 			m := fixtureModel(w, h)
-			m, _ = mustModel(m.startLogin())
+			m, _ = mustModel(m.startLogin("anthropic"))
 			m.login.sess = view.LoginSession{URL: fixtureLoginURL}
+			return m
+		},
+		"login_pick": func(w, h int) Model {
+			m := fixtureModel(w, h)
+			m.login = loginState{picking: true}
 			return m
 		},
 	}

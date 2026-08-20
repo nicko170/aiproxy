@@ -209,7 +209,7 @@ func (m Model) viewAccounts(h int) string {
 		body := strings.Join([]string{
 			th.bold("no accounts yet"),
 			"",
-			"  " + th.accent("l") + "  log in with Anthropic",
+			"  " + th.accent("l") + "  log in — Anthropic or ChatGPT",
 			"  " + th.accent("i") + "  import from Claude Code or Codex",
 		}, "\n")
 		if m.accts.importing {

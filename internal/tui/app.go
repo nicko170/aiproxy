@@ -459,6 +459,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.login.active {
 		return m.loginKey(msg)
 	}
+	if m.login.picking {
+		return m.loginPickKey(msg)
+	}
 	if m.screen == screenSettings && m.settings.editing {
 		return m.settingsKey(msg)
 	}
@@ -496,7 +499,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "?":
 		m.help = true
 	case "l":
-		return m.startLogin()
+		// Reachable only when neither is already true: m.login.active and
+		// m.login.picking both intercept every key before this switch runs
+		// (see the top of handleKey), so "l" here always means "nothing is
+		// in progress yet."
+		m.login = loginState{picking: true}
 	case "p":
 		return m, m.probeNow()
 	case "o":
@@ -570,6 +577,8 @@ func (m Model) View() string {
 	switch {
 	case m.login.active:
 		content = m.viewLogin(contentH)
+	case m.login.picking:
+		content = m.viewLoginPick(contentH)
 	case m.help:
 		content = m.viewHelp(contentH)
 	default:
@@ -833,6 +842,8 @@ func (m Model) viewFooter() string {
 	switch {
 	case m.login.active:
 		keys = []string{"enter submit code", "ctrl+o open url", "esc cancel"}
+	case m.login.picking:
+		keys = []string{"a Anthropic", "c ChatGPT", "esc cancel"}
 	case m.help:
 		keys = []string{"esc close"}
 	default:
@@ -884,7 +895,7 @@ func (m Model) viewHelp(h int) string {
 	// headers do the grouping the blank lines used to.
 	rows := [][2]string{
 		{"1–5, tab", "switch screens"},
-		{"l", "log in with Anthropic"},
+		{"l", "log in — choose Anthropic or ChatGPT"},
 		{"p", "probe quota now"},
 		{"o", "open the dashboard"},
 		{"u", "install the latest release"},
