@@ -30,6 +30,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 	"github.com/nicko170/aiproxy/internal/warmer"
+	"github.com/nicko170/aiproxy/internal/web"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=..."
@@ -44,11 +45,13 @@ func main() {
 	}
 
 	var (
-		configPath = flag.String("config", "", "path to config.json (default: XDG config dir)")
-		addr       = flag.String("addr", "", "listen address (overrides config)")
-		headless   = flag.Bool("headless", false, "run without the TUI, logging to stderr")
-		logLevel   = flag.String("log-level", "info", "debug, info, warn, or error")
-		showVer    = flag.Bool("version", false, "print version and exit")
+		configPath     = flag.String("config", "", "path to config.json (default: XDG config dir)")
+		addr           = flag.String("addr", "", "listen address (overrides config)")
+		headless       = flag.Bool("headless", false, "run without the TUI, logging to stderr")
+		logLevel       = flag.String("log-level", "info", "debug, info, warn, or error")
+		showVer        = flag.Bool("version", false, "print version and exit")
+		insecureNoAuth = flag.Bool("insecure-no-auth", false,
+			"permit a non-loopback listener with no API key; the control plane is then unauthenticated")
 	)
 	flag.Parse()
 
@@ -66,7 +69,7 @@ func main() {
 		logs = tui.NewLogRing(500)
 		log = slog.New(logs.Handler(parseLevel(*logLevel)))
 	}
-	if err := run(*configPath, *addr, *headless, log, logs); err != nil {
+	if err := run(*configPath, *addr, *headless, *insecureNoAuth, log, logs); err != nil {
 		log.Error("fatal", "err", err)
 		if !*headless {
 			// The ring died with the TUI; say it where it can still be read.
@@ -88,7 +91,7 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(level)}))
 }
 
-func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs *tui.LogRing) error {
+func run(configPath, addrOverride string, headless, insecureNoAuth bool, log *slog.Logger, logs *tui.LogRing) error {
 	if configPath == "" {
 		configPath = config.Path()
 	}
@@ -100,6 +103,13 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 	if addrOverride != "" {
 		cfg.Listen.Addr = addrOverride
+	}
+
+	if err := checkBindSafety(cfg.Listen.Addr, cfg.Listen.APIKey, insecureNoAuth); err != nil {
+		return err
+	}
+	if insecureNoAuth && cfg.Listen.APIKey == "" {
+		log.Warn("--insecure-no-auth: the dashboard and control plane are UNAUTHENTICATED on this listener")
 	}
 
 	db, err := metrics.Open(config.DBPath())
@@ -447,10 +457,18 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// internal/proxy's routes changing at all.
 	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd, pf)
 
+	// Sessions backs the dashboard's cookie login: a session token exchanged for
+	// the API key once, rather than the key itself sitting in the browser. The
+	// TTL is generous because re-authenticating a local dashboard weekly buys
+	// nothing; the session cookie is still bound to this process's Sessions
+	// instance and dies with it.
+	sessions := web.NewSessions(30 * 24 * time.Hour)
+
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
 		Manager:       mgr,
 		APIKey:        cfg.Listen.APIKey,
+		Sessions:      sessions,
 		BlockedModels: cfg.Routing.BlockedModels,
 		Log:           log,
 		// Paths bound to the client's own paired identity, relayed with its
@@ -601,6 +619,37 @@ func endpointOf(path string) string {
 		return path[:i]
 	}
 	return path
+}
+
+// checkBindSafety refuses to start a publicly-reachable proxy with no API key.
+//
+// Before the dashboard, an unauthenticated non-loopback bind exposed inference
+// and account listing. With the dashboard it also exposes OAuth login, account
+// removal, and settings — the whole control plane. A warning is not enough:
+// warnings scroll past, and the failure mode is a stranger holding your Claude
+// subscription.
+//
+// The escape hatch exists because refusing every public bind would break a
+// legitimate deployment behind an authenticating reverse proxy. It is loud, it
+// is explicit, and it is named for what it costs.
+func checkBindSafety(addr, apiKey string, insecure bool) error {
+	if apiKey != "" || insecure {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	// An empty host is the ":3456" shorthand, which binds every interface. It
+	// must not be read as "no host, therefore local". And IsLoopback parses IPs
+	// only, so the NAME localhost needs its own branch.
+	if host == "localhost" || (host != "" && proxy.IsLoopback(addr)) {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to listen on %s with no API key: the dashboard and control plane would be open to anyone who can reach this port.\n"+
+			"Set listen.apiKey in config.json, bind to 127.0.0.1 instead, or pass --insecure-no-auth if this is behind an authenticating proxy",
+		addr)
 }
 
 // listen binds the client-facing socket, setting NoDelay on each accepted
