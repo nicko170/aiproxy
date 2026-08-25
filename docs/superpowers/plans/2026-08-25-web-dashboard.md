@@ -443,12 +443,14 @@ and becomes:
 		if !authorizedRequest(o, r) {
 ```
 
-The four are `internal/proxy/control.go:26`, `internal/proxy/handler.go:152`, `internal/proxy/handler.go:308`, and `internal/proxy/models.go:36`. Miss one and that surface silently refuses every browser request while the others work — a confusing partial failure, so grep afterwards to confirm no bare `Authorized(r.RemoteAddr` calls remain outside the function's own definition and its tests.
+The four are `internal/proxy/control.go:26`, `internal/proxy/handler.go:152`, `internal/proxy/handler.go:308`, and `internal/proxy/models.go:36`. Miss one and that surface silently refuses every browser request while the others work — a confusing partial failure that reads as "the dashboard mostly works", so verify coverage by grep afterwards.
+
+The grep will match **exactly one** line: `authorizedRequest`'s own delegation to `Authorized`. That is the correct end state, not a miss. Anything else it prints is a call site you did not convert.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `go test ./internal/proxy/ 2>&1 | tail -5` then `grep -rn "Authorized(r.RemoteAddr" --include="*.go" internal/ | grep -v _test.go`
-Expected: PASS, and the grep returns nothing.
+Expected: PASS, and the grep returns exactly one line — `authorizedRequest`'s delegation inside `handler.go`. Two or more lines means an unconverted call site.
 
 - [ ] **Step 5: Commit**
 
