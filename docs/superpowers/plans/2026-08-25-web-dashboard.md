@@ -285,7 +285,7 @@ git commit -m "feat(web): in-memory session store with a sliding expiry"
 
 ---
 
-### Task 2: `authorizedRequest` — session, then key, then loopback
+### Task 2: `authorizedRequest` — session first, then the existing checks
 
 **Files:**
 - Modify: `internal/proxy/handler.go` (add `SessionValidator`, `authorizedRequest`, `HandlerOptions.Sessions`)
@@ -415,12 +415,14 @@ Add to `HandlerOptions`:
 And the wrapper:
 
 ```go
-// authorizedRequest gates a request: a valid dashboard session, then a matching
-// API key, then the loopback exemption.
+// authorizedRequest gates a request: a valid dashboard session first, then
+// whatever Authorized already decides — which is the loopback exemption, then a
+// matching API key, in that order.
 //
 // Session first because it is the cheapest positive answer for the dashboard,
 // which is the only caller that has one. The pure Authorized below is left
-// exactly as it was — four call sites depend on it and it is separately tested.
+// exactly as it was — four call sites depend on it and it is separately tested,
+// so the loopback-before-key order inside it is deliberately not disturbed.
 func authorizedRequest(o HandlerOptions, r *http.Request) bool {
 	if o.Sessions != nil {
 		if c, err := r.Cookie(sessionCookie); err == nil && o.Sessions.Valid(c.Value) {
