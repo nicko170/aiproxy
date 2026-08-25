@@ -45,13 +45,11 @@ func main() {
 	}
 
 	var (
-		configPath     = flag.String("config", "", "path to config.json (default: XDG config dir)")
-		addr           = flag.String("addr", "", "listen address (overrides config)")
-		headless       = flag.Bool("headless", false, "run without the TUI, logging to stderr")
-		logLevel       = flag.String("log-level", "info", "debug, info, warn, or error")
-		showVer        = flag.Bool("version", false, "print version and exit")
-		insecureNoAuth = flag.Bool("insecure-no-auth", false,
-			"permit a non-loopback listener with no API key; the control plane is then unauthenticated")
+		configPath = flag.String("config", "", "path to config.json (default: XDG config dir)")
+		addr       = flag.String("addr", "", "listen address (overrides config)")
+		headless   = flag.Bool("headless", false, "run without the TUI, logging to stderr")
+		logLevel   = flag.String("log-level", "info", "debug, info, warn, or error")
+		showVer    = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 
@@ -69,7 +67,7 @@ func main() {
 		logs = tui.NewLogRing(500)
 		log = slog.New(logs.Handler(parseLevel(*logLevel)))
 	}
-	if err := run(*configPath, *addr, *headless, *insecureNoAuth, log, logs); err != nil {
+	if err := run(*configPath, *addr, *headless, log, logs); err != nil {
 		log.Error("fatal", "err", err)
 		if !*headless {
 			// The ring died with the TUI; say it where it can still be read.
@@ -91,7 +89,7 @@ func newLogger(level string) *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(level)}))
 }
 
-func run(configPath, addrOverride string, headless, insecureNoAuth bool, log *slog.Logger, logs *tui.LogRing) error {
+func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs *tui.LogRing) error {
 	if configPath == "" {
 		configPath = config.Path()
 	}
@@ -105,11 +103,8 @@ func run(configPath, addrOverride string, headless, insecureNoAuth bool, log *sl
 		cfg.Listen.Addr = addrOverride
 	}
 
-	if err := checkBindSafety(cfg.Listen.Addr, cfg.Listen.APIKey, insecureNoAuth); err != nil {
+	if err := checkBindSafety(cfg.Listen.Addr, cfg.Listen.APIKey); err != nil {
 		return err
-	}
-	if insecureNoAuth && cfg.Listen.APIKey == "" {
-		log.Warn("--insecure-no-auth: the dashboard and control plane are UNAUTHENTICATED on this listener")
 	}
 
 	db, err := metrics.Open(config.DBPath())
@@ -623,17 +618,24 @@ func endpointOf(path string) string {
 
 // checkBindSafety refuses to start a publicly-reachable proxy with no API key.
 //
+// In the current codebase this cannot actually fire: internal/config/store.go's
+// loadLocked heals a blank listen.apiKey, and config.Default seeds one too, so
+// by the time cfg reaches here APIKey is never empty. This function is a
+// backstop against that guarantee ever being weakened or removed elsewhere —
+// a config loaded some other way, a future refactor of the store, a caller
+// that builds Config by hand — not the mechanism that keeps aiproxy closed
+// today. See TestConfigAlwaysSuppliesAnAPIKey in internal/config, which
+// asserts the invariant this function depends on; if that test ever fails,
+// this guard has just become load-bearing.
+//
 // Before the dashboard, an unauthenticated non-loopback bind exposed inference
 // and account listing. With the dashboard it also exposes OAuth login, account
-// removal, and settings — the whole control plane. A warning is not enough:
-// warnings scroll past, and the failure mode is a stranger holding your Claude
-// subscription.
-//
-// The escape hatch exists because refusing every public bind would break a
-// legitimate deployment behind an authenticating reverse proxy. It is loud, it
-// is explicit, and it is named for what it costs.
-func checkBindSafety(addr, apiKey string, insecure bool) error {
-	if apiKey != "" || insecure {
+// removal, and settings — the whole control plane. If the upstream guarantee
+// is ever lost, a warning is not enough: warnings scroll past, and the failure
+// mode is a stranger holding your Claude subscription. So this stays a refusal,
+// not a log line, even though it is currently unreachable.
+func checkBindSafety(addr, apiKey string) error {
+	if apiKey != "" {
 		return nil
 	}
 	host, _, err := net.SplitHostPort(addr)
@@ -648,7 +650,7 @@ func checkBindSafety(addr, apiKey string, insecure bool) error {
 	}
 	return fmt.Errorf(
 		"refusing to listen on %s with no API key: the dashboard and control plane would be open to anyone who can reach this port.\n"+
-			"Set listen.apiKey in config.json, bind to 127.0.0.1 instead, or pass --insecure-no-auth if this is behind an authenticating proxy",
+			"Set listen.apiKey in config.json, or bind to 127.0.0.1 instead — a reverse proxy that authenticates its own callers can still reach a loopback listener from 127.0.0.1",
 		addr)
 }
 
