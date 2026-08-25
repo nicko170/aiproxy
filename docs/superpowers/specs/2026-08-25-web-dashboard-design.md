@@ -107,12 +107,33 @@ being wrong is someone else's use of your Claude subscription.
 
 Three changes, in order of importance:
 
-**A bind guard.** `cmd/aiproxy` refuses to start when the listen address is not
-loopback and no API key is configured, naming the fix. This is a startup error,
-not a warning: a warning scrolls past, and the failure mode it prevents is a
-stranger holding your Claude subscription. An explicit
-`--insecure-no-auth` flag exists for someone who genuinely means it, e.g. behind
-their own authenticating proxy, and it logs on every start.
+**A bind guard, honestly described.** `cmd/aiproxy` refuses to start when the
+listen address is not loopback and no API key is configured.
+
+It is a backstop, not the primary protection, and this spec previously claimed
+otherwise twice. The truth, verified against the code and against a running
+binary: `internal/config`'s `loadLocked` regenerates a blank `listen.apiKey` on
+**every** load, and `Default()` seeds one for a missing file. So after
+configuration is loaded the proxy always has a key, a non-loopback caller must
+present it, and there is no open door for this guard to close. Its refusal
+branch is unreachable through normal startup.
+
+It is kept anyway, for one reason: that guarantee lives in a different file
+that has no idea it is load-bearing for this one. If the self-heal is ever
+removed, the guard becomes live. To stop that coupling being invisible, a test
+asserts the invariant the guard depends on being redundant — a blank
+`listen.apiKey` comes back from `Store.Load` non-blank — with a comment saying
+that `checkBindSafety` is redundant *because* of it. If that test ever fails,
+the backstop has just become the protection.
+
+There is deliberately **no `--insecure-no-auth` escape hatch.** An earlier draft
+of this design included one, on the reasoning that refusing every public bind
+would break a deployment behind an authenticating reverse proxy. That reasoning
+does not survive the paragraph above: the flag exists only to defeat a check
+that cannot fire, and the deployment it was meant to serve is better served by
+binding loopback — already exempt from the API key — with the reverse proxy
+connecting from `127.0.0.1`. Shipping an unreachable foot-gun in `--help`
+invites someone to disable a safety check for no benefit.
 
 **A session endpoint.** `POST /_aiproxy/api/v1/session` takes the API key in a
 JSON body, compares it in constant time, and sets an `HttpOnly`, `SameSite=Strict`,
