@@ -842,8 +842,9 @@ func checkBindSafety(addr, apiKey string, insecure bool) error {
 		host = addr
 	}
 	// An empty host is the ":3456" shorthand, which binds every interface. It
-	// must not be read as "no host, therefore local".
-	if host != "" && proxy.IsLoopback(addr) {
+	// must not be read as "no host, therefore local". And IsLoopback parses IPs
+	// only, so the NAME localhost needs its own branch.
+	if host == "localhost" || (host != "" && proxy.IsLoopback(addr)) {
 		return nil
 	}
 	return fmt.Errorf(
@@ -853,7 +854,19 @@ func checkBindSafety(addr, apiKey string, insecure bool) error {
 }
 ```
 
-`proxy.IsLoopback` takes a host or host:port and already handles the IPv6 bracket form, so it covers `localhost`, `127.0.0.1` and `[::1]` — but check the `localhost` case actually passes when you run the test; if `IsLoopback` resolves only literal IPs, add a `host == "localhost"` branch rather than changing `IsLoopback`, which the proxy path depends on.
+**`proxy.IsLoopback` returns false for the NAME `localhost`** — verified: it
+calls `net.ParseIP`, which yields nil for a hostname. It covers `127.0.0.1` and
+`[::1]` and nothing else. So `checkBindSafety` needs its own branch:
+
+```go
+	if host == "localhost" || (host != "" && proxy.IsLoopback(addr)) {
+		return nil
+	}
+```
+
+Put the branch HERE, not in `proxy.IsLoopback`. That function gates every
+proxied request's authorization, and widening it to resolve hostnames would put
+a name lookup on the hot path and change who is exempt from the API key.
 
 Wire it in `main.go` before `listen(cfg.Listen.Addr)`:
 
@@ -1233,6 +1246,7 @@ git commit -m "feat(web): embed and serve the dashboard shell under the reserved
 
 **Files:**
 - Modify: `internal/web/assets/index.html`
+- Create: `internal/web/assets/dom.js`
 - Create: `internal/web/assets/app.js`
 - Create: `internal/web/assets/screens/signin.js`
 - Modify: `internal/web/assets/style.css`
@@ -1243,11 +1257,61 @@ git commit -m "feat(web): embed and serve the dashboard shell under the reserved
   - `api(path, opts)` → parsed JSON; throws `ApiError {status, message}`
   - `registerScreen(name, {title, mount(el), unmount()})`
   - `navigate(hash)`, `currentScreen()`
-  - `el(tag, attrs, ...children)` — the DOM helper every screen and chart uses
+  - `el(tag, attrs, ...children)` — the DOM helper every screen and chart uses, defined in `dom.js` and re-exported here
   - `subscribeEvents(handler)` → unsubscribe function; owns the single `EventSource`
   - `startPolling(fn, intervalMs)` → stop function; visible-tab only
 
-- [ ] **Step 1: Write the DOM helper and the fetch layer**
+- [ ] **Step 1: Write the DOM helper in its own module**
+
+`el` lives in `dom.js`, NOT in `app.js`, and this is load-bearing rather than
+tidiness. `app.js` registers a `hashchange` listener at module scope, so
+importing it outside a browser throws `ReferenceError: window is not defined`.
+`chart.js` needs `el` for its marks (Task 8) and is covered by `node --test`
+(Task 7) — so if `chart.js` reached for `el` through `app.js`, the chart tests
+would die the moment the marks landed. Verified: a module with a top-level
+`window.addEventListener` fails to import under node.
+
+`dom.js` touches `document` only inside function bodies, so importing it under
+node is harmless even though calling `el` there would not be.
+
+```js
+// The DOM helper every screen and every chart builds with.
+//
+// Separate from app.js deliberately: app.js registers listeners at module
+// scope and cannot be imported outside a browser, while chart.js needs this
+// helper AND is unit-tested under node. Keep this module free of top-level
+// browser access.
+
+const SVG_TAGS = new Set(["svg","g","path","rect","circle","line","text",
+  "polyline","polygon","defs","clipPath","tspan","title"]);
+
+// el builds a DOM node. Children that are strings become TEXT NODES, never
+// markup — which is why no part of this app needs to think about escaping a
+// model name, an account label, or an error message from an upstream.
+export function el(tag, attrs = {}, ...children) {
+  const ns = SVG_TAGS.has(tag) ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
+  const node = document.createElementNS(ns, tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, String(v));
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    node.appendChild(typeof child === "object" ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+```
+
+- [ ] **Step 2: Write the fetch layer**
+
+`app.js` imports `el` from `./dom.js` and re-exports it, so screens can keep
+importing everything from one place:
+
+```js
+export { el } from "./dom.js";
+```
 
 `app.js`:
 
@@ -1290,30 +1354,9 @@ export async function api(path, opts = {}) {
   return body;
 }
 
-// el builds a DOM node. Children that are strings become TEXT NODES, never
-// markup — which is why no part of this app needs to think about escaping a
-// model name, an account label, or an error message from an upstream.
-export function el(tag, attrs = {}, ...children) {
-  const node = document.createElementNS(
-    tag === "svg" || SVG_TAGS.has(tag) ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml",
-    tag);
-  for (const [k, v] of Object.entries(attrs || {})) {
-    if (v === undefined || v === null || v === false) continue;
-    if (k.startsWith("on") && typeof v === "function") node.addEventListener(k.slice(2), v);
-    else if (k === "class") node.setAttribute("class", v);
-    else node.setAttribute(k, String(v));
-  }
-  for (const child of children.flat()) {
-    if (child === null || child === undefined || child === false) continue;
-    node.appendChild(typeof child === "object" ? child : document.createTextNode(String(child)));
-  }
-  return node;
-}
-
-const SVG_TAGS = new Set(["g","path","rect","circle","line","text","polyline","polygon","defs","clipPath","tspan","title"]);
 ```
 
-- [ ] **Step 2: Add polling, events, and the router**
+- [ ] **Step 3: Add polling, events, and the router**
 
 Appended to `app.js`:
 
@@ -1408,7 +1451,7 @@ window.addEventListener("hashchange", render);
 export { render };
 ```
 
-- [ ] **Step 3: Write the sign-in screen and boot sequence**
+- [ ] **Step 4: Write the sign-in screen and boot sequence**
 
 `screens/signin.js`:
 
@@ -1462,7 +1505,7 @@ export async function boot() {
 
 Wire `showSignIn` into `app.js` via a late import to avoid a cycle, and replace the shell's `<main>` with the real chrome — header, nav for the five screens, a connection dot, and a sign-out control that `DELETE`s the session and calls `showSignIn()`.
 
-- [ ] **Step 4: Verify by hand**
+- [ ] **Step 5: Verify by hand**
 
 ```bash
 go build -o /tmp/aiproxy ./cmd/aiproxy && /tmp/aiproxy --headless &
@@ -1471,7 +1514,7 @@ open http://127.0.0.1:3456/_aiproxy/
 
 Expected: the shell loads, and on loopback with no configured key it goes straight to the (empty) overview rather than the sign-in card. Set `listen.apiKey` in a scratch config and re-run to see the sign-in path.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add internal/web/
@@ -1692,7 +1735,7 @@ git commit -m "feat(web): chart scales, ticks, and formatting"
 - Modify: `internal/web/assets/style.css`
 
 **Interfaces:**
-- Consumes: everything from Task 7, plus `el` from `app.js`.
+- Consumes: everything from Task 7, plus `el` from `./dom.js` — NOT from `app.js`, which cannot be imported under node and would break Task 7's chart tests.
 - Produces:
   - `stackedArea({points, keys, width, height, valueOf, format})` → `SVGElement`
   - `lineChart({series, width, height, format})` → `SVGElement`
