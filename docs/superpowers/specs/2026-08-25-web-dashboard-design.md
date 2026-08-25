@@ -125,8 +125,12 @@ persisting anything credential-adjacent to disk.
 presentedKey, configuredKey)` and is called from four places — the proxy
 handler, the passthrough handler, the models handler, and the control API — all
 of which must be updated together; it gains the request's session token. Order:
-valid session, then matching key, then loopback exemption. The loopback
-exemption stays so nothing about local use changes.
+valid session first, then whatever `Authorized` already decides — which is the
+loopback exemption, then a matching key, in that order. That inner order is
+deliberately not disturbed: loopback and key are alternative sufficient
+conditions inside a pure, separately-tested function, so which is tested first
+cannot change any verdict. The loopback exemption stays, so nothing about local
+use changes.
 
 The API key never reaches JavaScript beyond the single login POST. It is not put
 in a URL, `localStorage`, or a query parameter — a key in a URL lands in logs and
