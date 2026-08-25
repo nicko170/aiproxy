@@ -97,6 +97,14 @@ loopback unconditionally. On a laptop that is right. On a public interface it
 means account removal and OAuth login are exposed to anyone who can reach the
 port, which is the state this stage would otherwise ship into.
 
+The exposure is narrower than it first looks: `config.Defaults` generates a key
+with `newAPIKey()`, so a fresh install already has one and is not affected. The
+gap is a config where the key was hand-cleared, one that predates key
+generation, or a deployment that sets `listen.apiKey` to the empty string
+explicitly. That is a small population, but it is exactly the population that
+would bind to a public address without thinking about it — and the cost of
+being wrong is someone else's use of your Claude subscription.
+
 Three changes, in order of importance:
 
 **A bind guard.** `cmd/aiproxy` refuses to start when the listen address is not
