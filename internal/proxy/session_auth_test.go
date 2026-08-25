@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/nicko170/aiproxy/internal/web"
 )
 
 type stubSessions struct{ good string }
@@ -66,5 +68,15 @@ func TestAuthorizedRequestToleratesNilSessions(t *testing.T) {
 	}
 	if !authorizedRequest(o, reqWith("127.0.0.1:5555", "", "")) {
 		t.Error("loopback broke when Sessions was nil")
+	}
+}
+
+// The proxy reads the cookie internal/web writes. They cannot share a constant
+// without a dependency edge neither package wants, so this is what stops them
+// drifting apart into a dashboard that signs in and is then refused on every
+// subsequent request.
+func TestSessionCookieNameMatchesTheWebPackage(t *testing.T) {
+	if sessionCookie != web.CookieName {
+		t.Errorf("proxy.sessionCookie = %q, web.CookieName = %q", sessionCookie, web.CookieName)
 	}
 }
