@@ -28,6 +28,24 @@ const ReservedPrefix = "/_aiproxy"
 // sessionHeader is how a client tags requests belonging to one conversation.
 const sessionHeader = "x-claude-code-session-id"
 
+// sessionCookie carries the browser's dashboard session. A cookie rather than
+// a header because a browser cannot attach an x-api-key header to a top-level
+// navigation, and rather than a query parameter because a credential in a URL
+// lands in access logs and Referer headers.
+const sessionCookie = "aiproxy_session"
+
+// SessionValidator is the one thing the proxy needs from the dashboard's
+// session store.
+//
+// Declared HERE, as an interface, rather than importing internal/web: the
+// dependency runs router -> web, and reversing it for an auth check would make
+// the two packages mutually dependent. A nil SessionValidator means no session
+// auth is configured, which is the state of every caller that predates the
+// dashboard.
+type SessionValidator interface {
+	Valid(token string) bool
+}
+
 // maxBodyBytes bounds a buffered request body. The body must be buffered so an
 // attempt can be replayed on another account; the cap keeps a hostile or
 // runaway client from exhausting memory.
@@ -61,6 +79,21 @@ func Authorized(remoteAddr, presentedKey, configuredKey string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// authorizedRequest gates a request: a valid dashboard session, then a matching
+// API key, then the loopback exemption.
+//
+// Session first because it is the cheapest positive answer for the dashboard,
+// which is the only caller that has one. The pure Authorized below is left
+// exactly as it was — four call sites depend on it and it is separately tested.
+func authorizedRequest(o HandlerOptions, r *http.Request) bool {
+	if o.Sessions != nil {
+		if c, err := r.Cookie(sessionCookie); err == nil && o.Sessions.Valid(c.Value) {
+			return true
+		}
+	}
+	return Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey)
 }
 
 // ParseModel reads the top-level "model" field. Only the top level is decoded,
@@ -117,6 +150,9 @@ type HandlerOptions struct {
 	// Privacy redacts request bodies and restores responses. Nil disables the
 	// whole path at zero cost.
 	Privacy *privacy.Filter
+	// Sessions authorizes browser dashboard requests. Nil disables the session
+	// path entirely, leaving key-and-loopback behaviour byte for byte as it was.
+	Sessions SessionValidator
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
@@ -149,7 +185,7 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			return
 		}
 
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}
@@ -305,7 +341,7 @@ func passthroughHandler(o HandlerOptions) http.HandlerFunc {
 		Transport: NewTransport(TransportOptions{DisableResponseHeaderTimeout: true}),
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}

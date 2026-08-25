@@ -23,7 +23,7 @@ import (
 // gate every other endpoint enforces, loopback exempt (see Authorized).
 func controlHandler(o HandlerOptions, fn func(view.Source, http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}
