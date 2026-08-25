@@ -54,6 +54,16 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Post("/api/v1/accounts/login/{sessionId}/code", loginSubmitCodeHandler(o, loginSessions))
 		cp.Get("/api/v1/accounts/login/{sessionId}", loginPollHandler(o, loginSessions))
 
+		// The dashboard mounts INSIDE the reserved prefix, as a sibling of the
+		// API routes rather than by relaxing cp.NotFound. That handler exists so
+		// a future control path can never fall through to the upstream, and an
+		// unknown path under the prefix must stay a 404.
+		if o.Web != nil {
+			cp.Handle("/", http.StripPrefix(ReservedPrefix, o.Web))
+			cp.Handle("/assets/*", http.StripPrefix(ReservedPrefix, o.Web))
+			cp.Handle("/api/v1/session", http.StripPrefix(ReservedPrefix, o.Web))
+		}
+
 		// Anything else under the reserved prefix is a 404, never a proxied
 		// request: a future control route must not be answerable by the upstream.
 		cp.NotFound(func(w http.ResponseWriter, _ *http.Request) {

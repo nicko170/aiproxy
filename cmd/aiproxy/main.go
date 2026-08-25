@@ -464,6 +464,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		Manager:       mgr,
 		APIKey:        cfg.Listen.APIKey,
 		Sessions:      sessions,
+		Web:           web.Handler(sessions, cfg.Listen.APIKey),
 		BlockedModels: cfg.Routing.BlockedModels,
 		Log:           log,
 		// Paths bound to the client's own paired identity, relayed with its

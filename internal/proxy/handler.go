@@ -153,6 +153,9 @@ type HandlerOptions struct {
 	// Sessions authorizes browser dashboard requests. Nil disables the session
 	// path entirely, leaving key-and-loopback behaviour byte for byte as it was.
 	Sessions SessionValidator
+	// Web serves the browser dashboard under the reserved prefix. Nil leaves
+	// the prefix API-only, which is what every existing test expects.
+	Web http.Handler
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
