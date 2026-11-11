@@ -44,7 +44,6 @@ export function startLogin(onDone) {
         // through unchanged rather than splitting it here.
         await api(`/accounts/login/${encodeURIComponent(sessionId)}/code`, { method: "POST", body: JSON.stringify({ code: code.value.trim() }) });
         body.replaceChildren(el("p", { class: "muted" }, "Exchanging the code…"));
-        poll();
       } catch (ex) { err.textContent = ex.message; }
     };
     body.replaceChildren(
@@ -52,9 +51,16 @@ export function startLogin(onDone) {
       el("p", {}, el("a", { href: r.url, target: "_blank", rel: "noopener" }, "Open the sign-in page")),
       // On a remote deploy the operator may need to move the URL by hand.
       el("input", { type: "text", readonly: true, value: r.url, class: "wide mono", "aria-label": "sign-in URL", onfocus: (e) => e.target.select() }),
-      el("form", { onsubmit: submit }, el("p", {}, "2. Paste the code the page shows you:"), code, err,
+      el("p", { class: "small muted" }, "If this browser is on the aiproxy machine, signing in finishes on its own."),
+      el("form", { onsubmit: submit },
+        el("p", {}, "2. Otherwise paste the code the page shows you — or, if your browser ended on a page that would not load, the full address from its address bar:"),
+        code, err,
         el("div", { class: "controls" }, el("button", { type: "submit" }, "Finish"))));
     code.focus();
+    // Poll from the start, not only after a paste: when the browser is on the
+    // aiproxy host the provider's redirect reaches the local callback and
+    // finishes the login with no code to paste at all.
+    poll();
   }
 
   async function poll() {

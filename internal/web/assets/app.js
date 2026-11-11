@@ -34,6 +34,10 @@ export async function api(path, opts = {}) {
   try { body = await res.json(); } catch { /* non-JSON error bodies exist */ }
   if (!res.ok) {
     const msg = body?.error?.message || `${res.status} ${res.statusText}`;
+    // A 401 anywhere but the sign-in call itself means the session is gone
+    // (expired, signed out elsewhere, or the server restarted). Polling
+    // swallows errors, so without this every screen would sit on stale data.
+    if (res.status === 401 && path !== "/session") sessionLost();
     throw new ApiError(res.status, msg);
   }
   return body;
@@ -145,6 +149,15 @@ export { render };
 // imports api/el/render from this module, and a static import back into it
 // from here would be a load-time cycle. A dynamic import is resolved at call
 // time instead, once both modules have already finished evaluating.
+// sessionLost stops the active screen — its poll would otherwise redraw over
+// the sign-in card — and asks the operator to sign in again.
+function sessionLost() {
+  if (document.body.classList.contains("signin")) return;
+  if (active && active.unmount) active.unmount();
+  active = null;
+  showSignIn("Your session ended. Sign in again.");
+}
+
 async function showSignIn(message) {
   const { showSignIn: show } = await import("./screens/signin.js");
   show(message);
