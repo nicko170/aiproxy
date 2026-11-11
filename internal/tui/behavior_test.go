@@ -796,3 +796,23 @@ func TestOverviewForceKeyOnThePinnedAccountReleasesIt(t *testing.T) {
 		t.Errorf("PinAccount(%q); pressing f on the forced account must clear it, which is the empty id", rec.gotID)
 	}
 }
+
+// An overridden request reads as "asked → sent", and the model column widens
+// to fit it rather than truncating the part that says what was actually sent.
+func TestActivityShowsModelOverride(t *testing.T) {
+	plain := view.Event{Model: "claude-opus-5-5"}
+	over := view.Event{Model: "claude-opus-5-5", RequestedModel: "claude-opus-4-8"}
+	if got := modelCell(plain); got != "claude-opus-5-5" {
+		t.Errorf("plain cell = %q", got)
+	}
+	want := "claude-opus-4-8 → claude-opus-5-5"
+	if got := modelCell(over); got != want {
+		t.Errorf("override cell = %q, want %q", got, want)
+	}
+	if w := modelWidthFor([]view.Event{plain}); w != modelColWidth {
+		t.Errorf("plain width = %d, want %d", w, modelColWidth)
+	}
+	if w := modelWidthFor([]view.Event{plain, over}); w != len([]rune(want)) {
+		t.Errorf("override width = %d, want %d", w, len([]rune(want)))
+	}
+}

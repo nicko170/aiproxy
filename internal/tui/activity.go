@@ -152,10 +152,39 @@ type actCol struct {
 	cell  func(m Model, e view.Event) string
 }
 
-func activityColumns(width int) []actCol {
+func activityColumns(width int) []actCol { return activityColumnsFor(width, modelColWidth) }
+
+// modelColWidth fits any current model id. maxModelColWidth bounds how far an
+// overridden row ("claude-opus-4-8 → claude-opus-5-5") may widen it.
+const (
+	modelColWidth    = 21
+	maxModelColWidth = 40
+)
+
+// modelCell is the model a request was sent as, prefixed by what the client
+// asked for when the model override replaced it.
+func modelCell(e view.Event) string {
+	if e.RequestedModel != "" {
+		return e.RequestedModel + " → " + e.Model
+	}
+	return e.Model
+}
+
+// modelWidthFor widens the model column just enough for the widest row.
+func modelWidthFor(events []view.Event) int {
+	w := modelColWidth
+	for _, e := range events {
+		if n := len([]rune(modelCell(e))); n > w {
+			w = n
+		}
+	}
+	return min(w, maxModelColWidth)
+}
+
+func activityColumnsFor(width, modelWidth int) []actCol {
 	all := []actCol{
 		{"time", 8, false, func(m Model, e view.Event) string { return formatClockSec(e.Time, m.loc) }},
-		{"model", 21, false, func(m Model, e view.Event) string { return e.Model }},
+		{"model", modelWidth, false, func(m Model, e view.Event) string { return modelCell(e) }},
 		{"account", 18, false, func(m Model, e view.Event) string { return m.accountLabel(e.Account) }},
 		{"st", 3, false, func(m Model, e view.Event) string { return fmt.Sprintf("%d", e.Status) }},
 		{"dur", 7, true, func(m Model, e view.Event) string { return formatMS(e.DurationMS) }},
@@ -250,7 +279,7 @@ func (m Model) viewActivity(h int) string {
 		return caption + "\n\n" + overlay(th.dim(hint), m.width, h-2)
 	}
 
-	cols := activityColumns(m.width)
+	cols := activityColumnsFor(m.width, modelWidthFor(events))
 	head := make([]string, 0, len(cols))
 	for _, c := range cols {
 		if c.right {

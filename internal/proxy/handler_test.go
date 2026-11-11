@@ -648,3 +648,85 @@ func TestRouterRefusesOversizeBodyWithoutCallingUpstream(t *testing.T) {
 		})
 	}
 }
+
+func TestOverrideModel(t *testing.T) {
+	cases := []struct {
+		name, body, requested, override string
+		wantModel                       string
+		wantChanged                     bool
+	}{
+		{"rewrites a same-family model", `{"model":"claude-opus-4-8","max_tokens":5}`, "claude-opus-4-8", "claude-opus-5-5", "claude-opus-5-5", true},
+		{"off when empty", `{"model":"claude-opus-4-8"}`, "claude-opus-4-8", "", "claude-opus-4-8", false},
+		{"no-op when already asked for", `{"model":"claude-opus-5-5"}`, "claude-opus-5-5", "claude-opus-5-5", "claude-opus-5-5", false},
+		{"leaves another family alone", `{"model":"gpt-5-codex"}`, "gpt-5-codex", "claude-opus-5-5", "gpt-5-codex", false},
+		{"no model, no rewrite", `{}`, "", "claude-opus-5-5", "", false},
+	}
+	for _, c := range cases {
+		got, changed := OverrideModel([]byte(c.body), c.requested, c.override)
+		if changed != c.wantChanged {
+			t.Errorf("%s: changed = %v, want %v", c.name, changed, c.wantChanged)
+		}
+		if m := ParseModel(got); m != c.wantModel {
+			t.Errorf("%s: model = %q, want %q", c.name, m, c.wantModel)
+		}
+	}
+
+	// Everything but the model survives, including characters json.Marshal
+	// would otherwise HTML-escape.
+	got, _ := OverrideModel([]byte(`{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"a<b && c>d"}]}`),
+		"claude-haiku-4-5", "claude-opus-5-5")
+	if !strings.Contains(string(got), `"content":"a<b && c>d"`) {
+		t.Errorf("message content was altered: %s", got)
+	}
+}
+
+// The override is read from the Manager per request, so setting it applies to
+// the very next request: the upstream sees the overridden model and the
+// result records what the client originally asked for.
+func TestRouterAppliesModelOverrideLive(t *testing.T) {
+	var reqs []Request
+	var mu sync.Mutex
+	h := newRouterHarness(t, func(o *HandlerOptions) {
+		inner := o.OnResult
+		o.OnResult = func(req Request, r Result) {
+			mu.Lock()
+			reqs = append(reqs, req)
+			mu.Unlock()
+			inner(req, r)
+		}
+	}, testutil.Script{Status: 200, Body: `{}`}, testutil.Script{Status: 200, Body: `{}`})
+
+	post := func() {
+		t.Helper()
+		res, err := http.Post(h.srv.URL+"/v1/messages", "application/json",
+			strings.NewReader(`{"model":"claude-opus-4-8","max_tokens":5}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+	}
+
+	post()
+	h.mgr.SetModelOverride("claude-opus-5-5")
+	post()
+
+	up := h.up.Requests()
+	if len(up) != 2 {
+		t.Fatalf("upstream saw %d requests, want 2", len(up))
+	}
+	if m := ParseModel(up[0].Body); m != "claude-opus-4-8" {
+		t.Errorf("before override, upstream model = %q", m)
+	}
+	if m := ParseModel(up[1].Body); m != "claude-opus-5-5" {
+		t.Errorf("after override, upstream model = %q, want claude-opus-5-5", m)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if reqs[0].RequestedModel != "" {
+		t.Errorf("unoverridden request reported RequestedModel %q", reqs[0].RequestedModel)
+	}
+	if reqs[1].Model != "claude-opus-5-5" || reqs[1].RequestedModel != "claude-opus-4-8" {
+		t.Errorf("overridden request = model %q requested %q", reqs[1].Model, reqs[1].RequestedModel)
+	}
+}

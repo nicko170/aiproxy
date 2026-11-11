@@ -3,6 +3,7 @@ package view
 import (
 	"fmt"
 	"path"
+	"strings"
 
 	"github.com/nicko170/aiproxy/internal/privacy"
 )
@@ -39,6 +40,9 @@ func (s Settings) Validate() error {
 		if _, err := path.Match(pattern, ""); err != nil {
 			return fmt.Errorf("blockedModels pattern %q is not a valid glob: %w", pattern, err)
 		}
+	}
+	if strings.ContainsAny(strings.TrimSpace(s.ModelOverride), " \t\n,") {
+		return fmt.Errorf("modelOverride must be a single model name, got %q", s.ModelOverride)
 	}
 	// Empty is accepted here as the documented default (closed /
 	// passthrough): config.loadLocked fills in a non-empty value on any real

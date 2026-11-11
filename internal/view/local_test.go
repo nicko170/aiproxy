@@ -1270,3 +1270,43 @@ func TestValidateRejectsAnUnknownFailureMode(t *testing.T) {
 		t.Fatal("Validate accepted an unknown scan-failure mode")
 	}
 }
+
+// modelOverride is live: UpdateSettings persists it, reports it under Live,
+// and the Manager the proxy handler reads from sees it immediately. A
+// value that is not a single model name is refused before anything is written.
+func TestUpdateSettingsAppliesModelOverrideLive(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+	s, err := h.local.Settings(context.Background())
+	if err != nil {
+		t.Fatalf("Settings: %v", err)
+	}
+
+	s.ModelOverride = " claude-opus-5-5 "
+	applied, err := h.local.UpdateSettings(context.Background(), s)
+	if err != nil {
+		t.Fatalf("UpdateSettings: %v", err)
+	}
+	if !slices.Contains(applied.Live, "modelOverride") || slices.Contains(applied.NeedsRestart, "modelOverride") {
+		t.Errorf("applied = %+v, want modelOverride live", applied)
+	}
+	if got := h.mgr.ModelOverride(); got != "claude-opus-5-5" {
+		t.Errorf("Manager.ModelOverride = %q, want trimmed claude-opus-5-5", got)
+	}
+	cfg, _ := h.cs.Load()
+	if cfg.Routing.ModelOverride != "claude-opus-5-5" {
+		t.Errorf("persisted modelOverride = %q", cfg.Routing.ModelOverride)
+	}
+
+	s.ModelOverride = "claude-opus-5-5, claude-sonnet-5-5"
+	if _, err := h.local.UpdateSettings(context.Background(), s); err == nil {
+		t.Error("a list of models must be refused")
+	}
+
+	s.ModelOverride = ""
+	if _, err := h.local.UpdateSettings(context.Background(), s); err != nil {
+		t.Fatalf("clearing: %v", err)
+	}
+	if got := h.mgr.ModelOverride(); got != "" {
+		t.Errorf("after clearing, Manager.ModelOverride = %q", got)
+	}
+}

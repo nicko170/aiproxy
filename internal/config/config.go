@@ -38,10 +38,16 @@ type Listen struct {
 	APIKey string `json:"apiKey"`
 }
 
+// Routing.ModelOverride, when set, replaces the model a client asked for with this
+// one before routing. It only rewrites requests in the same model family (the
+// text before the first "-": "claude" for "claude-opus-5-5"), so forcing a
+// Claude model leaves Codex's gpt-* traffic alone rather than sending a
+// Responses-API body to Anthropic. Empty disables it.
 type Routing struct {
 	SwitchThreshold float64  `json:"switchThreshold"`
 	SessionAffinity bool     `json:"sessionAffinity"`
 	BlockedModels   []string `json:"blockedModels"`
+	ModelOverride   string   `json:"modelOverride,omitempty"`
 }
 
 // Retry holds three independent clocks, and conflating them is a defect that
