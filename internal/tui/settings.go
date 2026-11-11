@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -134,6 +135,7 @@ func settingFields() []settingField {
 			set: func(*view.Settings, string) error {
 				return fmt.Errorf("routing rules are edited in the rules editor")
 			},
+			opens: openRulesEditor,
 		},
 		{
 			name: "retryBudgetMs", unit: "ms",
@@ -245,6 +247,9 @@ type settingsState struct {
 	// justApplied names fields confirmed live by the last update, cleared on
 	// the next edit.
 	justApplied map[string]bool
+
+	// rules is the routing-rules editor, open when non-nil.
+	rules *rulesEditor
 }
 
 func newSettingsState() settingsState {
@@ -295,6 +300,12 @@ func (m Model) updateSettings(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		m.settings.updateErr = ""
 		m.settings.current = msg.s
+		if m.settings.rules != nil {
+			m.settings.rules.rules = slices.Clone(msg.s.RoutingRules)
+			if m.settings.rules.sel >= len(m.settings.rules.rules) {
+				m.settings.rules.sel = max(len(m.settings.rules.rules)-1, 0)
+			}
+		}
 		m.settings.justApplied = map[string]bool{}
 		for _, f := range msg.applied.Live {
 			m.settings.justApplied[f] = true
@@ -309,6 +320,9 @@ func (m Model) updateSettings(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m Model) settingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.settings.rules != nil {
+		return m.rulesKey(msg)
+	}
 	s := &m.settings
 	fields := settingFields()
 
@@ -404,6 +418,9 @@ func (m Model) pushSettings(next view.Settings) tea.Cmd {
 }
 
 func (m Model) settingsFooter() []string {
+	if m.settings.rules != nil {
+		return m.rulesFooter()
+	}
 	if m.settings.editing {
 		return []string{"enter save", "esc cancel"}
 	}
@@ -418,6 +435,10 @@ func (m Model) viewSettings(h int) string {
 	}
 	if !s.loaded {
 		return "\n  " + th.dim("loading settings…")
+	}
+
+	if s.rules != nil {
+		return m.viewRules()
 	}
 
 	fields := settingFields()

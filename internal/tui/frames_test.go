@@ -154,6 +154,17 @@ func frameCases() map[string]func(w, h int) Model {
 			m.accounts = nil
 			return m
 		},
+		"rules": func(w, h int) Model {
+			m := fixtureModel(w, h)
+			m.screen = screenSettings
+			m.settings.loaded = true
+			m.accounts[0].Group = "gt"
+			m.settings.rules = newRulesEditor([]view.RoutingRule{
+				{Match: "Primary working directory: /Users/nick/code/GT", Group: "gt"},
+				{Match: "<cwd>/Users/nick/code/client", Group: "client", Strict: true},
+			})
+			return m
+		},
 		"activity": func(w, h int) Model {
 			m := fixtureModel(w, h)
 			m.screen = screenActivity

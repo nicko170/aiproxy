@@ -1,0 +1,28 @@
+! aiproxy  ·  on 127.0.0.1:8118  ·  2 in flight             
+  1 overview   2 activity   3 usage   4 accounts   5 setting
+────────────────────────────────────────────────────────────
+  routing rules  ·  text in a request → preferred group, fir
+
+  ▸ 1. gt  ← "Primary working directory: /Users/nick/co…
+    2. client [strict]  ← "<cwd>/Users/nick/code/client"
+       no accounts in this group
+
+  groups with accounts: (ungrouped) ×1, gt ×1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  a add  ·  e edit  ·  s strict  ·  ? help  ·  q quit       

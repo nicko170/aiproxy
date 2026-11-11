@@ -463,7 +463,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.login.picking {
 		return m.loginPickKey(msg)
 	}
-	if m.screen == screenSettings && m.settings.editing {
+	if m.screen == screenSettings && (m.settings.editing || m.settings.rules != nil) {
 		return m.settingsKey(msg)
 	}
 	// A MODAL prompt on the Accounts screen owns the keyboard, exactly like the
