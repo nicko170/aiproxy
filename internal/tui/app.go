@@ -923,7 +923,7 @@ func (m Model) viewHelp(h int) string {
 		{"g", "group by account, model, or outcome"},
 		{"accounts", ""},
 		{"e", "enable or disable"},
-		{"+/- g", "priority up or down; g sets the routing group"},
+		{"+/- g", "priority; g sets the routing group"},
 		{"x", "remove (asks first)"},
 		{"i", "import credentials"},
 	}
