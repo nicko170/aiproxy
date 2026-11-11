@@ -24,6 +24,10 @@ type Account struct {
 	Identity   Identity            `json:"identity"`
 	Upstream   string              `json:"upstream,omitempty"`
 	ModelMap   map[string]string   `json:"modelMap,omitempty"`
+	// Group names the routing group this account belongs to. Empty is the
+	// ungrouped group, which is what every account is in until an operator
+	// says otherwise.
+	Group string `json:"group,omitempty"`
 }
 
 type Identity struct {
@@ -48,6 +52,22 @@ type Routing struct {
 	SessionAffinity bool     `json:"sessionAffinity"`
 	BlockedModels   []string `json:"blockedModels"`
 	ModelOverride   string   `json:"modelOverride,omitempty"`
+	// Rules prefer a group of accounts for requests whose body contains a
+	// rule's text; see RoutingRule. First match wins. Work no rule matches
+	// prefers DefaultGroup. With no rules and no account groups, every request
+	// prefers the ungrouped group, which is every account: routing unchanged.
+	Rules         []RoutingRule `json:"rules"`
+	DefaultGroup  string        `json:"defaultGroup"`
+	DefaultStrict bool          `json:"defaultStrict"`
+}
+
+// RoutingRule prefers Group for any request whose body contains Match, as
+// literal case-sensitive text. Strict keeps that work in the group even when
+// every account in it is spent; otherwise it spills onto the rest.
+type RoutingRule struct {
+	Match  string `json:"match"`
+	Group  string `json:"group"`
+	Strict bool   `json:"strict,omitempty"`
 }
 
 // Retry holds three independent clocks, and conflating them is a defect that
@@ -237,7 +257,7 @@ func Default() Config {
 	return Config{
 		Listen:   Listen{Addr: "127.0.0.1:3456", APIKey: newAPIKey()},
 		Accounts: []Account{},
-		Routing:  Routing{SwitchThreshold: 0.98, SessionAffinity: true, BlockedModels: []string{}},
+		Routing:  Routing{SwitchThreshold: 0.98, SessionAffinity: true, BlockedModels: []string{}, Rules: []RoutingRule{}},
 		Retry: Retry{
 			BudgetMS: 10000, InlineAbsorbMaxMS: 5000, BodyIdleMS: 120000,
 			HeaderTimeoutMS: 60000, OverloadedBudgetMS: 30000,

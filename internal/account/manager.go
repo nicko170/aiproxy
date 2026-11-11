@@ -65,6 +65,14 @@ type Manager struct {
 	// persisted — a forced override is a live intervention, and one set days
 	// ago silently applying after a restart is a surprise, not a setting.
 	pinned string
+
+	// rules, defaultRoute and sessionRoutes are the routing-rule state; see
+	// route.go. sessionRoutes remembers the route a session's first matching
+	// request decided, so background calls that omit the matched text follow
+	// it. Same lifetime as affinity: in memory, never pruned.
+	rules         []compiledRule
+	defaultRoute  Route
+	sessionRoutes map[string]Route
 }
 
 func New(accts []config.Account, providers map[string]provider.Provider, opts Options) *Manager {
@@ -85,6 +93,9 @@ func New(accts []config.Account, providers map[string]provider.Provider, opts Op
 		opts:       opts,
 		refreshing: map[string]*refreshCall{},
 		affinity:   map[string]string{},
+
+		defaultRoute:  Route{Rule: -1},
+		sessionRoutes: map[string]Route{},
 	}
 	for _, c := range accts {
 		a := fromConfig(c)
