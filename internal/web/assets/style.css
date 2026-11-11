@@ -10,3 +10,38 @@
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--fg);
        font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+/* Shell chrome */
+header { display: flex; align-items: center; gap: 1.5rem;
+         padding: 0.6rem 1rem; border-bottom: 1px solid var(--line); }
+header h1 { font-size: 1rem; margin: 0; }
+nav { display: flex; gap: 1rem; flex: 1; }
+nav a { color: var(--muted); text-decoration: none; padding: 0.25rem 0; }
+nav a:hover { color: var(--fg); }
+nav a.active { color: var(--accent); border-bottom: 2px solid var(--accent); }
+#signout { background: none; border: 1px solid var(--line); color: var(--fg);
+           border-radius: 4px; padding: 0.3rem 0.6rem; cursor: pointer; }
+#signout:hover { border-color: var(--accent); }
+main { padding: 1rem; }
+
+/* Connection indicator, driven by app.js's setConnState */
+.conn { display: inline-block; width: 0.6rem; height: 0.6rem; border-radius: 50%;
+        background: var(--muted); }
+.conn.live { background: #2fa84f; }
+.conn.reconnecting { background: #d98c2b; }
+
+/* Sign-in replaces the whole shell; hide the chrome while it is up. */
+body.signin header { display: none; }
+.signin-card { max-width: 22rem; margin: 4rem auto; display: flex;
+               flex-direction: column; gap: 0.5rem; padding: 1.5rem;
+               border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.signin-card h1 { margin: 0 0 0.5rem; }
+.signin-card input { padding: 0.5rem; border: 1px solid var(--line); border-radius: 4px;
+                      background: var(--bg); color: var(--fg); }
+.signin-card button { padding: 0.5rem; border: 1px solid var(--accent); border-radius: 4px;
+                       background: var(--accent); color: #fff; cursor: pointer; }
+.error-text { color: #c0392b; min-height: 1.2em; margin: 0; }
+
+/* Generic screen-load failure card, built by app.js's render() */
+.error { padding: 1rem; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); }
+.error code { display: block; margin: 0.5rem 0; white-space: pre-wrap; }

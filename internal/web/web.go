@@ -74,12 +74,15 @@ var (
 )
 
 // referencedAssets extracts local asset paths from the shell, ignoring
-// absolute URLs and anything with a scheme.
+// absolute URLs, anything with a scheme, and in-page hash routes (the SPA's
+// nav uses href="#/overview" for real anchor semantics — keyboard focus, a
+// visible status-bar URL, no-JS fallback affordance — and that is a route,
+// never an asset).
 func referencedAssets(html string) []string {
 	var out []string
 	for _, m := range hrefSrc.FindAllStringSubmatch(html, -1) {
 		ref := m[2]
-		if ref == "" || strings.HasPrefix(ref, "/") || strings.Contains(ref, "//") {
+		if ref == "" || strings.HasPrefix(ref, "/") || strings.HasPrefix(ref, "#") || strings.Contains(ref, "//") {
 			continue
 		}
 		out = append(out, ref)
