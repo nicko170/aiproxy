@@ -1,0 +1,5 @@
+{
+  "//": "Test-time only: tells node --test these files are ES modules. Not a build step; nothing installs from here.",
+  "type": "module",
+  "private": true
+}
