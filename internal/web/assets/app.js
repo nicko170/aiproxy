@@ -93,9 +93,22 @@ function ensureSource() {
   connect();
 }
 
+let connState = "connecting";
+const connHandlers = new Set();
+
 function setConnState(state) {
+  connState = state;
   const dot = document.getElementById("conn");
   if (dot) { dot.className = "conn " + state; dot.title = state; }
+  for (const h of connHandlers) h(state);
+}
+
+// onConnState reports the event feed's connection state now and on every
+// change; returns an unsubscribe function.
+export function onConnState(handler) {
+  connHandlers.add(handler);
+  handler(connState);
+  return () => connHandlers.delete(handler);
 }
 
 const screens = new Map();
@@ -142,7 +155,7 @@ async function showSignIn(message) {
 // SCREENS are loaded with dynamic imports, after this module has finished
 // evaluating: each screen imports registerScreen from here, and a static
 // import cycle would run the screen before `screens` exists.
-const SCREENS = ["overview"];
+const SCREENS = ["overview", "activity"];
 let screensLoaded = null;
 function loadScreens() {
   screensLoaded ??= Promise.all(SCREENS.map((n) => import(`./screens/${n}.js`)));

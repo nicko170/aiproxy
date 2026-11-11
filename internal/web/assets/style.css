@@ -125,3 +125,15 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 .empty-state { padding: 2rem; text-align: center; border: 1px dashed var(--line); border-radius: 8px; }
 .skeleton .bar { height: 0.8rem; background: var(--line); border-radius: 4px; }
 .skeleton .bar.short { width: 60%; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 0.6rem 1rem; align-items: center; margin-bottom: 0.6rem; }
+.filter { display: flex; gap: 0.35rem; align-items: center; font-size: 12px; color: var(--muted); }
+select, input, textarea { background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 0.25rem 0.4rem; font: inherit; font-size: 13px; }
+.banner { background: var(--panel); border: 1px solid var(--warning); border-radius: 6px; padding: 0.5rem 0.8rem; margin-bottom: 0.6rem; }
+table.feed { width: 100%; border-collapse: collapse; font-size: 12px; }
+.feed th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); padding: 0.3rem 0.5rem; }
+.feed td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.feed td.num { font-variant-numeric: tabular-nums; }
+.feed tr.sev-warn td:nth-child(5) { color: var(--warning); }
+.feed tr.sev-bad td:nth-child(5) { color: var(--danger); }
+.feed .spill { color: var(--muted); }
+.empty-row { text-align: center; padding: 1.5rem !important; }
