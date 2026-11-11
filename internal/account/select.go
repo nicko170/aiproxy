@@ -18,6 +18,13 @@ type SelectRequest struct {
 	SessionID string
 	// Exclude holds account ids already attempted or refused for this request.
 	Exclude map[string]bool
+	// Group is the routing group this request prefers (see Route). Accounts in
+	// it are chosen ahead of all others while any can serve; the zero value
+	// prefers ungrouped accounts, which with no groups configured is all of
+	// them. Strict forbids spilling outside the group, and beats both the pin
+	// and session affinity.
+	Group  string
+	Strict bool
 }
 
 // BucketAppliesTo reports whether a quota bucket constrains a given model.
@@ -89,23 +96,43 @@ func (m *Manager) Select(req SelectRequest) (Account, error) {
 	nowMS := m.opts.Now().UnixMilli()
 
 	// The operator override comes first: ahead of affinity, ahead of ranking.
-	if a := m.pinnedChoiceLocked(req, nowMS); a != nil {
-		return copyAccount(a), nil
+	// Strict work skips a pin outside its group without touching it — a strict
+	// rule is a wall, and the pin still applies to everything else.
+	if !req.Strict || m.pinnedInGroupLocked(req.Group) {
+		if a := m.pinnedChoiceLocked(req, nowMS); a != nil {
+			return copyAccount(a), nil
+		}
 	}
 
+	eligible := make([]*Account, 0, len(m.accounts))
+	var inGroup []*Account
+	for _, a := range m.accounts {
+		if m.eligibleLocked(a, req, nowMS) {
+			eligible = append(eligible, a)
+			if a.Group == req.Group {
+				inGroup = append(inGroup, a)
+			}
+		}
+	}
+
+	// Affinity holds inside the preferred group. Outside it — a session that
+	// spilled — it holds only while the group still cannot serve, so spilled
+	// work comes home when the group recovers, at the cost of one cold cache.
 	if m.opts.SessionAffinity && req.SessionID != "" {
 		if id, ok := m.affinity[req.SessionID]; ok {
-			if a := m.byID[id]; a != nil && m.eligibleLocked(a, req, nowMS) {
+			if a := m.byID[id]; a != nil && m.eligibleLocked(a, req, nowMS) &&
+				(a.Group == req.Group || (len(inGroup) == 0 && !req.Strict)) {
 				return copyAccount(a), nil
 			}
 		}
 	}
 
-	candidates := make([]*Account, 0, len(m.accounts))
-	for _, a := range m.accounts {
-		if m.eligibleLocked(a, req, nowMS) {
-			candidates = append(candidates, a)
-		}
+	candidates := eligible
+	switch {
+	case len(inGroup) > 0:
+		candidates = inGroup
+	case req.Strict:
+		return Account{}, ErrNoAccount
 	}
 	if len(candidates) == 0 {
 		return Account{}, ErrNoAccount
@@ -286,6 +313,12 @@ func (m *Manager) Pinned() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.pinned
+}
+
+// pinnedInGroupLocked reports whether the pinned account is in group.
+func (m *Manager) pinnedInGroupLocked(group string) bool {
+	a := m.byID[m.pinned]
+	return a != nil && a.Group == group
 }
 
 // pinnedChoiceLocked resolves the override for one request. It returns the
