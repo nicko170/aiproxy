@@ -1,4 +1,5 @@
 import { api, el, registerScreen } from "../app.js";
+import { readField } from "../form.js";
 
 // Mirrors view.restartSettingsFields: these are persisted at once but only
 // adopted by the running proxy after a restart. Labelled up front, and the
@@ -53,12 +54,10 @@ function input(name, kind, value, opts = {}) {
   return el("input", { type: "text", id: name, value: value ?? "" });
 }
 
-function readInput(node, kind) {
-  if (kind === "bool") return node.checked;
-  if (kind === "list") return node.value.split(",").map((s) => s.trim()).filter(Boolean);
-  if (kind === "int") return parseInt(node.value, 10);
-  if (kind === "number") return parseFloat(node.value);
-  return node.value;
+function readInput(node, kind, original) {
+  if (kind === "bool") return { value: node.checked };
+  if (Array.isArray(kind)) return { value: node.value };
+  return readField(kind, node.value, original);
 }
 
 // routingCard edits routingRules, defaultGroup and defaultStrict. It owns a
@@ -131,16 +130,23 @@ registerScreen("settings", {
     const sections = FIELDS.map(([title, fields]) => el("section", { class: "panel" }, el("h3", {}, title),
       fields.map(([name, kind, help, opts]) => {
         const node = input(name, kind, s[name], opts);
-        nodes.set(name, [node, kind]);
+        const err = el("span", { class: "field-error" });
+        nodes.set(name, [node, kind, err]);
         return el("div", { class: "row" }, el("label", { for: name }, name), node,
-          el("span", { class: "help" }, help, RESTART.has(name) ? el("span", { class: "pill warn" }, "takes effect on restart") : null));
+          el("span", { class: "help" }, help, RESTART.has(name) ? el("span", { class: "pill warn" }, "takes effect on restart") : null, err));
       })));
     const routing = routingCard(s, groups);
     sections.splice(1, 0, routing);
 
     const save = el("button", { class: "primary", onclick: async () => {
       const next = { ...s };
-      for (const [name, [node, kind]] of nodes) next[name] = readInput(node, kind);
+      let bad = false;
+      for (const [name, [node, kind, err]] of nodes) {
+        const r = readInput(node, kind, s[name]);
+        err.textContent = r.error || "";
+        if (r.error) bad = true; else next[name] = r.value;
+      }
+      if (bad) { result.replaceChildren(el("p", { class: "error-text" }, "Fix the highlighted fields.")); return; }
       Object.assign(next, routing.collect());
       result.replaceChildren(el("p", { class: "muted" }, "Saving…"));
       try {
