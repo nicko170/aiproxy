@@ -56,6 +56,9 @@ type Source interface {
 	// an empty id clears the override and restores normal routing.
 	PinAccount(ctx context.Context, accountID string) error
 	SetPriority(ctx context.Context, accountID string, priority int) error
+	// SetAccountGroup moves an account into a routing group; empty is
+	// ungrouped. Live and persisted.
+	SetAccountGroup(ctx context.Context, accountID, group string) error
 	RemoveAccount(ctx context.Context, accountID string) error
 
 	// Settings reads the live-tunable subset of config back (spec §6.2), so a

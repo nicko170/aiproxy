@@ -155,6 +155,8 @@ type Account struct {
 	RateLimitedUntil int64              `json:"rateLimitedUntil,omitempty"`
 	PausedUntil      int64              `json:"pausedUntil,omitempty"`
 	Buckets          map[string]float64 `json:"buckets"`
+	// Group is the account's routing group; empty is ungrouped.
+	Group string `json:"group"`
 }
 
 // Window is a closed-open time range in unix ms, mirroring metrics.Window but
@@ -253,9 +255,18 @@ type Settings struct {
 	BlockedModels     []string `json:"blockedModels"`
 	// ModelOverride, when set, replaces the model of every same-family
 	// request (see config.Routing.ModelOverride). Live.
-	ModelOverride             string `json:"modelOverride"`
-	QuotaProbeIntervalSeconds int    `json:"quotaProbeIntervalSeconds"`
-	MetricsRetentionDays      int    `json:"metricsRetentionDays"`
+	ModelOverride string `json:"modelOverride"`
+	// RoutingRules, DefaultGroup and DefaultStrict configure routing rules
+	// (config.RoutingRule). All three are live. Absent on the wire — a nil
+	// slice or nil pointer — means "keep the current value", so a client that
+	// predates them, or a script that only touches one field, cannot silently
+	// wipe a strict rule. An explicit empty list clears the rules. Settings()
+	// always returns all three present.
+	RoutingRules              []RoutingRule `json:"routingRules"`
+	DefaultGroup              *string       `json:"defaultGroup,omitempty"`
+	DefaultStrict             *bool         `json:"defaultStrict,omitempty"`
+	QuotaProbeIntervalSeconds int           `json:"quotaProbeIntervalSeconds"`
+	MetricsRetentionDays      int           `json:"metricsRetentionDays"`
 	// UpdateCheckEnabled and UpdateCheckIntervalHours control the background
 	// release check. Enabled is live-tunable; the interval is not, because the
 	// checker's ticker is built once at startup.
@@ -273,6 +284,14 @@ type Settings struct {
 	// replaced by the default, the same way the two failure modes read "".
 	PrivacyScanTimeoutMS int      `json:"privacyScanTimeoutMs"`
 	PrivacyDenylist      []string `json:"privacyDenylist"`
+}
+
+// RoutingRule prefers Group for requests whose body contains Match; see
+// config.RoutingRule.
+type RoutingRule struct {
+	Match  string `json:"match"`
+	Group  string `json:"group"`
+	Strict bool   `json:"strict"`
 }
 
 // Applied reports which fields an UpdateSettings call actually put into

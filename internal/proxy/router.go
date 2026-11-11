@@ -36,6 +36,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Get("/api/v1/events", eventsHandler(o))
 		cp.Post("/api/v1/accounts/{id}/enabled", setAccountEnabledHandler(o))
 		cp.Post("/api/v1/accounts/{id}/priority", setAccountPriorityHandler(o))
+		cp.Post("/api/v1/accounts/{id}/group", setAccountGroupHandler(o))
 		cp.Delete("/api/v1/accounts/{id}", removeAccountHandler(o))
 		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))

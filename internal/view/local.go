@@ -282,6 +282,7 @@ func (l *Local) Accounts(ctx context.Context) ([]Account, error) {
 			RateLimitedUntil: a.RateLimitedUntil,
 			PausedUntil:      a.PausedUntil,
 			Buckets:          buckets,
+			Group:            a.Group,
 		})
 	}
 	return out, nil
@@ -384,6 +385,24 @@ func (l *Local) SetPriority(ctx context.Context, accountID string, priority int)
 	return l.mgr.SetPriority(accountID, priority)
 }
 
+// SetAccountGroup mirrors SetPriority: persist, then apply to the Manager, under
+// l.mu so the file and the live state cannot disagree.
+func (l *Local) SetAccountGroup(ctx context.Context, accountID, group string) error {
+	group = strings.TrimSpace(group)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if _, ok := l.mgr.Get(accountID); !ok {
+		return fmt.Errorf("%w: %q", ErrUnknownAccount, accountID)
+	}
+	if _, err := l.config.Update(func(c *config.Config) error {
+		return setAccountField(c, accountID, func(a *config.Account) { a.Group = group })
+	}); err != nil {
+		return err
+	}
+	return l.mgr.SetGroup(accountID, group)
+}
+
 // RemoveAccount drops the account from the config store, the live Manager,
 // and — inside Manager.Remove — any session affinity pinned to it.
 func (l *Local) RemoveAccount(ctx context.Context, accountID string) error {
@@ -428,6 +447,9 @@ func settingsFromConfig(c config.Config) Settings {
 		SessionAffinity:           c.Routing.SessionAffinity,
 		BlockedModels:             c.Routing.BlockedModels,
 		ModelOverride:             c.Routing.ModelOverride,
+		RoutingRules:              rulesToView(c.Routing.Rules),
+		DefaultGroup:              &c.Routing.DefaultGroup,
+		DefaultStrict:             &c.Routing.DefaultStrict,
 		QuotaProbeIntervalSeconds: c.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      c.Metrics.RetentionDays,
 		UpdateCheckEnabled:        c.Update.CheckEnabled,
@@ -448,7 +470,10 @@ func settingsFromConfig(c config.Config) Settings {
 // wire the corresponding Manager setter; UpdateSettings's diff logic does not
 // change.
 var (
-	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity", "modelOverride", "updateCheckEnabled"}
+	liveSettingsFields = []string{
+		"switchThreshold", "sessionAffinity", "modelOverride", "updateCheckEnabled",
+		"routingRules", "defaultGroup", "defaultStrict",
+	}
 	restartSettingsFields = []string{
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
@@ -509,19 +534,52 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 	}
 
 	s.ModelOverride = strings.TrimSpace(s.ModelOverride)
+	// Pasted rules arrive with stray whitespace and newlines from terminals
+	// and browsers; a rule that silently never matches is worse than a trim.
+	// A fresh slice, so the caller's own is not rewritten under it.
+	if s.RoutingRules != nil {
+		trimmed := make([]RoutingRule, len(s.RoutingRules))
+		for i, r := range s.RoutingRules {
+			trimmed[i] = RoutingRule{Match: strings.TrimSpace(r.Match), Group: strings.TrimSpace(r.Group), Strict: r.Strict}
+		}
+		s.RoutingRules = trimmed
+	}
+	if s.DefaultGroup != nil {
+		g := strings.TrimSpace(*s.DefaultGroup)
+		s.DefaultGroup = &g
+	}
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	var applied Applied
+	var routingChanged bool
+	var routing config.Routing
 	if _, err := l.config.Update(func(c *config.Config) error {
 		before := settingsFromConfig(*c)
+		// Absent routing fields keep their current values; filling them from
+		// before also makes diffSettings see them as unchanged.
+		if s.RoutingRules == nil {
+			s.RoutingRules = before.RoutingRules
+		}
+		if s.DefaultGroup == nil {
+			s.DefaultGroup = before.DefaultGroup
+		}
+		if s.DefaultStrict == nil {
+			s.DefaultStrict = before.DefaultStrict
+		}
 		applied = diffSettings(before, s)
+		routingChanged = !rulesEqual(before.RoutingRules, s.RoutingRules) ||
+			*before.DefaultGroup != *s.DefaultGroup || *before.DefaultStrict != *s.DefaultStrict
 
 		c.Routing.SwitchThreshold = s.SwitchThreshold
 		c.Routing.SessionAffinity = s.SessionAffinity
 		c.Routing.BlockedModels = s.BlockedModels
 		c.Routing.ModelOverride = s.ModelOverride
+		c.Routing.Rules = rulesFromView(s.RoutingRules)
+		c.Routing.DefaultGroup = *s.DefaultGroup
+		c.Routing.DefaultStrict = *s.DefaultStrict
+		routing = c.Routing
 		c.Retry.BudgetMS = s.RetryBudgetMS
 		c.Retry.InlineAbsorbMaxMS = s.InlineAbsorbMaxMS
 		c.Retry.HeaderTimeoutMS = s.HeaderTimeoutMS
@@ -543,6 +601,11 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 	l.mgr.SetSwitchThreshold(s.SwitchThreshold)
 	l.mgr.SetSessionAffinity(s.SessionAffinity)
 	l.mgr.SetModelOverride(s.ModelOverride)
+	// Only on a real change: SetRouting forgets every session's route, and an
+	// unrelated save must not reroute conversations already in flight.
+	if routingChanged {
+		l.mgr.SetRouting(routing.Rules, routing.DefaultGroup, routing.DefaultStrict)
+	}
 	if l.updates != nil {
 		l.updates.SetEnabled(s.UpdateCheckEnabled)
 	}
@@ -562,6 +625,9 @@ func diffSettings(before, after Settings) Applied {
 		"sessionAffinity":           before.SessionAffinity != after.SessionAffinity,
 		"blockedModels":             !stringSlicesEqual(before.BlockedModels, after.BlockedModels),
 		"modelOverride":             before.ModelOverride != after.ModelOverride,
+		"routingRules":              !rulesEqual(before.RoutingRules, after.RoutingRules),
+		"defaultGroup":              derefString(before.DefaultGroup) != derefString(after.DefaultGroup),
+		"defaultStrict":             derefBool(before.DefaultStrict) != derefBool(after.DefaultStrict),
 		"retryBudgetMs":             before.RetryBudgetMS != after.RetryBudgetMS,
 		"inlineAbsorbMaxMs":         before.InlineAbsorbMaxMS != after.InlineAbsorbMaxMS,
 		"headerTimeoutMs":           before.HeaderTimeoutMS != after.HeaderTimeoutMS,
@@ -587,6 +653,45 @@ func diffSettings(before, after Settings) Applied {
 		}
 	}
 	return applied
+}
+
+func rulesToView(rs []config.RoutingRule) []RoutingRule {
+	out := make([]RoutingRule, len(rs))
+	for i, r := range rs {
+		out[i] = RoutingRule{Match: r.Match, Group: r.Group, Strict: r.Strict}
+	}
+	return out
+}
+
+func rulesFromView(rs []RoutingRule) []config.RoutingRule {
+	out := make([]config.RoutingRule, len(rs))
+	for i, r := range rs {
+		out[i] = config.RoutingRule{Match: r.Match, Group: r.Group, Strict: r.Strict}
+	}
+	return out
+}
+
+func rulesEqual(a, b []RoutingRule) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func derefBool(p *bool) bool {
+	return p != nil && *p
 }
 
 func stringSlicesEqual(a, b []string) bool {

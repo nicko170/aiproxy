@@ -41,6 +41,11 @@ func (s Settings) Validate() error {
 			return fmt.Errorf("blockedModels pattern %q is not a valid glob: %w", pattern, err)
 		}
 	}
+	for i, r := range s.RoutingRules {
+		if strings.TrimSpace(r.Match) == "" {
+			return fmt.Errorf("routingRules[%d].match must not be blank", i)
+		}
+	}
 	if strings.ContainsAny(strings.TrimSpace(s.ModelOverride), " \t\n,") {
 		return fmt.Errorf("modelOverride must be a single model name, got %q", s.ModelOverride)
 	}

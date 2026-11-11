@@ -285,6 +285,26 @@ func setAccountPriorityHandler(o HandlerOptions) http.HandlerFunc {
 	})
 }
 
+type groupBody struct {
+	Group string `json:"group"`
+}
+
+func setAccountGroupHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		var body groupBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+			return
+		}
+		if err := src.SetAccountGroup(r.Context(), id, body.Group); err != nil {
+			writeMutationError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
+}
+
 func removeAccountHandler(o HandlerOptions) http.HandlerFunc {
 	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
 		id := chi.URLParam(r, "id")
