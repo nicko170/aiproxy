@@ -186,3 +186,20 @@ func TestRouterNonStrictWorkWhoseGroupWasEmptiedMidSessionSpills(t *testing.T) {
 		t.Errorf("result = %+v, want served by personal and marked spilled", r)
 	}
 }
+
+// The group exists and is healthy but cannot serve this model at all — a
+// path-only strict rule that also matches Codex bodies, against a Claude-only
+// group. Waiting fixes nothing, so it must not be a retryable 429 forever.
+func TestRouterStrictRefusalWhenTheGroupLacksTheModelIsNotRetryable(t *testing.T) {
+	h := newGroupedHarness(t, nil)
+	h.mgr.SetRouting(gtRules(true), "personal", false)
+	h.mgr.UpdateModels("gt", []provider.Model{{ID: "claude-sonnet-5"}})
+
+	res, body := post(t, h, gtPrompt, "") // asks for claude-opus-5
+	if res.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d (Retry-After %q), want a non-retryable 502: %s", res.StatusCode, res.Header.Get("Retry-After"), body)
+	}
+	if !strings.Contains(body, "claude-opus-5") || !strings.Contains(body, `\"gt\"`) {
+		t.Errorf("body should name the model and the group: %s", body)
+	}
+}

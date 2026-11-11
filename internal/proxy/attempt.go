@@ -323,7 +323,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 			Group: req.Route.Group, Strict: req.Route.Strict,
 		})
 		if err != nil {
-			a.writeNoAccount(w, &res, refused, req.Route)
+			a.writeNoAccount(w, &res, refused, req.Route, req.Model)
 			return res
 		}
 		res.AccountID = acct.ID
@@ -902,7 +902,7 @@ func (a *Attempter) writeRetryAfter(w http.ResponseWriter, res *Result, d time.D
 // health is no reason to give up. A strict group with nothing usable in it —
 // emptied, disabled, or errored — gets a non-retryable answer naming the
 // group, because waiting fixes none of those.
-func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused map[string]bool, route account.Route) {
+func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused map[string]bool, route account.Route, model string) {
 	inScope := anyAccount
 	if route.Strict {
 		inScope = func(acct account.Account) bool { return acct.Group == route.Group }
@@ -917,16 +917,24 @@ func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused m
 			continue
 		}
 		total++
-		if acct.Status != account.StatusErrored {
+		// Usable means it could serve THIS request once quota or a rate
+		// limit passes. A group that lacks the model, a credential, or an
+		// enabled healthy account will never serve it, and a 429 would send
+		// the client into a retry loop with no end.
+		if a.mgr.CanServe(acct.ID, model) {
 			usable++
 		}
 	}
 	if route.Strict && usable == 0 {
 		res.Status = http.StatusBadGateway
 		res.Outcome = provider.OutcomeNoAccountReady
+		what := "No usable account in group \"" + route.Group + "\""
+		if model != "" {
+			what += " for model \"" + model + "\""
+		}
 		a.writeJSON(w, http.StatusBadGateway, nil, "proxy_error",
-			"No usable account in group \""+route.Group+"\": a strict routing rule keeps this work there. "+
-				"Add or re-enable an account in that group, or turn strict off.")
+			what+": a strict routing rule keeps this work there. "+
+				"Add or re-enable an account in that group that serves it, or turn strict off.")
 		return
 	}
 	if len(refused) > 0 && len(refused) >= total {

@@ -193,6 +193,18 @@ func (m *Manager) eligibleLocked(a *Account, req SelectRequest, nowMS int64) boo
 	return true
 }
 
+// CanServe reports whether an account could EVER serve model without someone
+// intervening: enabled, not errored, holding a credential, and with the model
+// in its catalogue (or no catalogue yet). Quota, rate limits and pauses are
+// not consulted — those pass on their own, which is what makes the difference
+// between "retry later" and "this will never work".
+func (m *Manager) CanServe(id, model string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.byID[id]
+	return a != nil && !a.Disabled && a.Status != StatusErrored && hasCredential(a) && servesModel(a, model)
+}
+
 func hasCredential(a *Account) bool {
 	return a.Credential.AccessToken != "" || a.Credential.RefreshToken != "" || a.Credential.APIKey != ""
 }
