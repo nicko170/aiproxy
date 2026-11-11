@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 )
 
 // Window is a closed-open time range in unix ms.
@@ -162,45 +163,58 @@ WHERE started_at >= ? AND started_at < ?`, w.From, w.To).
 	return t, nil
 }
 
-// LatencyPercentiles computes p50/p95 by offset. Requests that never produced a
-// first byte record ttfb_ms = -1 and are excluded: counting them would drag the
-// percentile toward zero and hide the very latency problem it exists to show.
+// LatencyPercentiles computes p50/p95 of TTFB and duration over a window.
+// Requests that never produced a first byte record ttfb_ms = -1 and are
+// excluded, as is a missing duration: counting them would drag the percentile
+// toward zero and hide the very latency problem it exists to show.
+//
+// One indexed range scan reads both columns and the percentiles are picked in
+// memory. This used to be eight queries — a count and an ORDER BY … OFFSET
+// sort per percentile — and over a 30-day window on a busy proxy (411k rows)
+// that took 6.5 s on its own, which put the Usage screen past its fetch
+// deadline in production. The pick is unchanged: the element at
+// floor((n-1)·p) of the ascending values.
 func (s *Store) LatencyPercentiles(ctx context.Context, w Window) (Latency, error) {
 	var l Latency
-	pick := func(column string, pct float64) (int64, error) {
-		var n int64
-		if err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
-SELECT count(*) FROM requests WHERE started_at >= ? AND started_at < ? AND %s >= 0`, column),
-			w.From, w.To).Scan(&n); err != nil {
-			return 0, err
+	rows, err := s.db.QueryContext(ctx, `
+SELECT coalesce(ttfb_ms, -1), coalesce(duration_ms, -1) FROM requests
+WHERE started_at >= ? AND started_at < ?`, w.From, w.To)
+	if err != nil {
+		return l, fmt.Errorf("latency: %w", err)
+	}
+	defer rows.Close()
+
+	var ttfb, dur []int64
+	for rows.Next() {
+		var t, d int64
+		if err := rows.Scan(&t, &d); err != nil {
+			return l, fmt.Errorf("latency: %w", err)
 		}
-		if n == 0 {
-			return 0, nil
+		if t >= 0 {
+			ttfb = append(ttfb, t)
 		}
-		offset := int64(float64(n-1) * pct)
-		var v int64
-		err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
-SELECT %s FROM requests
-WHERE started_at >= ? AND started_at < ? AND %s >= 0
-ORDER BY %s LIMIT 1 OFFSET ?`, column, column, column),
-			w.From, w.To, offset).Scan(&v)
-		return v, err
+		if d >= 0 {
+			dur = append(dur, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return l, fmt.Errorf("latency: %w", err)
 	}
 
-	var err error
-	if l.TTFBP50, err = pick("ttfb_ms", 0.50); err != nil {
-		return l, fmt.Errorf("ttfb p50: %w", err)
-	}
-	if l.TTFBP95, err = pick("ttfb_ms", 0.95); err != nil {
-		return l, fmt.Errorf("ttfb p95: %w", err)
-	}
-	if l.DurationP50, err = pick("duration_ms", 0.50); err != nil {
-		return l, fmt.Errorf("duration p50: %w", err)
-	}
-	if l.DurationP95, err = pick("duration_ms", 0.95); err != nil {
-		return l, fmt.Errorf("duration p95: %w", err)
-	}
+	slices.Sort(ttfb)
+	slices.Sort(dur)
+	l.TTFBP50, l.TTFBP95 = pickPercentile(ttfb, 0.50), pickPercentile(ttfb, 0.95)
+	l.DurationP50, l.DurationP95 = pickPercentile(dur, 0.50), pickPercentile(dur, 0.95)
 	return l, nil
+}
+
+// pickPercentile returns the element at floor((n-1)·p) of ascending values,
+// or 0 for none.
+func pickPercentile(sorted []int64, p float64) int64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	return sorted[int64(float64(len(sorted)-1)*p)]
 }
 
 // AccountQuotaHistory returns one account's observed quota, oldest first.

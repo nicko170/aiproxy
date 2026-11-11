@@ -255,3 +255,31 @@ func TestTotalsOverAWindowWithNoMatchingRowsReturnsZero(t *testing.T) {
 		t.Errorf("totals = %+v, want the zero value", got)
 	}
 }
+
+// Pins the exact values, not a range: the single-scan implementation must pick
+// the same element the old ORDER BY … OFFSET floor((n-1)·p) did, for both
+// columns, and a NULL duration must be skipped like a -1 ttfb.
+func TestLatencyPercentilesExactValues(t *testing.T) {
+	s, _ := OpenMemory()
+	defer s.Close()
+	base := time.Date(2026, 8, 18, 9, 0, 0, 0, time.UTC).UnixMilli()
+	for i := 1; i <= 100; i++ {
+		if _, err := s.DB().Exec(`
+INSERT INTO requests (started_at, account_id, provider, status, outcome, ttfb_ms, duration_ms)
+VALUES (?,?,?,?,?,?,?)`, base+int64(i), "a", "anthropic", 200, "ok", i*10, i*20); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No duration at all, and no first byte: neither may count.
+	s.DB().Exec(`INSERT INTO requests (started_at, account_id, provider, status, outcome, ttfb_ms)
+	             VALUES (?,?,?,?,?,?)`, base+500, "a", "anthropic", 429, "throttled_no_hint", -1)
+
+	got, err := s.LatencyPercentiles(context.Background(), Window{From: base, To: base + 60000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Latency{TTFBP50: 500, TTFBP95: 950, DurationP50: 1000, DurationP95: 1900}
+	if got != want {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
