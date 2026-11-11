@@ -301,7 +301,11 @@ type Event struct {
 	Model string `json:"model"`
 	// RequestedModel is what the client asked for when the model override
 	// replaced it; empty when the request was sent as asked.
-	RequestedModel   string `json:"requestedModel,omitempty"`
+	RequestedModel string `json:"requestedModel,omitempty"`
+	// Group is the routing group the request preferred; Spilled reports it
+	// was served by an account outside that group.
+	Group            string `json:"group,omitempty"`
+	Spilled          bool   `json:"spilled,omitempty"`
 	Account          string `json:"account"`
 	Status           int    `json:"status"`
 	Outcome          string `json:"outcome"`

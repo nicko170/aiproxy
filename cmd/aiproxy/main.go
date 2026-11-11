@@ -375,6 +375,9 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			}
 		},
 	})
+	// Routing rules are Manager state, like the switch threshold, so the
+	// settings seam can replace them live.
+	mgr.SetRouting(cfg.Routing.Rules, cfg.Routing.DefaultGroup, cfg.Routing.DefaultStrict)
 
 	// OnLoginSuccess is the only place a PKCE login's exchanged credential
 	// exists after the exchange — set here, after mgr and store both exist,
@@ -478,6 +481,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "requestedModel", req.RequestedModel, "account", res.AccountID,
+				"group", res.Group, "spilled", res.Spilled,
 				"provider", res.Provider, "status", res.Status,
 				"outcome", res.Outcome.String(), "attempts", res.Attempts,
 				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
@@ -511,6 +515,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			// the live event stream.
 			vl.Publish(view.Event{
 				Time: res.StartedAt, Model: req.Model, RequestedModel: req.RequestedModel, Account: res.AccountID,
+				Group: res.Group, Spilled: res.Spilled,
 				Status: res.Status, Outcome: res.Outcome.String(), DurationMS: res.DurationMS,
 				TTFBMS: res.TTFBMS, InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,

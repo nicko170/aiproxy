@@ -280,6 +280,12 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			}
 		}
 
+		// Routing rules read the client's own body, so this sits ahead of the
+		// privacy filter: redaction may rewrite the very text a rule matches.
+		if o.Manager != nil {
+			req.Route = o.Manager.Classify(req.SessionID, req.Body)
+		}
+
 		if req.Model != "" {
 			for _, pattern := range o.BlockedModels {
 				if !ModelMatches(pattern, req.Model) {
