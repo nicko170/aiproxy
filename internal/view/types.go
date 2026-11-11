@@ -244,15 +244,18 @@ type QuotaPoint struct {
 // and update checking. Everything else in config.Config (listen address,
 // accounts, MITM) is not reachable through this call.
 type Settings struct {
-	SwitchThreshold           float64  `json:"switchThreshold"`
-	RetryBudgetMS             int      `json:"retryBudgetMs"`
-	InlineAbsorbMaxMS         int      `json:"inlineAbsorbMaxMs"`
-	HeaderTimeoutMS           int      `json:"headerTimeoutMs"`
-	BodyIdleMS                int      `json:"bodyIdleMs"`
-	SessionAffinity           bool     `json:"sessionAffinity"`
-	BlockedModels             []string `json:"blockedModels"`
-	QuotaProbeIntervalSeconds int      `json:"quotaProbeIntervalSeconds"`
-	MetricsRetentionDays      int      `json:"metricsRetentionDays"`
+	SwitchThreshold   float64  `json:"switchThreshold"`
+	RetryBudgetMS     int      `json:"retryBudgetMs"`
+	InlineAbsorbMaxMS int      `json:"inlineAbsorbMaxMs"`
+	HeaderTimeoutMS   int      `json:"headerTimeoutMs"`
+	BodyIdleMS        int      `json:"bodyIdleMs"`
+	SessionAffinity   bool     `json:"sessionAffinity"`
+	BlockedModels     []string `json:"blockedModels"`
+	// ModelOverride, when set, replaces the model of every same-family
+	// request (see config.Routing.ModelOverride). Live.
+	ModelOverride             string `json:"modelOverride"`
+	QuotaProbeIntervalSeconds int    `json:"quotaProbeIntervalSeconds"`
+	MetricsRetentionDays      int    `json:"metricsRetentionDays"`
 	// UpdateCheckEnabled and UpdateCheckIntervalHours control the background
 	// release check. Enabled is live-tunable; the interval is not, because the
 	// checker's ticker is built once at startup.
@@ -294,8 +297,11 @@ type Applied struct {
 // label, status, outcome, duration, TTFB, and token counts — never a
 // credential.
 type Event struct {
-	Time             int64  `json:"time"`
-	Model            string `json:"model"`
+	Time  int64  `json:"time"`
+	Model string `json:"model"`
+	// RequestedModel is what the client asked for when the model override
+	// replaced it; empty when the request was sent as asked.
+	RequestedModel   string `json:"requestedModel,omitempty"`
 	Account          string `json:"account"`
 	Status           int    `json:"status"`
 	Outcome          string `json:"outcome"`

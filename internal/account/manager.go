@@ -29,7 +29,11 @@ type Options struct {
 	Now             func() time.Time
 	SwitchThreshold float64
 	SessionAffinity bool
-	Ramp            Ramp
+	// ModelOverride is read per request by the proxy handler; see
+	// config.Routing.ModelOverride. Held here so it is live-tunable under the
+	// same lock as the other routing settings.
+	ModelOverride string
+	Ramp          Ramp
 	// RefreshTimeout bounds one refresh. Zero takes defaultRefreshTimeout.
 	RefreshTimeout time.Duration
 	// Log receives the manager's own diagnostics. Nil takes slog.Default().

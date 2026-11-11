@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -83,6 +84,48 @@ func ParseModel(body []byte) string {
 		return ""
 	}
 	return model
+}
+
+// modelFamily is the text before a model name's first "-": "claude" for
+// "claude-opus-5-5", "gpt" for "gpt-5-codex". It is what keeps a model
+// override from crossing providers.
+func modelFamily(model string) string {
+	if i := strings.IndexByte(model, '-'); i >= 0 {
+		return model[:i]
+	}
+	return model
+}
+
+// OverrideModel rewrites the request body's top-level "model" to override,
+// reporting whether it did. It leaves the body alone when there is no
+// override, when the client already asked for it, and when the requested
+// model is in a different family: overriding to a Claude model must not
+// drag Codex's gpt-* requests onto Anthropic with a body Anthropic cannot
+// parse.
+//
+// Only the top level is decoded, so message content stays raw bytes, and HTML
+// escaping is off so those bytes are not rewritten on the way back out.
+func OverrideModel(body []byte, requested, override string) ([]byte, bool) {
+	if override == "" || requested == "" || requested == override ||
+		modelFamily(requested) != modelFamily(override) {
+		return body, false
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body, false
+	}
+	enc, err := json.Marshal(override)
+	if err != nil {
+		return body, false
+	}
+	fields["model"] = enc
+	var buf bytes.Buffer
+	e := json.NewEncoder(&buf)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(fields); err != nil {
+		return body, false
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), true
 }
 
 // ModelMatches reports whether a blocklist pattern matches a model name.
@@ -182,6 +225,20 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			Body:      body,
 			Model:     ParseModel(body),
 			SessionID: r.Header.Get(sessionHeader),
+		}
+
+		// The override runs before the blocklist so the blocklist judges the
+		// model that would actually be sent upstream. Read per request from
+		// the Manager, which is what makes the setting live.
+		if o.Manager != nil {
+			if override := o.Manager.ModelOverride(); override != "" {
+				if rewritten, ok := OverrideModel(req.Body, req.Model, override); ok {
+					o.Log.Debug("model overridden", "requested", req.Model, "model", override)
+					req.RequestedModel = req.Model
+					req.Model = override
+					req.Body = rewritten
+				}
+			}
 		}
 
 		if req.Model != "" {
