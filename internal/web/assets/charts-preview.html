@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>aiproxy · chart preview</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    main { display: grid; grid-template-columns: repeat(auto-fit, minmax(22rem, 1fr)); gap: 1.5rem; }
+    section { border: 1px solid var(--line); border-radius: 8px; padding: 0.8rem; background: var(--panel); }
+    h2 { font-size: 0.9rem; margin: 0 0 0.5rem; color: var(--muted); font-weight: 500; }
+  </style>
+</head>
+<body>
+  <!-- A development aid: every chart mark with canned data, so a chart change
+       can be checked by eye without driving real traffic. -->
+  <main id="preview"></main>
+  <script type="module">
+    import { el } from "./dom.js";
+    import { stackedArea, lineChart, barChart, gauge, legend, emptyChart } from "./chart.js";
+
+    const now = Date.now(), H = 3600e3, keys = ["claude-opus-5-5", "claude-sonnet-5-5", "gpt-5-codex"];
+    const points = [];
+    for (let i = 0; i < 24; i++) for (const [j, k] of keys.entries())
+      points.push({ x: now - (23 - i) * H, key: k, value: Math.round(20000 + 15000 * Math.sin(i / 3 + j) ** 2 * (j + 1)) });
+    const lat = ["p50", "p95"].map((k, j) => ({ key: k,
+      points: Array.from({ length: 24 }, (_, i) => ({ x: now - (23 - i) * H, y: 400 + j * 1800 + 300 * Math.cos(i / 2) })) }));
+    // Charts draw at the pixel width they will occupy, so 11px text stays 11px.
+    const W = 370; // the preview grid's card width at a typical desktop size
+    const card = (title, ...kids) => el("section", {}, el("h2", {}, title), ...kids);
+    const fmtK = (v) => (v >= 1000 ? (v / 1000).toFixed(0) + "K" : String(v));
+
+    document.getElementById("preview").append(
+      card("stackedArea — tokens by model, 24h", stackedArea({ points, keys, format: fmtK , width: W }), legend(keys)),
+      card("lineChart — TTFB p50/p95", lineChart({ series: lat, format: (v) => Math.round(v) + "ms" , width: W }), legend(["p50", "p95"], { shape: "line" })),
+      card("barChart — outcome mix", barChart({ bars: [
+        { label: "ok", value: 1840 }, { label: "rate_limited", value: 72 },
+        { label: "overloaded", value: 9 }, { label: "error", value: 3 }], width: W })),
+      card("gauge — quota buckets",
+        gauge({ fraction: 0.18, label: "7d" }), gauge({ fraction: 0.74, label: "5h", sublabel: "resets in 1h12m" }),
+        gauge({ fraction: 0.97, label: "7d_opus" })),
+      card("single point", lineChart({ series: [{ key: "solo", points: [{ x: now, y: 5 }] }] , width: W })),
+      card("emptyChart", emptyChart("No traffic in this range", { width: W })),
+    );
+  </script>
+</body>
+</html>

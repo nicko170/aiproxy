@@ -109,3 +109,13 @@ test("colorFor is stable and deterministic", () => {
   assert.notEqual(colorFor("acct-1"), colorFor("acct-2"));
   assert.match(colorFor("acct-1"), /^(#|hsl|var|oklch)/);
 });
+
+// Hashing alone put two of three models on the same orange in the preview:
+// series on one screen must not share a colour while slots remain.
+test("colorFor gives distinct keys distinct slots until the palette runs out", () => {
+  // Slots are page-wide: acct-1 and acct-2 were coloured by the test above,
+  // so they plus six new keys are the first eight this page has seen.
+  const keys = ["acct-1", "acct-2", ...Array.from({ length: 6 }, (_, i) => `distinct-key-${i}`)];
+  const colors = new Set(keys.map(colorFor));
+  assert.equal(colors.size, 8);
+});
