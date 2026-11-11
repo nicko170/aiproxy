@@ -143,12 +143,16 @@ type RetryConfig struct {
 // Request is a client request ready to be attempted, body already buffered so it
 // can be replayed on another account.
 type Request struct {
-	Method    string
-	Path      string
-	Header    http.Header
-	Body      []byte
-	Model     string
-	SessionID string
+	Method string
+	Path   string
+	Header http.Header
+	Body   []byte
+	Model  string
+	// RequestedModel is the model the client asked for when the model
+	// override replaced it, and empty otherwise. Model is always what was
+	// actually routed and sent.
+	RequestedModel string
+	SessionID      string
 	// Restore carries the placeholders this request's body was redacted with, so
 	// the relay can undo them in the response. Nil when the privacy filter is
 	// disabled, which leaves the relay's write path untouched.

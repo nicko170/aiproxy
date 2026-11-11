@@ -146,3 +146,18 @@ func (m *Manager) SetSessionAffinity(v bool) {
 	defer m.mu.Unlock()
 	m.opts.SessionAffinity = v
 }
+
+// SetModelOverride changes the model every same-family request is rewritten to.
+// Empty turns forcing off. Applies to the next request, no restart.
+func (m *Manager) SetModelOverride(v string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.opts.ModelOverride = v
+}
+
+// ModelOverride returns the current forced model, or "" when forcing is off.
+func (m *Manager) ModelOverride() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.opts.ModelOverride
+}

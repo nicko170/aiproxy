@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -426,6 +427,7 @@ func settingsFromConfig(c config.Config) Settings {
 		BodyIdleMS:                c.Retry.BodyIdleMS,
 		SessionAffinity:           c.Routing.SessionAffinity,
 		BlockedModels:             c.Routing.BlockedModels,
+		ModelOverride:             c.Routing.ModelOverride,
 		QuotaProbeIntervalSeconds: c.QuotaProbe.IntervalSeconds,
 		MetricsRetentionDays:      c.Metrics.RetentionDays,
 		UpdateCheckEnabled:        c.Update.CheckEnabled,
@@ -446,7 +448,7 @@ func settingsFromConfig(c config.Config) Settings {
 // wire the corresponding Manager setter; UpdateSettings's diff logic does not
 // change.
 var (
-	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity", "updateCheckEnabled"}
+	liveSettingsFields    = []string{"switchThreshold", "sessionAffinity", "modelOverride", "updateCheckEnabled"}
 	restartSettingsFields = []string{
 		"blockedModels", "retryBudgetMs", "inlineAbsorbMaxMs",
 		"headerTimeoutMs", "bodyIdleMs", "quotaProbeIntervalSeconds", "metricsRetentionDays",
@@ -506,6 +508,8 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		s.PrivacyScanTimeoutMS = config.Default().Privacy.ScanTimeoutMS
 	}
 
+	s.ModelOverride = strings.TrimSpace(s.ModelOverride)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -517,6 +521,7 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 		c.Routing.SwitchThreshold = s.SwitchThreshold
 		c.Routing.SessionAffinity = s.SessionAffinity
 		c.Routing.BlockedModels = s.BlockedModels
+		c.Routing.ModelOverride = s.ModelOverride
 		c.Retry.BudgetMS = s.RetryBudgetMS
 		c.Retry.InlineAbsorbMaxMS = s.InlineAbsorbMaxMS
 		c.Retry.HeaderTimeoutMS = s.HeaderTimeoutMS
@@ -537,6 +542,7 @@ func (l *Local) UpdateSettings(ctx context.Context, s Settings) (Applied, error)
 
 	l.mgr.SetSwitchThreshold(s.SwitchThreshold)
 	l.mgr.SetSessionAffinity(s.SessionAffinity)
+	l.mgr.SetModelOverride(s.ModelOverride)
 	if l.updates != nil {
 		l.updates.SetEnabled(s.UpdateCheckEnabled)
 	}
@@ -555,6 +561,7 @@ func diffSettings(before, after Settings) Applied {
 		"switchThreshold":           before.SwitchThreshold != after.SwitchThreshold,
 		"sessionAffinity":           before.SessionAffinity != after.SessionAffinity,
 		"blockedModels":             !stringSlicesEqual(before.BlockedModels, after.BlockedModels),
+		"modelOverride":             before.ModelOverride != after.ModelOverride,
 		"retryBudgetMs":             before.RetryBudgetMS != after.RetryBudgetMS,
 		"inlineAbsorbMaxMs":         before.InlineAbsorbMaxMS != after.InlineAbsorbMaxMS,
 		"headerTimeoutMs":           before.HeaderTimeoutMS != after.HeaderTimeoutMS,

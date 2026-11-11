@@ -558,7 +558,7 @@ that read those values are built once at startup.
 ```json
 {
   "listen": { "addr": "127.0.0.1:3456", "apiKey": "ap-..." },
-  "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [] },
+  "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [], "modelOverride": "" },
   "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000, "overloadedBudgetMs": 30000 },
   "quotaProbe": { "intervalSeconds": 300 },
   "warming": { "enabled": true, "threshold": 0.5, "model": "claude-haiku-4-5-20251001" },
@@ -577,6 +577,12 @@ that read those values are built once at startup.
   while that account still has room. **`blockedModels`** takes globs. Accounts
   of equal priority are ordered by how much allowance they are about to waste —
   see [Which account gets picked](#which-account-gets-picked).
+- **`routing.modelOverride`** (default empty, off) sends every request as this
+  model whatever the client asked for — e.g. `"claude-opus-5-5"` turns Claude
+  Code's Haiku and Sonnet calls into Opus. It only rewrites models in the same
+  family (the part before the first `-`), so overriding to a `claude-*` model
+  leaves Codex's `gpt-*` traffic alone. Takes effect immediately; Activity
+  shows overridden requests as `claude-opus-4-8 → claude-opus-5-5`.
 - **`retry.budgetMs`** bounds only the time *aiproxy* adds before the first
   byte — backoff, waiting on a paused account, absorbing a rate limit,
   refreshing a credential. **`headerTimeoutMs`** bounds one attempt's wait for

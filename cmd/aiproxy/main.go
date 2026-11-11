@@ -349,6 +349,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	mgr := account.New(cfg.Accounts, providers, account.Options{
 		SwitchThreshold: cfg.Routing.SwitchThreshold,
 		SessionAffinity: cfg.Routing.SessionAffinity,
+		ModelOverride:   cfg.Routing.ModelOverride,
 		Ramp:            account.Ramp{Enabled: true},
 		Log:             log,
 		// A rotated credential is the only way back into an account, so it is
@@ -476,7 +477,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		Privacy:             pf,
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
-				"model", req.Model, "account", res.AccountID,
+				"model", req.Model, "requestedModel", req.RequestedModel, "account", res.AccountID,
 				"provider", res.Provider, "status", res.Status,
 				"outcome", res.Outcome.String(), "attempts", res.Attempts,
 				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
@@ -509,7 +510,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			// which is spec invariant 4 ("one number, one source") extended to
 			// the live event stream.
 			vl.Publish(view.Event{
-				Time: res.StartedAt, Model: req.Model, Account: res.AccountID,
+				Time: res.StartedAt, Model: req.Model, RequestedModel: req.RequestedModel, Account: res.AccountID,
 				Status: res.Status, Outcome: res.Outcome.String(), DurationMS: res.DurationMS,
 				TTFBMS: res.TTFBMS, InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,

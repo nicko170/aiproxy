@@ -82,6 +82,15 @@ func settingFields() []settingField {
 			},
 		},
 		{
+			name: "modelOverride",
+			desc: "send every claude-* request as this model, whatever the client asked for; empty sends what was asked",
+			get:  func(s view.Settings) string { return s.ModelOverride },
+			set: func(s *view.Settings, v string) error {
+				s.ModelOverride = strings.TrimSpace(v)
+				return nil
+			},
+		},
+		{
 			name: "retryBudgetMs", unit: "ms",
 			desc: "total time the proxy may spend retrying one request across accounts",
 			get:  func(s view.Settings) string { return strconv.Itoa(s.RetryBudgetMS) },
