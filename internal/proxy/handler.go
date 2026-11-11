@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -94,7 +95,70 @@ func authorizedRequest(o HandlerOptions, r *http.Request) bool {
 			return true
 		}
 	}
-	return Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey)
+	// The loopback exemption is for the operator's own tools. A request that
+	// only LOOKS local is denied it and must present the key like any other.
+	remote := r.RemoteAddr
+	if !trustedLocal(r) {
+		remote = ""
+	}
+	return Authorized(remote, r.Header.Get("x-api-key"), o.APIKey)
+}
+
+// forwardingHeaders are set by reverse proxies and tunnels. A request carrying
+// one arrived from somewhere else and was relayed by a process on this host —
+// Caddy, nginx, cloudflared, tailscale serve — so its loopback source address
+// says nothing about who sent it. Local clients (Claude Code, Codex, curl) do
+// not send them.
+var forwardingHeaders = []string{"X-Forwarded-For", "Forwarded", "X-Real-Ip", "Cf-Connecting-Ip", "True-Client-Ip"}
+
+// trustedLocal reports whether a request from a loopback address may use the
+// loopback exemption. Three things disqualify it:
+//
+//   - a forwarding header: a same-host reverse proxy is relaying someone else;
+//   - a Host that is a domain name: DNS rebinding points an attacker's domain
+//     at 127.0.0.1, and the browser still sends that domain as the Host;
+//   - a browser saying the request is cross-site (Sec-Fetch-Site, or an
+//     Origin that is not this host): any page the operator has open can
+//     otherwise POST to the control API.
+func trustedLocal(r *http.Request) bool {
+	for _, h := range forwardingHeaders {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	if !localHost(r.Host) {
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host != r.Host {
+			return false
+		}
+	}
+	return true
+}
+
+// localHost accepts an empty Host, an IP literal, or localhost. An IP literal
+// cannot be rebound; a domain name can.
+func localHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	h = strings.Trim(h, "[]")
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	h = strings.ToLower(h)
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
 }
 
 // ParseModel reads the top-level "model" field. Only the top level is decoded,

@@ -698,7 +698,16 @@ internet access, and is served by the proxy itself at
   session cookie; it is never kept in the page. aiproxy refuses to start on a
   non-loopback address with no API key, because that would hand the whole
   control plane — accounts, credentials, settings — to anyone who can reach it.
-  Put it behind TLS if the network between you and it is not yours.
+  Put it behind TLS if the network between you and it is not yours. A TLS
+  terminator or tunnel on the same host (Caddy, nginx, cloudflared,
+  `tailscale serve`) connects from 127.0.0.1, so aiproxy refuses loopback trust
+  to any request carrying a forwarding header (`X-Forwarded-For`, `Forwarded`,
+  `X-Real-IP`, `CF-Connecting-IP`): those callers sign in or send the key like
+  everyone else. Loopback trust is also refused to a request whose `Host` is a
+  domain name rather than `localhost` or an IP (DNS rebinding), and to a
+  browser request marked cross-site — so another website open in your browser
+  cannot drive the control API. A local client that reaches aiproxy through a
+  custom hostname alias must send `x-api-key`.
 - **Adding an account remotely** uses the paste-the-code login: open the sign-in
   link the dashboard shows, approve, and paste back the code the provider's page
   displays. The OAuth callback listens on the *server's* loopback, which a

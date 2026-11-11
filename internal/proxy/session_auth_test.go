@@ -15,6 +15,9 @@ func (s stubSessions) Valid(tok string) bool { return tok != "" && tok == s.good
 func reqWith(remote, key, cookie string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "/_aiproxy/api/v1/status", nil)
 	r.RemoteAddr = remote
+	// httptest's default Host is example.com, a domain name no local client
+	// sends; trustedLocal refuses loopback trust to one (DNS rebinding).
+	r.Host = "127.0.0.1:3456"
 	if key != "" {
 		r.Header.Set("x-api-key", key)
 	}
