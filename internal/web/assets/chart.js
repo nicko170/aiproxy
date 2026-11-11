@@ -276,19 +276,33 @@ export function emptyChart(message, { width = 640, height = 200 } = {}) {
   return svg;
 }
 
+// costAxisFormat formats micro-dollar axis ticks with enough decimals that
+// adjacent ticks never read the same ("$0.01, $0.01").
+export function costAxisFormat(ticks) {
+  const step = ticks.length > 1 ? Math.abs(ticks[1] - ticks[0]) / 1e6 : 1;
+  const digits = Math.min(6, Math.max(2, Math.ceil(-Math.log10(step))));
+  return (v) => "$" + (v / 1e6).toFixed(digits);
+}
+
 // stackedArea draws long-form points ({x, key, value}) stacked in key order:
 // each band is a ~10% wash under a 2px line at its top edge.
-export function stackedArea({ points, keys, width = 640, height = 220, format = formatTokens, label }) {
+//
+// xDomain pins the time axis to the requested window rather than the data's
+// own extent, so "last hour" always spans an hour. axisFormat formats the
+// value axis when the tooltip formatter would round ticks into duplicates
+// (see axisFormatFor).
+export function stackedArea({ points, keys, width = 640, height = 220, format = formatTokens, axisFormat, xDomain, label }) {
   if (!points.length || !keys.length) return emptyChart("No traffic in this range", { width, height });
   const series = stack(points, keys);
   const xs = series[0].values.map((v) => v.x);
   const top = Math.max(...series[series.length - 1].values.map((v) => v.y1));
   const yt = niceTicks(0, top, 4);
-  const x = timeScale({ domain: [xs[0], xs[xs.length - 1]], range: [M.l, width - M.r] });
+  const [x0, x1] = xDomain || [xs[0], xs[xs.length - 1]];
+  const x = timeScale({ domain: [x0, x1], range: [M.l, width - M.r] });
   const y = linearScale({ domain: [0, yt[yt.length - 1]], range: [height - M.b, M.t] });
   const svg = frame(width, height, label || "stacked area: " + keys.join(", "));
-  yAxis(svg, y, yt, width, format);
-  xAxis(svg, x, timeTicks(xs[0], xs[xs.length - 1], 6), height);
+  yAxis(svg, y, yt, width, axisFormat || format);
+  xAxis(svg, x, timeTicks(x0, x1, 6), height);
 
   for (const s of series) {
     const c = colorFor(s.key);

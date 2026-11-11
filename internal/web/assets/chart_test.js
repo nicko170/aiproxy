@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import {
   linearScale, timeScale, niceTicks, timeTicks,
   formatTokens, formatCostMicros, formatMs, formatPercent,
-  stack, colorFor,
+  stack, colorFor, costAxisFormat,
 } from "./chart.js";
 
 test("linearScale maps domain onto range", () => {
@@ -118,4 +118,12 @@ test("colorFor gives distinct keys distinct slots until the palette runs out", (
   const keys = ["acct-1", "acct-2", ...Array.from({ length: 6 }, (_, i) => `distinct-key-${i}`)];
   const colors = new Set(keys.map(colorFor));
   assert.equal(colors.size, 8);
+});
+
+// The Usage cost axis showed "$0.01" twice: ticks need their own precision.
+test("costAxisFormat keeps adjacent ticks distinct", () => {
+  const ticks = niceTicks(0, 18_000, 4); // micros: $0 … $0.02 in small steps
+  const f = costAxisFormat(ticks);
+  const labels = ticks.map(f);
+  assert.equal(new Set(labels).size, labels.length, labels.join(" "));
 });

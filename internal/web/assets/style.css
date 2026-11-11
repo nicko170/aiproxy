@@ -137,3 +137,10 @@ table.feed { width: 100%; border-collapse: collapse; font-size: 12px; }
 .feed tr.sev-bad td:nth-child(5) { color: var(--danger); }
 .feed .spill { color: var(--muted); }
 .empty-row { text-align: center; padding: 1.5rem !important; }
+.segmented { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.segmented button { border: 0; border-radius: 0; border-right: 1px solid var(--line); }
+.segmented button:last-child { border-right: 0; }
+.segmented button.on { background: var(--panel); color: var(--accent); font-weight: 600; }
+.panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 0.8rem; margin-bottom: 1rem; }
+.panel h3 { margin: 0 0 0.5rem; font-size: 0.9rem; font-weight: 500; color: var(--muted); }
+.stat-note { font-size: 11px; color: var(--warning); }
