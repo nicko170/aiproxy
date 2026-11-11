@@ -580,6 +580,9 @@ respected, and narrowing drops sparklines then columns rather than wrapping.
 
 ## 9. Dashboard and control API
 
+> Built in stage 5; see [2026-08-25-web-dashboard-design.md](2026-08-25-web-dashboard-design.md)
+> for what shipped, including browser sessions and the paste-the-code login.
+
 Assets are embedded via `embed.FS` — vanilla JS with hand-rolled SVG charts, no
 build step and no CDN, so the dashboard works offline and the repository stays a
 pure Go project. Charts: tokens over time stacked by model and by account, cost
@@ -702,7 +705,8 @@ each end somewhere usable rather than half-wired.
    with the lockstep test in §9 passing.
 4. **TUI.** Five screens over `view.Source`, in-TUI login. Ends when the binary
    with no arguments is the primary way to use the tool.
-5. **Dashboard.** Embedded assets and SVG charts over the same API.
+5. **Dashboard.** Embedded assets and SVG charts over the same API. *Done*
+   (v0.5.0), as a complete substitute for the TUI rather than a read-only view.
 6. **MITM.** CONNECT handler and CA, reusing the stage-1 handler.
 
 Stage 1 depends on nothing later; stages 2 and 3 are prerequisites for 4 and 5;

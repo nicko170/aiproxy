@@ -20,11 +20,9 @@ tested:
 | 2 | Accounting — SQLite store, ingestion, rollups, queries, retention | done |
 | 3 | `view.Source` and the control API — the presentation seam plus JSON/SSE routes | done |
 | 4 | TUI — five screens over the seam, in-TUI login | done |
-| 5 | Dashboard — embedded assets and SVG charts over the same API | not started |
+| 5 | Dashboard — embedded assets and SVG charts over the same API | done |
 | 6 | MITM forward proxy — CONNECT handler and CA, for clients with a hardcoded upstream | not started |
 
-Until stage 5 lands, the `o` key in the TUI opens a dashboard URL that nothing
-is serving yet.
 
 ## Install
 
@@ -452,7 +450,9 @@ cross-protocol routing is a separate piece of future work.
 
 Selection sorts eligible accounts by, in order: unpaused before paused, then
 priority ascending, then **how much unused allowance is about to be wasted**,
-then account ID as a deterministic backstop.
+then account ID as a deterministic backstop. When [routing rules](#routing-rules)
+prefer a group, that ranking runs within the group first, and over everyone
+else only once the group is spent.
 
 That third key is the interesting one. Each quota window is scored by the rate
 you would have to spend at to avoid wasting it — headroom divided by the time
@@ -558,7 +558,8 @@ that read those values are built once at startup.
 ```json
 {
   "listen": { "addr": "127.0.0.1:3456", "apiKey": "ap-..." },
-  "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [], "modelOverride": "" },
+  "routing": { "switchThreshold": 0.98, "sessionAffinity": true, "blockedModels": [], "modelOverride": "",
+               "rules": [], "defaultGroup": "", "defaultStrict": false },
   "retry": { "budgetMs": 10000, "inlineAbsorbMaxMs": 5000, "bodyIdleMs": 120000, "headerTimeoutMs": 60000, "overloadedBudgetMs": 30000 },
   "quotaProbe": { "intervalSeconds": 300 },
   "warming": { "enabled": true, "threshold": 0.5, "model": "claude-haiku-4-5-20251001" },
@@ -577,6 +578,9 @@ that read those values are built once at startup.
   while that account still has room. **`blockedModels`** takes globs. Accounts
   of equal priority are ordered by how much allowance they are about to waste —
   see [Which account gets picked](#which-account-gets-picked).
+- **`routing.rules`**, **`routing.defaultGroup`** and **`accounts[].group`**
+  send work to the accounts that should pay for it. See
+  [Routing rules](#routing-rules).
 - **`routing.modelOverride`** (default empty, off) sends every request as this
   model whatever the client asked for — e.g. `"claude-opus-5-5"` turns Claude
   Code's Haiku and Sonnet calls into Opus. It only rewrites models in the same
@@ -629,11 +633,83 @@ Everything else is flags.
 share a terminal, so under the TUI logs feed the Activity screen's ring buffer
 instead.
 
+## Routing rules
+
+When some of your work should be billed to one subscription and the rest to
+another — company repositories on the company account, everything else on
+your own — put the accounts in **groups** and add **rules**:
+
+```json
+"accounts": [
+  { "label": "you@company", "group": "work", "…": "…" },
+  { "label": "you@personal", "group": "personal", "…": "…" }
+],
+"routing": {
+  "rules": [
+    { "match": "Primary working directory: /Users/you/code/company", "group": "work" },
+    { "match": "<cwd>/Users/you/code/company", "group": "work" }
+  ],
+  "defaultGroup": "personal"
+}
+```
+
+- **A rule is literal text.** A request whose body contains it prefers that
+  rule's group. Rules are tried in order and the first match wins; work no rule
+  matches prefers `defaultGroup`. Matching is case-sensitive and happens on
+  the request as the client sent it, before the privacy filter.
+- **Precision is your choice.** Codex sends `<cwd>/path</cwd>` in every request,
+  and Claude Code names its working directory in its system prompt (current
+  versions write `Primary working directory: /path`; if a rule never matches,
+  check the exact wording in one of your own requests). Matching those lines
+  routes by project. A bare `code/company` also matches a personal session that
+  merely reads a file from that tree.
+- **A session sticks.** Claude Code's first request that matches a rule decides
+  the session's group, and its later requests — including small background
+  calls that do not repeat the directory — follow it. Editing the rules
+  re-decides sessions already in flight.
+- **Spill, or strict.** When every account in the preferred group is spent, the
+  work spills onto your other accounts, and comes back when the group recovers.
+  Set `"strict": true` on a rule (or `defaultStrict`) to forbid that: the request
+  is refused instead, with a retry time from the group's own quota resets, or a
+  plain error if the group has no usable account.
+- **Visible.** Activity marks a spilled request `↪` on its account, and the
+  request log line carries `group` and `spilled`.
+- **Unconfigured means unchanged.** With no rules and no groups, routing is
+  exactly what it was before.
+
+Edit all of it live, with no restart: **Settings → `routingRules`** and **`g`
+on Accounts** in the TUI, the **Settings** and **Accounts** screens in the
+dashboard, or `POST /_aiproxy/api/v1/settings` and
+`POST /_aiproxy/api/v1/accounts/{id}/group`.
+
+## Dashboard
+
+Everything the TUI does, in a browser: live overview and activity, usage
+charts and cost, account management (including adding an account), and every
+setting — routing rules included. It is built into the binary, needs no
+internet access, and is served by the proxy itself at
+**`http://127.0.0.1:3456/_aiproxy/`** (press `o` in the TUI to open it).
+
+- **On your own machine** nothing to configure: loopback is trusted, so the page
+  opens straight onto the overview.
+- **On a server**, set `listen.apiKey` (generated on first run), bind to an
+  address you can reach (`--addr 0.0.0.0:3456`, or `listen.addr`), and sign in
+  with that key. The key is exchanged once for an `HttpOnly`, `SameSite=Strict`
+  session cookie; it is never kept in the page. aiproxy refuses to start on a
+  non-loopback address with no API key, because that would hand the whole
+  control plane — accounts, credentials, settings — to anyone who can reach it.
+  Put it behind TLS if the network between you and it is not yours.
+- **Adding an account remotely** uses the paste-the-code login: open the sign-in
+  link the dashboard shows, approve, and paste back the code the provider's page
+  displays. The OAuth callback listens on the *server's* loopback, which a
+  browser on another machine can never reach, so this is the only path that
+  works there.
+
 ## Control API
 
 Everything the TUI shows is read through `view.Source`, and every method on it
 has exactly one route under the reserved `/_aiproxy/` prefix — which is also
-what a stage-5 dashboard or a future detached daemon will read.
+what the dashboard reads, and what a future detached daemon will.
 
 ```
 GET    /_aiproxy/api/v1/status
@@ -645,6 +721,8 @@ GET    /_aiproxy/api/v1/quota/history
 GET    /_aiproxy/api/v1/events          (SSE)
 POST   /_aiproxy/api/v1/accounts/{id}/enabled
 POST   /_aiproxy/api/v1/accounts/{id}/priority
+POST   /_aiproxy/api/v1/accounts/{id}/group
+POST   /_aiproxy/api/v1/accounts/pin
 DELETE /_aiproxy/api/v1/accounts/{id}
 GET    /_aiproxy/api/v1/settings
 POST   /_aiproxy/api/v1/settings
