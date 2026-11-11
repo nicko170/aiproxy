@@ -35,6 +35,8 @@ type Account struct {
 	Plan        string
 	Upstream    string
 	ModelMap    map[string]string
+	// Group is the routing group; see config.Account.Group.
+	Group string
 
 	Status    Status
 	LastError string
@@ -78,6 +80,7 @@ func fromConfig(c config.Account) *Account {
 		Plan:        c.Identity.Plan,
 		Upstream:    c.Upstream,
 		ModelMap:    c.ModelMap,
+		Group:       c.Group,
 		Status:      StatusActive,
 		Buckets:     map[string]provider.QuotaBucket{},
 	}

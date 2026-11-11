@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>aiproxy</title>
+  <link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+  <noscript>The aiproxy dashboard needs JavaScript. Use the terminal UI instead: run <code>aiproxy</code> with no flags.</noscript>
+  <header>
+    <h1>aiproxy</h1>
+    <nav>
+      <a href="#/overview" data-screen="overview">Overview</a>
+      <a href="#/activity" data-screen="activity">Activity</a>
+      <a href="#/usage" data-screen="usage">Usage</a>
+      <a href="#/accounts" data-screen="accounts">Accounts</a>
+      <a href="#/settings" data-screen="settings">Settings</a>
+    </nav>
+    <span id="conn" class="conn" title="connecting"></span>
+    <button id="signout" type="button">Sign out</button>
+  </header>
+  <main id="app"></main>
+  <script type="module" src="assets/app.js"></script>
+</body>
+</html>

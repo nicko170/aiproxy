@@ -30,6 +30,7 @@ import (
 	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 	"github.com/nicko170/aiproxy/internal/warmer"
+	"github.com/nicko170/aiproxy/internal/web"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=..."
@@ -100,6 +101,10 @@ func run(configPath, addrOverride string, headless bool, log *slog.Logger, logs 
 	}
 	if addrOverride != "" {
 		cfg.Listen.Addr = addrOverride
+	}
+
+	if err := checkBindSafety(cfg.Listen.Addr, cfg.Listen.APIKey); err != nil {
+		return err
 	}
 
 	db, err := metrics.Open(config.DBPath())
@@ -370,6 +375,9 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			}
 		},
 	})
+	// Routing rules are Manager state, like the switch threshold, so the
+	// settings seam can replace them live.
+	mgr.SetRouting(cfg.Routing.Rules, cfg.Routing.DefaultGroup, cfg.Routing.DefaultStrict)
 
 	// OnLoginSuccess is the only place a PKCE login's exchanged credential
 	// exists after the exchange — set here, after mgr and store both exist,
@@ -448,10 +456,19 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// internal/proxy's routes changing at all.
 	vl := view.NewLocal(mgr, ing.Store(), store, cfg.Listen.Addr, ing.Dropped, pb, upd, pf)
 
+	// Sessions backs the dashboard's cookie login: a session token exchanged for
+	// the API key once, rather than the key itself sitting in the browser. The
+	// TTL is generous because re-authenticating a local dashboard weekly buys
+	// nothing; the session cookie is still bound to this process's Sessions
+	// instance and dies with it.
+	sessions := web.NewSessions(30 * 24 * time.Hour)
+
 	return proxy.NewRouter(proxy.HandlerOptions{
 		Attempter:     attempter,
 		Manager:       mgr,
 		APIKey:        cfg.Listen.APIKey,
+		Sessions:      sessions,
+		Web:           web.Handler(sessions, cfg.Listen.APIKey),
 		BlockedModels: cfg.Routing.BlockedModels,
 		Log:           log,
 		// Paths bound to the client's own paired identity, relayed with its
@@ -464,6 +481,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 		OnResult: func(req proxy.Request, res proxy.Result) {
 			log.Info("request",
 				"model", req.Model, "requestedModel", req.RequestedModel, "account", res.AccountID,
+				"group", res.Group, "spilled", res.Spilled,
 				"provider", res.Provider, "status", res.Status,
 				"outcome", res.Outcome.String(), "attempts", res.Attempts,
 				"ttfbMs", res.TTFBMS, "waitMs", res.WaitMS, "bytes", res.Bytes,
@@ -497,6 +515,7 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 			// the live event stream.
 			vl.Publish(view.Event{
 				Time: res.StartedAt, Model: req.Model, RequestedModel: req.RequestedModel, Account: res.AccountID,
+				Group: res.Group, Spilled: res.Spilled,
 				Status: res.Status, Outcome: res.Outcome.String(), DurationMS: res.DurationMS,
 				TTFBMS: res.TTFBMS, InputTokens: res.InputTokens, OutputTokens: res.OutputTokens,
 				CacheReadTokens: res.CacheReadTokens, CacheWriteTokens: res.CacheWriteTokens,
@@ -602,6 +621,44 @@ func endpointOf(path string) string {
 		return path[:i]
 	}
 	return path
+}
+
+// checkBindSafety refuses to start a publicly-reachable proxy with no API key.
+//
+// In the current codebase this cannot actually fire: internal/config/store.go's
+// loadLocked heals a blank listen.apiKey, and config.Default seeds one too, so
+// by the time cfg reaches here APIKey is never empty. This function is a
+// backstop against that guarantee ever being weakened or removed elsewhere —
+// a config loaded some other way, a future refactor of the store, a caller
+// that builds Config by hand — not the mechanism that keeps aiproxy closed
+// today. See TestConfigAlwaysSuppliesAnAPIKey in internal/config, which
+// asserts the invariant this function depends on; if that test ever fails,
+// this guard has just become load-bearing.
+//
+// Before the dashboard, an unauthenticated non-loopback bind exposed inference
+// and account listing. With the dashboard it also exposes OAuth login, account
+// removal, and settings — the whole control plane. If the upstream guarantee
+// is ever lost, a warning is not enough: warnings scroll past, and the failure
+// mode is a stranger holding your Claude subscription. So this stays a refusal,
+// not a log line, even though it is currently unreachable.
+func checkBindSafety(addr, apiKey string) error {
+	if apiKey != "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	// An empty host is the ":3456" shorthand, which binds every interface. It
+	// must not be read as "no host, therefore local". And IsLoopback parses IPs
+	// only, so the NAME localhost needs its own branch.
+	if host == "localhost" || (host != "" && proxy.IsLoopback(addr)) {
+		return nil
+	}
+	return fmt.Errorf(
+		"refusing to listen on %s with no API key: the dashboard and control plane would be open to anyone who can reach this port.\n"+
+			"Set listen.apiKey in config.json, or bind to 127.0.0.1 instead — a reverse proxy that authenticates its own callers can still reach a loopback listener from 127.0.0.1",
+		addr)
 }
 
 // listen binds the client-facing socket, setting NoDelay on each accepted

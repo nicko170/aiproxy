@@ -153,6 +153,10 @@ type Request struct {
 	// actually routed and sent.
 	RequestedModel string
 	SessionID      string
+	// Route is what the routing rules decided: the preferred account group,
+	// and whether the work may leave it. Decided in proxyHandler on the
+	// client's own body, before redaction.
+	Route account.Route
 	// Restore carries the placeholders this request's body was redacted with, so
 	// the relay can undo them in the response. Nil when the privacy filter is
 	// disabled, which leaves the relay's write path untouched.
@@ -163,6 +167,10 @@ type Request struct {
 type Result struct {
 	Status    int
 	AccountID string
+	// Group is the routing group the request preferred, and Spilled reports
+	// that the account which served it is outside that group.
+	Group   string
+	Spilled bool
 	// Provider is the name of the provider that served the request — the
 	// account's, read from the account actually selected, not a constant.
 	//
@@ -259,7 +267,7 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 	// budget so waiting out an upstream capacity problem cannot starve the
 	// rotation and refresh paths; see defaultOverloadedBudget.
 	overload := NewBudget(a.cfg.OverloadedBudget)
-	res = Result{TTFBMS: -1}
+	res = Result{TTFBMS: -1, Group: req.Route.Group}
 
 	exclude := map[string]bool{}
 	refused := map[string]bool{}
@@ -312,12 +320,14 @@ func (a *Attempter) Do(ctx context.Context, w http.ResponseWriter, req Request) 
 		// lock and a torn read of those strings yields a garbage token.
 		acct, err := a.mgr.Select(account.SelectRequest{
 			Model: req.Model, SessionID: req.SessionID, Exclude: exclude,
+			Group: req.Route.Group, Strict: req.Route.Strict,
 		})
 		if err != nil {
-			a.writeNoAccount(w, &res, refused)
+			a.writeNoAccount(w, &res, refused, req.Route, req.Model)
 			return res
 		}
 		res.AccountID = acct.ID
+		res.Spilled = acct.Group != req.Route.Group
 		// Stamped with the account, not at the end: a rotation onto a different
 		// provider must leave this naming whichever one the LAST attempt used,
 		// and a request that dies mid-loop must still report the provider it
@@ -849,7 +859,16 @@ func (a *Attempter) writeJSON(w http.ResponseWriter, status int, hdr map[string]
 // from observed reset times rather than a guess, so the client backs off on
 // something real.
 func (a *Attempter) writeExhausted(w http.ResponseWriter, res *Result, reason string) {
-	retry := a.retryAfterHint()
+	a.writeExhaustedIn(w, res, reason, anyAccount)
+}
+
+// anyAccount scopes a no-account answer to every account.
+func anyAccount(account.Account) bool { return true }
+
+// writeExhaustedIn is writeExhausted with the Retry-After taken only from the
+// accounts inScope accepts — for strict work, the group it may not leave.
+func (a *Attempter) writeExhaustedIn(w http.ResponseWriter, res *Result, reason string, inScope func(account.Account) bool) {
+	retry := a.retryAfterHint(inScope)
 	secs := strconv.Itoa(int(retry.Seconds()))
 	res.Status = http.StatusTooManyRequests
 	// Nothing upstream classified this request, so without an explicit verdict the
@@ -877,16 +896,46 @@ func (a *Attempter) writeRetryAfter(w http.ResponseWriter, res *Result, d time.D
 
 // writeNoAccount distinguishes "every account was refused", which waiting cannot
 // fix, from "everything is out of quota", which a reset will.
-func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused map[string]bool) {
+//
+// Strict work is judged only against its own group: the rest of the accounts
+// will never serve it, so their resets are no reason to retry and their
+// health is no reason to give up. A strict group with nothing usable in it —
+// emptied, disabled, or errored — gets a non-retryable answer naming the
+// group, because waiting fixes none of those.
+func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused map[string]bool, route account.Route, model string) {
+	inScope := anyAccount
+	if route.Strict {
+		inScope = func(acct account.Account) bool { return acct.Group == route.Group }
+	}
 	// Enabled accounts only. Counting disabled ones too made "every account
 	// refused" all but unreachable the moment an operator switched one off, so a
 	// dead credential — which no amount of waiting fixes — came back as a 429
 	// telling the client to retry later.
-	var total int
+	var total, usable int
 	for _, acct := range a.mgr.All() {
-		if !acct.Disabled {
-			total++
+		if !inScope(acct) || acct.Disabled {
+			continue
 		}
+		total++
+		// Usable means it could serve THIS request once quota or a rate
+		// limit passes. A group that lacks the model, a credential, or an
+		// enabled healthy account will never serve it, and a 429 would send
+		// the client into a retry loop with no end.
+		if a.mgr.CanServe(acct.ID, model) {
+			usable++
+		}
+	}
+	if route.Strict && usable == 0 {
+		res.Status = http.StatusBadGateway
+		res.Outcome = provider.OutcomeNoAccountReady
+		what := "No usable account in group \"" + route.Group + "\""
+		if model != "" {
+			what += " for model \"" + model + "\""
+		}
+		a.writeJSON(w, http.StatusBadGateway, nil, "proxy_error",
+			what+": a strict routing rule keeps this work there. "+
+				"Add or re-enable an account in that group that serves it, or turn strict off.")
+		return
 	}
 	if len(refused) > 0 && len(refused) >= total {
 		names := make([]string, 0, len(refused))
@@ -902,12 +951,12 @@ func (a *Attempter) writeNoAccount(w http.ResponseWriter, res *Result, refused m
 				"). Check the accounts and log in again.")
 		return
 	}
-	a.writeExhausted(w, res, "no eligible account")
+	a.writeExhaustedIn(w, res, "no eligible account", inScope)
 }
 
 // retryAfterHint is the soonest observed reset across all accounts, floored at
 // one second and capped at five minutes.
-func (a *Attempter) retryAfterHint() time.Duration {
+func (a *Attempter) retryAfterHint(inScope func(account.Account) bool) time.Duration {
 	now := time.Now().UnixMilli()
 	var soonest int64
 	consider := func(ts int64) {
@@ -916,6 +965,9 @@ func (a *Attempter) retryAfterHint() time.Duration {
 		}
 	}
 	for _, acct := range a.mgr.Snapshot() {
+		if !inScope(acct) {
+			continue
+		}
 		for _, b := range acct.Buckets {
 			consider(b.ResetsAt)
 		}

@@ -107,6 +107,14 @@ type routerHarness struct {
 
 func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testutil.Script) *routerHarness {
 	t.Helper()
+	return newRouterHarnessWith(t, nil, opts, scripts...)
+}
+
+// newRouterHarnessWith is newRouterHarness with the accounts supplied by the
+// test. accounts receives the fake upstream's URL; nil takes the single
+// default account.
+func newRouterHarnessWith(t *testing.T, accounts func(upstream string) []config.Account, opts func(*HandlerOptions), scripts ...testutil.Script) *routerHarness {
+	t.Helper()
 	up := testutil.NewFakeUpstream(t, scripts...)
 	p := anthropic.New(http.DefaultClient)
 	p.TokenEndpointOverride = fakeTokenEndpoint(t)
@@ -124,6 +132,9 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(),
 		},
 	}}
+	if accounts != nil {
+		accts = accounts(up.URL())
+	}
 	mgr := account.New(accts, providers, account.Options{
 		SwitchThreshold: 0.98,
 		Persist:         func(string, provider.Credential) error { return nil },
@@ -180,6 +191,7 @@ func newRouterHarness(t *testing.T, opts func(*HandlerOptions), scripts ...testu
 			if h.view != nil {
 				h.view.Publish(view.Event{
 					Time: r.StartedAt, Model: req.Model, Account: r.AccountID,
+					Group: r.Group, Spilled: r.Spilled,
 					Status: r.Status, Outcome: r.Outcome.String(), DurationMS: r.DurationMS,
 					TTFBMS: r.TTFBMS, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
 					CacheReadTokens: r.CacheReadTokens, CacheWriteTokens: r.CacheWriteTokens,

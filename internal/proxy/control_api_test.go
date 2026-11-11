@@ -986,3 +986,29 @@ func TestControlAPIUpdateRejectsGet(t *testing.T) {
 		t.Errorf("status = %d, want 405", res.StatusCode)
 	}
 }
+
+func TestControlSetAccountGroup(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	post := func(id string) int {
+		res, err := http.Post(h.srv.URL+"/_aiproxy/api/v1/accounts/"+id+"/group", "application/json",
+			strings.NewReader(`{"group":"gt"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode == 200 && !strings.Contains(string(body), `"ok":true`) {
+			t.Errorf("body = %s", body)
+		}
+		return res.StatusCode
+	}
+	if code := post("acct-0"); code != 200 {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if a, _ := h.mgr.Get("acct-0"); a.Group != "gt" {
+		t.Errorf("group = %q, want gt", a.Group)
+	}
+	if code := post("nope"); code != 404 {
+		t.Errorf("unknown account status = %d, want 404", code)
+	}
+}

@@ -34,6 +34,18 @@ func (m *Manager) SetPriority(id string, priority int) error {
 	return nil
 }
 
+// SetGroup changes an account's routing group. Live: the next Select reads it.
+func (m *Manager) SetGroup(id, group string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a := m.byID[id]
+	if a == nil {
+		return fmt.Errorf("unknown account %q", id)
+	}
+	a.Group = group
+	return nil
+}
+
 // Remove deletes an account from the registry entirely, including any
 // session-affinity entries pinned to it. Leaving a stale affinity entry
 // behind would point a future request at an account id Select can never find

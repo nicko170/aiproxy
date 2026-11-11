@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -28,6 +29,24 @@ const ReservedPrefix = "/_aiproxy"
 
 // sessionHeader is how a client tags requests belonging to one conversation.
 const sessionHeader = "x-claude-code-session-id"
+
+// sessionCookie carries the browser's dashboard session. A cookie rather than
+// a header because a browser cannot attach an x-api-key header to a top-level
+// navigation, and rather than a query parameter because a credential in a URL
+// lands in access logs and Referer headers.
+const sessionCookie = "aiproxy_session"
+
+// SessionValidator is the one thing the proxy needs from the dashboard's
+// session store.
+//
+// Declared HERE, as an interface, rather than importing internal/web: the
+// dependency runs router -> web, and reversing it for an auth check would make
+// the two packages mutually dependent. A nil SessionValidator means no session
+// auth is configured, which is the state of every caller that predates the
+// dashboard.
+type SessionValidator interface {
+	Valid(token string) bool
+}
 
 // maxBodyBytes bounds a buffered request body. The body must be buffered so an
 // attempt can be replayed on another account; the cap keeps a hostile or
@@ -62,6 +81,84 @@ func Authorized(remoteAddr, presentedKey, configuredKey string) bool {
 		return false
 	}
 	return subtle.ConstantTimeCompare(a, b) == 1
+}
+
+// authorizedRequest gates a request: a valid dashboard session, then a matching
+// API key, then the loopback exemption.
+//
+// Session first because it is the cheapest positive answer for the dashboard,
+// which is the only caller that has one. The pure Authorized below is left
+// exactly as it was — four call sites depend on it and it is separately tested.
+func authorizedRequest(o HandlerOptions, r *http.Request) bool {
+	if o.Sessions != nil {
+		if c, err := r.Cookie(sessionCookie); err == nil && o.Sessions.Valid(c.Value) {
+			return true
+		}
+	}
+	// The loopback exemption is for the operator's own tools. A request that
+	// only LOOKS local is denied it and must present the key like any other.
+	remote := r.RemoteAddr
+	if !trustedLocal(r) {
+		remote = ""
+	}
+	return Authorized(remote, r.Header.Get("x-api-key"), o.APIKey)
+}
+
+// forwardingHeaders are set by reverse proxies and tunnels. A request carrying
+// one arrived from somewhere else and was relayed by a process on this host —
+// Caddy, nginx, cloudflared, tailscale serve — so its loopback source address
+// says nothing about who sent it. Local clients (Claude Code, Codex, curl) do
+// not send them.
+var forwardingHeaders = []string{"X-Forwarded-For", "Forwarded", "X-Real-Ip", "Cf-Connecting-Ip", "True-Client-Ip"}
+
+// trustedLocal reports whether a request from a loopback address may use the
+// loopback exemption. Three things disqualify it:
+//
+//   - a forwarding header: a same-host reverse proxy is relaying someone else;
+//   - a Host that is a domain name: DNS rebinding points an attacker's domain
+//     at 127.0.0.1, and the browser still sends that domain as the Host;
+//   - a browser saying the request is cross-site (Sec-Fetch-Site, or an
+//     Origin that is not this host): any page the operator has open can
+//     otherwise POST to the control API.
+func trustedLocal(r *http.Request) bool {
+	for _, h := range forwardingHeaders {
+		if r.Header.Get(h) != "" {
+			return false
+		}
+	}
+	if !localHost(r.Host) {
+		return false
+	}
+	switch r.Header.Get("Sec-Fetch-Site") {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host != r.Host {
+			return false
+		}
+	}
+	return true
+}
+
+// localHost accepts an empty Host, an IP literal, or localhost. An IP literal
+// cannot be rebound; a domain name can.
+func localHost(host string) bool {
+	if host == "" {
+		return true
+	}
+	h := host
+	if hh, _, err := net.SplitHostPort(host); err == nil {
+		h = hh
+	}
+	h = strings.Trim(h, "[]")
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	h = strings.ToLower(h)
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
 }
 
 // ParseModel reads the top-level "model" field. Only the top level is decoded,
@@ -160,6 +257,12 @@ type HandlerOptions struct {
 	// Privacy redacts request bodies and restores responses. Nil disables the
 	// whole path at zero cost.
 	Privacy *privacy.Filter
+	// Sessions authorizes browser dashboard requests. Nil disables the session
+	// path entirely, leaving key-and-loopback behaviour byte for byte as it was.
+	Sessions SessionValidator
+	// Web serves the browser dashboard under the reserved prefix. Nil leaves
+	// the prefix API-only, which is what every existing test expects.
+	Web http.Handler
 }
 
 // proxyHandler buffers the request and hands it to the attempt loop.
@@ -192,7 +295,7 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 			return
 		}
 
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}
@@ -239,6 +342,12 @@ func proxyHandler(o HandlerOptions) http.HandlerFunc {
 					req.Body = rewritten
 				}
 			}
+		}
+
+		// Routing rules read the client's own body, so this sits ahead of the
+		// privacy filter: redaction may rewrite the very text a rule matches.
+		if o.Manager != nil {
+			req.Route = o.Manager.Classify(req.SessionID, req.Body)
 		}
 
 		if req.Model != "" {
@@ -362,7 +471,7 @@ func passthroughHandler(o HandlerOptions) http.HandlerFunc {
 		Transport: NewTransport(TransportOptions{DisableResponseHeaderTimeout: true}),
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}

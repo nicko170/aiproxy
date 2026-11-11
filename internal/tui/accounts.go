@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/nicko170/aiproxy/internal/view"
@@ -16,6 +17,8 @@ type acctsState struct {
 	detail     bool
 	confirming bool // remove asks first
 	importing  bool // import source menu open
+	grouping   bool // group prompt open, editing input
+	input      textinput.Model
 
 	history    []view.QuotaPoint
 	historyFor string
@@ -98,6 +101,32 @@ func (m Model) accountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if s.grouping {
+		switch key {
+		case "esc":
+			s.grouping = false
+			return m, nil
+		case "enter":
+			s.grouping = false
+			a, ok := m.selectedAccount()
+			if !ok {
+				return m, nil
+			}
+			group := strings.TrimSpace(s.input.Value())
+			did := a.Label + " now ungrouped"
+			if group != "" {
+				did = a.Label + " now in " + group
+			}
+			src := m.src
+			return m, m.action(did, "set group", func(ctx context.Context) error {
+				return src.SetAccountGroup(ctx, a.ID, group)
+			})
+		}
+		var cmd tea.Cmd
+		s.input, cmd = s.input.Update(msg)
+		return m, cmd
+	}
+
 	if s.importing {
 		var source view.ImportSource
 		switch key {
@@ -173,6 +202,17 @@ func (m Model) accountsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "i":
 		s.importing = true
+	case "g":
+		if a, ok := m.selectedAccount(); ok {
+			ti := textinput.New()
+			ti.Prompt = ""
+			ti.CharLimit = 64
+			ti.SetValue(a.Group)
+			ti.CursorEnd()
+			ti.Focus()
+			s.input = ti
+			s.grouping = true
+		}
 	}
 	return m, nil
 }
@@ -198,9 +238,12 @@ func (m Model) accountsFooter() []string {
 	if m.accts.importing {
 		return []string{"c from Claude Code", "x from Codex", "esc cancel"}
 	}
+	if m.accts.grouping {
+		return []string{"enter save", "esc cancel", "empty = ungrouped"}
+	}
 	// Ordered so the footer sheds from the right when narrow: navigation
 	// hints go before the mutations do.
-	return []string{"l login", "i import", "e enable/disable", "+/- priority", "x remove", "enter detail", "j/k select"}
+	return []string{"l login", "i import", "e enable/disable", "+/- priority", "g group", "x remove", "enter detail", "j/k select"}
 }
 
 func (m Model) viewAccounts(h int) string {
@@ -224,14 +267,18 @@ func (m Model) viewAccounts(h int) string {
 	nowMS := m.now.UnixMilli()
 
 	var b strings.Builder
-	head := "   " + th.dim(padRight("pri", 5)+padRight("account", 30)+padRight("state", 24)+padRight("5h", 6)+padRight("7d", 6)+"in flight")
+	head := "   " + th.dim(padRight("pri", 5)+padRight("account", 30)+padRight("group", 14)+padRight("state", 24)+padRight("5h", 6)+padRight("7d", 6)+"in flight")
 	b.WriteString(head + "\n")
 	for i, a := range m.accounts {
 		cursor := "  "
+		group := a.Group
+		if group == "" {
+			group = "—"
+		}
 		line := fmt.Sprintf("%s%s%s",
 			padRight(fmt.Sprintf("p%d", a.Priority), 5),
 			padRight(truncate(a.Label, 28), 30),
-			"")
+			padRight(truncate(group, 12), 14))
 		state, sev := accountState(a, nowMS)
 		util := func(name string) string {
 			u, ok := a.Buckets[name]
@@ -257,6 +304,11 @@ func (m Model) viewAccounts(h int) string {
 		if a, ok := m.selectedAccount(); ok {
 			b.WriteString("\n  " + th.bad("remove "+a.Label+"?") + th.dim("  its history stays in the ledger; its credential is deleted. ") +
 				th.accent("y") + th.dim(" remove · any other key keeps it") + "\n")
+		}
+	} else if m.accts.grouping {
+		if a, ok := m.selectedAccount(); ok {
+			b.WriteString("\n  " + th.dim("group for "+a.Label+":  ") + th.accent(m.accts.input.View()) +
+				th.dim("  enter save · esc cancel · empty = ungrouped") + "\n")
 		}
 	} else if m.accts.importing {
 		b.WriteString("\n  " + th.dim("import from:  ") + th.accent("c") + " Claude Code  " + th.accent("x") + " Codex  " + th.dim("esc cancel") + "\n")

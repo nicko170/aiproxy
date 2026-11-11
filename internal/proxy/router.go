@@ -36,6 +36,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Get("/api/v1/events", eventsHandler(o))
 		cp.Post("/api/v1/accounts/{id}/enabled", setAccountEnabledHandler(o))
 		cp.Post("/api/v1/accounts/{id}/priority", setAccountPriorityHandler(o))
+		cp.Post("/api/v1/accounts/{id}/group", setAccountGroupHandler(o))
 		cp.Delete("/api/v1/accounts/{id}", removeAccountHandler(o))
 		cp.Get("/api/v1/settings", settingsHandler(o))
 		cp.Post("/api/v1/settings", updateSettingsHandler(o))
@@ -53,6 +54,26 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Post("/api/v1/accounts/login", loginBeginHandler(o, loginSessions))
 		cp.Post("/api/v1/accounts/login/{sessionId}/code", loginSubmitCodeHandler(o, loginSessions))
 		cp.Get("/api/v1/accounts/login/{sessionId}", loginPollHandler(o, loginSessions))
+
+		// The dashboard mounts INSIDE the reserved prefix, as a sibling of the
+		// API routes rather than by relaxing cp.NotFound. That handler exists so
+		// a future control path can never fall through to the upstream, and an
+		// unknown path under the prefix must stay a 404.
+		if o.Web != nil {
+			// The bare prefix also lands on "/". Stripped, it is an empty path,
+			// and ServeMux "cleans" that with a redirect to the SERVER root —
+			// which is the proxy, not the dashboard. Redirect it here instead.
+			dashboard := http.StripPrefix(ReservedPrefix, o.Web)
+			cp.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == ReservedPrefix {
+					http.Redirect(w, r, ReservedPrefix+"/", http.StatusMovedPermanently)
+					return
+				}
+				dashboard.ServeHTTP(w, r)
+			})
+			cp.Handle("/assets/*", http.StripPrefix(ReservedPrefix, o.Web))
+			cp.Handle("/api/v1/session", http.StripPrefix(ReservedPrefix, o.Web))
+		}
 
 		// Anything else under the reserved prefix is a 404, never a proxied
 		// request: a future control route must not be answerable by the upstream.

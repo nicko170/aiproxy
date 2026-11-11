@@ -23,7 +23,7 @@ import (
 // gate every other endpoint enforces, loopback exempt (see Authorized).
 func controlHandler(o HandlerOptions, fn func(view.Source, http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}
@@ -278,6 +278,26 @@ func setAccountPriorityHandler(o HandlerOptions) http.HandlerFunc {
 			return
 		}
 		if err := src.SetPriority(r.Context(), id, body.Priority); err != nil {
+			writeMutationError(w, err)
+			return
+		}
+		writeJSON(w, map[string]any{"ok": true})
+	})
+}
+
+type groupBody struct {
+	Group string `json:"group"`
+}
+
+func setAccountGroupHandler(o HandlerOptions) http.HandlerFunc {
+	return controlHandler(o, func(src view.Source, w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		var body groupBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request_error", "malformed request body")
+			return
+		}
+		if err := src.SetAccountGroup(r.Context(), id, body.Group); err != nil {
 			writeMutationError(w, err)
 			return
 		}

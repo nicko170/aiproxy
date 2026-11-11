@@ -19,7 +19,7 @@
   │     g         group by account, model, or outcome    │  
   │   accounts                                           │  
   │     e         enable or disable                      │  
-  │     +/-       raise or lower priority                │  
+  │     +/- g     priority; g sets the routing group     │  
   │     x         remove (asks first)                    │  
   │     i         import credentials                     │  
   │                                                      │  

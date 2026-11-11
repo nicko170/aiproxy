@@ -1,6 +1,6 @@
 # Routing rules: send work to the accounts that should pay for it
 
-**Status:** reviewed, awaiting approval
+**Status:** implemented (v0.5.0)
 **Date:** 2026-11-11
 **Lands with:** the web dashboard ([2026-08-25-web-dashboard-design.md](2026-08-25-web-dashboard-design.md)),
 in one release. The dashboard's Settings and Accounts screens are where most

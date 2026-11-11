@@ -119,6 +119,7 @@ func (h *modelsHarness) get(path string) *httptest.ResponseRecorder {
 func (h *modelsHarness) getFrom(path, remoteAddr, apiKey string) *httptest.ResponseRecorder {
 	h.t.Helper()
 	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Host = "127.0.0.1:3456" // as a local client sends it; see trustedLocal
 	if remoteAddr != "" {
 		req.RemoteAddr = remoteAddr
 	}

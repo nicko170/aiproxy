@@ -643,6 +643,8 @@ func TestSettingsRoundTripsWhatUpdateSettingsWrote(t *testing.T) {
 		// none.
 		PrivacyOnScanFailure: "closed", PrivacyOnUnresolved: "passthrough",
 		PrivacyScanTimeoutMS: 10000,
+		RoutingRules:         []RoutingRule{{Match: "code/GT", Group: "gt", Strict: true}},
+		DefaultGroup:         strp("personal"), DefaultStrict: boolp(false),
 	}
 	if _, err := h.local.UpdateSettings(context.Background(), want); err != nil {
 		t.Fatalf("UpdateSettings: %v", err)

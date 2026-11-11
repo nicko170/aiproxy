@@ -185,7 +185,7 @@ func activityColumnsFor(width, modelWidth int) []actCol {
 	all := []actCol{
 		{"time", 8, false, func(m Model, e view.Event) string { return formatClockSec(e.Time, m.loc) }},
 		{"model", modelWidth, false, func(m Model, e view.Event) string { return modelCell(e) }},
-		{"account", 18, false, func(m Model, e view.Event) string { return m.accountLabel(e.Account) }},
+		{"account", 18, false, func(m Model, e view.Event) string { return accountCell(m.accountLabel(e.Account), e.Spilled, 18) }},
 		{"st", 3, false, func(m Model, e view.Event) string { return fmt.Sprintf("%d", e.Status) }},
 		{"dur", 7, true, func(m Model, e view.Event) string { return formatMS(e.DurationMS) }},
 		{"ttfb", 7, true, func(m Model, e view.Event) string { return formatMS(e.TTFBMS) }},
@@ -222,6 +222,16 @@ func activityColumnsFor(width, modelWidth int) []actCol {
 		}
 	}
 	return out
+}
+
+// accountCell is the Activity account column: the label, with a spill marker
+// when the request was served outside its routing group. The label is
+// truncated first so the marker always survives a narrow column.
+func accountCell(label string, spilled bool, width int) string {
+	if !spilled {
+		return label
+	}
+	return truncate(label, width-2) + " ↪"
 }
 
 // accountLabel resolves an account id to its label; a vanished account keeps

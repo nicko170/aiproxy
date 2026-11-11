@@ -27,8 +27,10 @@ func (s Settings) Validate() error {
 	if s.BodyIdleMS <= 0 {
 		return fmt.Errorf("bodyIdleMs must be positive, got %d", s.BodyIdleMS)
 	}
-	if s.QuotaProbeIntervalSeconds <= 0 {
-		return fmt.Errorf("quotaProbeIntervalSeconds must be positive, got %d", s.QuotaProbeIntervalSeconds)
+	// Zero is the documented "probe disabled" (the prober skips its loop on
+	// a non-positive interval); only a negative value is nonsense.
+	if s.QuotaProbeIntervalSeconds < 0 {
+		return fmt.Errorf("quotaProbeIntervalSeconds must not be negative, got %d", s.QuotaProbeIntervalSeconds)
 	}
 	if s.MetricsRetentionDays <= 0 {
 		return fmt.Errorf("metricsRetentionDays must be positive, got %d", s.MetricsRetentionDays)
@@ -39,6 +41,11 @@ func (s Settings) Validate() error {
 	for _, pattern := range s.BlockedModels {
 		if _, err := path.Match(pattern, ""); err != nil {
 			return fmt.Errorf("blockedModels pattern %q is not a valid glob: %w", pattern, err)
+		}
+	}
+	for i, r := range s.RoutingRules {
+		if strings.TrimSpace(r.Match) == "" {
+			return fmt.Errorf("routingRules[%d].match must not be blank", i)
 		}
 	}
 	if strings.ContainsAny(strings.TrimSpace(s.ModelOverride), " \t\n,") {

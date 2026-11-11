@@ -33,7 +33,7 @@ func modelsHandler(o HandlerOptions) http.HandlerFunc {
 		// answers is the union of every logged-in account's models — a leak of
 		// plan entitlements and account composition to anyone who can reach
 		// the port.
-		if !Authorized(r.RemoteAddr, r.Header.Get("x-api-key"), o.APIKey) {
+		if !authorizedRequest(o, r) {
 			writeError(w, http.StatusUnauthorized, "authentication_error", "Invalid proxy API key")
 			return
 		}

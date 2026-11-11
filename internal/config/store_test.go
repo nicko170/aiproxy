@@ -103,6 +103,33 @@ func TestLoadFillsHeaderTimeoutForAPreExistingConfig(t *testing.T) {
 	}
 }
 
+// TestConfigAlwaysSuppliesAnAPIKey asserts the invariant that makes
+// cmd/aiproxy's checkBindSafety redundant today: Default seeds a key, and
+// loadLocked heals a blank one on the way out of Load, so no caller that goes
+// through this package ever sees an empty listen.apiKey. checkBindSafety's
+// "no key" refusal exists only as a backstop for that guarantee being
+// weakened elsewhere; if this test ever fails, that guard has just become the
+// only thing standing between a public bind and an open control plane.
+func TestConfigAlwaysSuppliesAnAPIKey(t *testing.T) {
+	if Default().Listen.APIKey == "" {
+		t.Error("Default() should seed a non-blank listen.apiKey")
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	blank := `{"listen":{"addr":"0.0.0.0:3456","apiKey":""}}`
+	if err := os.WriteFile(path, []byte(blank), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Listen.APIKey == "" {
+		t.Error("Load should heal a blank listen.apiKey on disk into a non-blank one")
+	}
+}
+
 // Concurrent read-modify-write must not lose writes. Losing one here means
 // losing a rotated refresh token, which invalidates an account on next start.
 func TestUpdateSerializesConcurrentWriters(t *testing.T) {

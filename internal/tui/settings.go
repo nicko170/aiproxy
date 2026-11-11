@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -22,6 +23,9 @@ type settingField struct {
 	boolean bool
 	get     func(view.Settings) string
 	set     func(*view.Settings, string) error
+	// opens, when set, replaces the inline editor: enter calls it instead,
+	// for a value too structured to edit as one line of text.
+	opens func(m *Model) tea.Cmd
 }
 
 func setInt(dst *int) func(*view.Settings, string) error {
@@ -89,6 +93,49 @@ func settingFields() []settingField {
 				s.ModelOverride = strings.TrimSpace(v)
 				return nil
 			},
+		},
+		{
+			name: "defaultGroup",
+			desc: "account group preferred by work no routing rule matches; empty means ungrouped accounts",
+			get:  func(s view.Settings) string { return derefStr(s.DefaultGroup) },
+			set: func(s *view.Settings, v string) error {
+				g := strings.TrimSpace(v)
+				s.DefaultGroup = &g
+				return nil
+			},
+		},
+		{
+			name: "defaultStrict", boolean: true,
+			desc: "unmatched work never spills outside the default group, even when every account in it is spent",
+			get: func(s view.Settings) string {
+				if s.DefaultStrict != nil && *s.DefaultStrict {
+					return "on"
+				}
+				return "off"
+			},
+			set: func(s *view.Settings, v string) error {
+				on := v == "on"
+				s.DefaultStrict = &on
+				return nil
+			},
+		},
+		{
+			name: "routingRules",
+			desc: "text in a request → preferred account group, first match wins; enter to edit",
+			get: func(s view.Settings) string {
+				switch n := len(s.RoutingRules); n {
+				case 0:
+					return "none"
+				case 1:
+					return "1 rule"
+				default:
+					return fmt.Sprintf("%d rules", n)
+				}
+			},
+			set: func(*view.Settings, string) error {
+				return fmt.Errorf("routing rules are edited in the rules editor")
+			},
+			opens: openRulesEditor,
 		},
 		{
 			name: "retryBudgetMs", unit: "ms",
@@ -200,6 +247,9 @@ type settingsState struct {
 	// justApplied names fields confirmed live by the last update, cleared on
 	// the next edit.
 	justApplied map[string]bool
+
+	// rules is the routing-rules editor, open when non-nil.
+	rules *rulesEditor
 }
 
 func newSettingsState() settingsState {
@@ -250,6 +300,12 @@ func (m Model) updateSettings(msg tea.Msg) (Model, tea.Cmd) {
 		}
 		m.settings.updateErr = ""
 		m.settings.current = msg.s
+		if m.settings.rules != nil {
+			m.settings.rules.rules = slices.Clone(msg.s.RoutingRules)
+			if m.settings.rules.sel >= len(m.settings.rules.rules) {
+				m.settings.rules.sel = max(len(m.settings.rules.rules)-1, 0)
+			}
+		}
 		m.settings.justApplied = map[string]bool{}
 		for _, f := range msg.applied.Live {
 			m.settings.justApplied[f] = true
@@ -264,6 +320,9 @@ func (m Model) updateSettings(msg tea.Msg) (Model, tea.Cmd) {
 }
 
 func (m Model) settingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.settings.rules != nil {
+		return m.rulesKey(msg)
+	}
 	s := &m.settings
 	fields := settingFields()
 
@@ -304,6 +363,10 @@ func (m Model) settingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if !s.loaded {
 			return m, nil
 		}
+		if f.opens != nil {
+			cmd := f.opens(&m)
+			return m, cmd
+		}
 		if f.boolean {
 			next := m.settings.current
 			cur := f.get(next)
@@ -324,6 +387,13 @@ func (m Model) settingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		s.input.Focus()
 	}
 	return m, nil
+}
+
+func derefStr(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
 }
 
 // pushSettings writes the whole settings struct through the seam and reports
@@ -348,6 +418,9 @@ func (m Model) pushSettings(next view.Settings) tea.Cmd {
 }
 
 func (m Model) settingsFooter() []string {
+	if m.settings.rules != nil {
+		return m.rulesFooter()
+	}
 	if m.settings.editing {
 		return []string{"enter save", "esc cancel"}
 	}
@@ -362,6 +435,10 @@ func (m Model) viewSettings(h int) string {
 	}
 	if !s.loaded {
 		return "\n  " + th.dim("loading settings…")
+	}
+
+	if s.rules != nil {
+		return m.viewRules()
 	}
 
 	fields := settingFields()
