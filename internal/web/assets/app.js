@@ -155,7 +155,7 @@ async function showSignIn(message) {
 // SCREENS are loaded with dynamic imports, after this module has finished
 // evaluating: each screen imports registerScreen from here, and a static
 // import cycle would run the screen before `screens` exists.
-const SCREENS = ["overview", "activity", "usage", "accounts"];
+const SCREENS = ["overview", "activity", "usage", "accounts", "settings"];
 let screensLoaded = null;
 function loadScreens() {
   screensLoaded ??= Promise.all(SCREENS.map((n) => import(`./screens/${n}.js`)));

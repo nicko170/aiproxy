@@ -146,7 +146,7 @@ table.feed { width: 100%; border-collapse: collapse; font-size: 12px; }
 .stat-note { font-size: 11px; color: var(--warning); }
 .chart .marker { stroke: var(--muted); stroke-width: 1; stroke-opacity: 0.5; }
 .inline { display: flex; gap: 0.3rem; align-items: center; flex-wrap: wrap; }
-.inline input { width: 9rem; }
+.inline input[type=text] { width: 9rem; }
 .field-error { color: var(--danger); font-size: 12px; }
 dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); max-width: 28rem; }
 dialog::backdrop { background: rgb(0 0 0 / 0.35); }
@@ -156,3 +156,16 @@ dialog.login { width: min(34rem, 92vw); }
 input.wide { width: 100%; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .controls-block { display: flex; flex-direction: column; gap: 0.4rem; margin-top: auto; }
+.panel .row { display: grid; grid-template-columns: 14rem 12rem 1fr; gap: 0.5rem 1rem; align-items: center; padding: 0.35rem 0; border-top: 1px solid var(--line); }
+.panel .row:first-of-type { border-top: 0; }
+.panel .row label { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.help { font-size: 12px; color: var(--muted); display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+@media (max-width: 760px) { .panel .row { grid-template-columns: 1fr; } }
+ol.rules { padding-left: 1.2rem; display: flex; flex-direction: column; gap: 0.6rem; }
+.rule-main { display: flex; flex-direction: column; gap: 0.35rem; }
+.rule textarea { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.examples { margin: 0.2rem 0 0.6rem; }
+.savebar { position: sticky; bottom: 0; background: var(--bg); padding: 0.6rem 0; border-top: 1px solid var(--line); display: flex; gap: 1rem; align-items: flex-start; }
+button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.warn-text { color: var(--warning); }
+.result p { margin: 0.1rem 0; }
