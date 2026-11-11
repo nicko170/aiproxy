@@ -179,3 +179,20 @@ func TestSetAccountGroupPersistsAndApplies(t *testing.T) {
 		t.Errorf("unknown account: err = %v", err)
 	}
 }
+
+// The README documents quotaProbe.intervalSeconds 0 as "disable the background
+// probe", and the prober honours it, but Validate refused it — so ANY settings
+// save, from the TUI or the dashboard, failed for an operator who had turned
+// the probe off. Negative is still nonsense.
+func TestUpdateSettingsAcceptsAZeroProbeInterval(t *testing.T) {
+	h := newHarness(t, acctCfg("a", 0))
+	s := loadSettings(t, h)
+	s.QuotaProbeIntervalSeconds = 0
+	if _, err := h.local.UpdateSettings(context.Background(), s); err != nil {
+		t.Fatalf("a zero probe interval (documented: disabled) was refused: %v", err)
+	}
+	s.QuotaProbeIntervalSeconds = -1
+	if _, err := h.local.UpdateSettings(context.Background(), s); err == nil {
+		t.Error("a negative probe interval must be refused")
+	}
+}
