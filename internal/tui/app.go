@@ -477,7 +477,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// This is a whitelist of modes, so a third prompt has the same hazard. It is
 	// left as a list rather than a helper because the screen check differs per
 	// mode above; behavior_test.go pins the leak shut.
-	if m.screen == screenAccounts && (m.accts.confirming || m.accts.importing) {
+	if m.screen == screenAccounts && (m.accts.confirming || m.accts.importing || m.accts.grouping) {
 		return m.accountsKey(msg)
 	}
 
@@ -923,7 +923,7 @@ func (m Model) viewHelp(h int) string {
 		{"g", "group by account, model, or outcome"},
 		{"accounts", ""},
 		{"e", "enable or disable"},
-		{"+/-", "raise or lower priority"},
+		{"+/- g", "priority up or down; g sets the routing group"},
 		{"x", "remove (asks first)"},
 		{"i", "import credentials"},
 	}

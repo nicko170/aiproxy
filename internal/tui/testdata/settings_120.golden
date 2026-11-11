@@ -8,6 +8,9 @@
       keep a session on the account that served it, while that account can serve
     blockedModels               claude-3-*            
     modelOverride                                     
+    defaultGroup                                      
+    defaultStrict               off                   
+    routingRules                none                  
     retryBudgetMs               60000 ms              
     inlineAbsorbMaxMs           15000 ms              
     headerTimeoutMs             30000 ms              
@@ -18,9 +21,6 @@
     updateCheckIntervalHours    24 h                  
     privacyEnabled              off                   
     privacyDenylist             acme-prod.internal    
-
-
-
 
 
 
