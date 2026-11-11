@@ -138,3 +138,23 @@ func TestDashboardConfiguresRoutingThroughASession(t *testing.T) {
 		t.Errorf("accounts came back as %+v", accts)
 	}
 }
+
+// Typing the dashboard URL without its trailing slash used to 307 to "/",
+// which is the PROXY root: the browser landed on an upstream error page, and
+// on loopback that request went out with an account credential.
+func TestBareReservedPrefixRedirectsToTheDashboard(t *testing.T) {
+	sessions := web.NewSessions(time.Hour)
+	srv := httptest.NewServer(NewRouter(HandlerOptions{
+		Log: quietLogger(), Sessions: sessions, Web: web.Handler(sessions, ""),
+	}))
+	defer srv.Close()
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	res, err := client.Get(srv.URL + ReservedPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if loc := res.Header.Get("Location"); loc != ReservedPrefix+"/" {
+		t.Errorf("status %d Location %q, want a redirect to %s/", res.StatusCode, loc, ReservedPrefix)
+	}
+}

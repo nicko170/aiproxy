@@ -60,7 +60,17 @@ func NewRouter(o HandlerOptions) http.Handler {
 		// a future control path can never fall through to the upstream, and an
 		// unknown path under the prefix must stay a 404.
 		if o.Web != nil {
-			cp.Handle("/", http.StripPrefix(ReservedPrefix, o.Web))
+			// The bare prefix also lands on "/". Stripped, it is an empty path,
+			// and ServeMux "cleans" that with a redirect to the SERVER root —
+			// which is the proxy, not the dashboard. Redirect it here instead.
+			dashboard := http.StripPrefix(ReservedPrefix, o.Web)
+			cp.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == ReservedPrefix {
+					http.Redirect(w, r, ReservedPrefix+"/", http.StatusMovedPermanently)
+					return
+				}
+				dashboard.ServeHTTP(w, r)
+			})
 			cp.Handle("/assets/*", http.StripPrefix(ReservedPrefix, o.Web))
 			cp.Handle("/api/v1/session", http.StripPrefix(ReservedPrefix, o.Web))
 		}
