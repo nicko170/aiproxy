@@ -139,7 +139,18 @@ async function showSignIn(message) {
 
 // Boot probes an authenticated endpoint. A 401 means sign in; anything else
 // means the proxy is reachable and we can render.
+// SCREENS are loaded with dynamic imports, after this module has finished
+// evaluating: each screen imports registerScreen from here, and a static
+// import cycle would run the screen before `screens` exists.
+const SCREENS = ["overview"];
+let screensLoaded = null;
+function loadScreens() {
+  screensLoaded ??= Promise.all(SCREENS.map((n) => import(`./screens/${n}.js`)));
+  return screensLoaded;
+}
+
 export async function boot() {
+  await loadScreens();
   try {
     await api("/status");
   } catch (e) {
