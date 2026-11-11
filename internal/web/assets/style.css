@@ -144,3 +144,15 @@ table.feed { width: 100%; border-collapse: collapse; font-size: 12px; }
 .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 0.8rem; margin-bottom: 1rem; }
 .panel h3 { margin: 0 0 0.5rem; font-size: 0.9rem; font-weight: 500; color: var(--muted); }
 .stat-note { font-size: 11px; color: var(--warning); }
+.chart .marker { stroke: var(--muted); stroke-width: 1; stroke-opacity: 0.5; }
+.inline { display: flex; gap: 0.3rem; align-items: center; flex-wrap: wrap; }
+.inline input { width: 9rem; }
+.field-error { color: var(--danger); font-size: 12px; }
+dialog { border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); max-width: 28rem; }
+dialog::backdrop { background: rgb(0 0 0 / 0.35); }
+.detail { margin-top: 1rem; }
+.card.selected { border-color: var(--accent); }
+dialog.login { width: min(34rem, 92vw); }
+input.wide { width: 100%; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.controls-block { display: flex; flex-direction: column; gap: 0.4rem; margin-top: auto; }

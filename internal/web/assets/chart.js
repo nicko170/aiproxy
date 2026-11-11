@@ -327,16 +327,25 @@ export function stackedArea({ points, keys, width = 640, height = 220, format = 
 }
 
 // lineChart draws independent series ([{key, points: [{x, y}]}]) on one axis.
-export function lineChart({ series, width = 640, height = 200, format = (v) => String(v), label, yMax }) {
+//
+// markers draws faint vertical lines at the given x values (e.g. quota
+// resets), each with a title for assistive technology.
+export function lineChart({ series, width = 640, height = 200, format = (v) => String(v), label, yMax, xDomain, markers = [] }) {
   const all = series.flatMap((s) => s.points);
   if (!all.length) return emptyChart("No data in this range", { width, height });
   const xs = [...new Set(all.map((p) => p.x))].sort((a, b) => a - b);
   const yt = niceTicks(0, yMax ?? Math.max(...all.map((p) => p.y)), 4);
-  const x = timeScale({ domain: [xs[0], xs[xs.length - 1]], range: [M.l, width - M.r] });
+  const [x0, x1] = xDomain || [xs[0], xs[xs.length - 1]];
+  const x = timeScale({ domain: [x0, x1], range: [M.l, width - M.r] });
   const y = linearScale({ domain: [0, yt[yt.length - 1]], range: [height - M.b, M.t] });
   const svg = frame(width, height, label || "line chart: " + series.map((s) => s.key).join(", "));
   yAxis(svg, y, yt, width, format);
-  xAxis(svg, x, timeTicks(xs[0], xs[xs.length - 1], 6), height);
+  xAxis(svg, x, timeTicks(x0, x1, 6), height);
+  for (const m of markers) {
+    if (m.at < x0 || m.at > x1) continue;
+    svg.appendChild(el("line", { x1: x(m.at), x2: x(m.at), y1: M.t, y2: height - M.b, class: "marker" },
+      el("title", {}, m.label || "")));
+  }
   for (const s of series) {
     const c = colorFor(s.key);
     const g = el("g", { class: "series" }, el("title", {}, s.key));
