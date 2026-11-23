@@ -768,3 +768,73 @@ func TestLoginAuthorizeURLMatchesReferenceStructure(t *testing.T) {
 		t.Errorf("state = %q (%d chars), want 43", state, len(state))
 	}
 }
+
+// Long-lived logins are setup-token-style: an inference + profile grant, not
+// the full scope set. The reduced scope is what lets the token endpoint honour
+// a custom expiry.
+func TestLoginLongLivedUsesInferenceAndProfileScope(t *testing.T) {
+	up := loginUpstream(t, "at", "rt")
+	p := newLoginProvider(t, up)
+
+	sess, err := p.Login(context.Background(), provider.LoginOptions{LongLived: true})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	defer sess.Cancel()
+
+	u, err := url.Parse(sess.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	if got := u.Query().Get("scope"); got != LongLivedScopes {
+		t.Errorf("scope = %q, want %q", got, LongLivedScopes)
+	}
+}
+
+// The exchange must ask for a year and store the result as a static bearer:
+// setup tokens have no refresh token, so any refresh token the server happens
+// to send must be dropped. The profile read still happens, because the grant
+// keeps user:profile.
+func TestLoginLongLivedRequestsOneYearAndDropsRefreshToken(t *testing.T) {
+	up := loginUpstream(t, "at", "rt-should-be-dropped")
+	p := newLoginProvider(t, up)
+
+	var got provider.Credential
+	var gotProfile provider.Profile
+	p.OnLoginSuccess = func(_ context.Context, c provider.Credential, pr provider.Profile) error {
+		got, gotProfile = c, pr
+		return nil
+	}
+
+	sess, err := p.Login(context.Background(), provider.LoginOptions{LongLived: true})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	state, redirectURI := sessionParams(t, sess.URL)
+	res, err := http.Get(redirectURI + "?code=auth-code-1&state=" + state)
+	if err != nil {
+		t.Fatalf("simulate callback: %v", err)
+	}
+	res.Body.Close()
+
+	if r := awaitResult(t, sess.Done); r.Err != nil {
+		t.Fatalf("LoginResult.Err = %v", r.Err)
+	}
+	if !got.LongLived {
+		t.Error("credential is not marked LongLived")
+	}
+	if got.RefreshToken != "" {
+		t.Errorf("RefreshToken = %q, want it dropped for a long-lived credential", got.RefreshToken)
+	}
+	if gotProfile.Email != "a@example.com" {
+		t.Errorf("profile = %+v, want the profile read to still happen", gotProfile)
+	}
+
+	var sent map[string]any
+	if err := json.Unmarshal(up.Requests()[0].Body, &sent); err != nil {
+		t.Fatalf("decode exchange body: %v", err)
+	}
+	if sent["expires_in"] != float64(LongLivedTokenTTLSeconds) {
+		t.Errorf("expires_in = %v, want %d", sent["expires_in"], LongLivedTokenTTLSeconds)
+	}
+}
