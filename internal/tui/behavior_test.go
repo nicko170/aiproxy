@@ -835,18 +835,38 @@ func TestLoginCtrlTTogglesLongLivedAndRestarts(t *testing.T) {
 	if rec.lastOpts.LongLived {
 		t.Fatal("first start should be standard")
 	}
+	standard := m.View()
+	if !strings.Contains(standard, "ctrl+t long-lived: off") {
+		t.Error("standard pane does not show the toggle as off")
+	}
+	// The reduced scope is the on state only; the standard login still asks
+	// for the full set.
+	if strings.Contains(standard, "inference+profile") {
+		t.Error("standard pane misstates the requested scope")
+	}
 
+	cancelled := make(chan struct{})
+	m.login.sess = view.LoginSession{Cancel: func() { close(cancelled) }}
 	next, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT})
 	m = next.(Model)
 	if !m.login.active || !m.login.longLived {
 		t.Fatalf("login = %+v, want a restarted long-lived flow", m.login)
 	}
+	select {
+	case <-cancelled:
+	default:
+		t.Error("ctrl+t did not cancel the previous session")
+	}
 	cmd() // records the restarted options
 	if !rec.lastOpts.LongLived {
 		t.Error("ctrl+t did not restart with LongLived")
 	}
-	if !strings.Contains(m.View(), "long-lived") {
-		t.Error("login pane does not say it is long-lived")
+	out := m.View()
+	if !strings.Contains(out, "long-lived (1 year)") {
+		t.Errorf("title does not say the mode: %q", out)
+	}
+	if !strings.Contains(out, "inference+profile") {
+		t.Error("long-lived pane does not name its scope")
 	}
 }
 

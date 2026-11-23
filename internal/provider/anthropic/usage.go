@@ -220,6 +220,12 @@ func (a *Anthropic) Quota(ctx context.Context, c provider.Credential) (provider.
 	if status == http.StatusTooManyRequests {
 		return provider.Quota{}, ErrQuotaThrottled
 	}
+	if status == http.StatusUnauthorized {
+		// Distinguishable from a generic failure: the bearer is dead. The
+		// prober turns this into a forced refresh, which sidles a long-lived
+		// credential instead of retrying it every cycle.
+		return provider.Quota{}, fmt.Errorf("%w: usage: HTTP %d", provider.ErrCredentialRejected, status)
+	}
 	if status != http.StatusOK {
 		return provider.Quota{}, fmt.Errorf("usage: HTTP %d", status)
 	}

@@ -43,8 +43,10 @@ func onLoginSuccess(store *config.Store, mgr *account.Manager, providerName stri
 		const longLivedFloor = 300 * 24 * time.Hour
 		if cred.LongLived && cred.ExpiresAt > 0 &&
 			cred.ExpiresAt < time.Now().Add(longLivedFloor).UnixMilli() {
+			expiresIn := time.Until(time.UnixMilli(cred.ExpiresAt)).Round(time.Minute)
 			log.Warn("long-lived login returned a shorter token than requested",
 				"provider", providerName, "account", profile.Email,
+				"expiresIn", expiresIn,
 				"expiresAt", time.UnixMilli(cred.ExpiresAt).UTC().Format(time.RFC3339))
 		}
 		acc := config.Account{

@@ -18,6 +18,15 @@ export function countdown(untilMs) {
   return "in " + humanDuration((untilMs - Date.now()) / 1000);
 }
 
+// expiryDate renders a unix-ms instant as YYYY-MM-DD, or "" when the value is
+// missing or out of Date's range. A corrupt config must not take the whole
+// account card down with a RangeError from toISOString.
+function expiryDate(ms) {
+  if (!Number.isFinite(ms)) return "";
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+}
+
 const BUCKET_NAMES = { five_hour: "5h", seven_day: "7d" };
 function bucketLabel(name) {
   return BUCKET_NAMES[name] || name.replace(/^seven_day_/, "7d ").replace(/_/g, " ");
@@ -45,8 +54,8 @@ export function renderAccountCard(a, status, extra = null) {
   // A setup-token account is a static bearer: the expiry is when it must be
   // re-authorised, so it is a fact worth showing, not hidden in the store.
   if (a.longLived) {
-    const expires = a.expiresAt ? " · expires " + new Date(a.expiresAt).toISOString().slice(0, 10) : "";
-    facts.push(el("dt", {}, "token"), el("dd", {}, "1-year" + expires));
+    const date = expiryDate(a.expiresAt);
+    facts.push(el("dt", {}, "token"), el("dd", {}, "1-year" + (date ? " · expires " + date : "")));
   }
   return el("article", { class: "card account" + (a.disabled ? " disabled" : ""), "data-id": a.id },
     el("header", {},

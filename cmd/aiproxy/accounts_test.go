@@ -192,8 +192,12 @@ func TestOnLoginSuccessWarnsWhenLongLivedTokenIsShort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("hook: %v", err)
 	}
-	if !strings.Contains(buf.String(), "shorter") {
-		t.Errorf("log = %q, want a downgrade warning", buf.String())
+	log := buf.String()
+	if !strings.Contains(log, "shorter") {
+		t.Errorf("log = %q, want a downgrade warning", log)
+	}
+	if !strings.Contains(log, "expiresIn=") {
+		t.Errorf("log = %q, want the actual lifetime named", log)
 	}
 }
 

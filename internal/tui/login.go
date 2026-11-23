@@ -276,12 +276,16 @@ func (m Model) viewLogin(h int) string {
 		b.WriteString(th.dim("waiting for the browser or a pasted code…") + "\n")
 	}
 	if l.provider == "anthropic" {
-		state := "off"
+		// Say only what is true for the CURRENT mode: the reduced scope belongs
+		// to the on state, and the off state asks for the full set. Kept short
+		// so a 60-column pane does not clip the line or grow past the screen.
+		hint := "ctrl+t long-lived: "
 		if l.longLived {
-			state = "on"
+			hint += "on  ·  inference+profile"
+		} else {
+			hint += "off"
 		}
-		b.WriteString("\n" + th.dim("ctrl+t long-lived: ") + th.accent(state) +
-			th.dim("  ·  scope user:inference user:profile") + "\n")
+		b.WriteString(th.dim(truncate(hint, max(20, m.width-12))) + "\n")
 	}
 	if l.err != "" {
 		b.WriteString("\n" + th.bad(truncate(l.err, max(20, m.width-12))) + "\n")

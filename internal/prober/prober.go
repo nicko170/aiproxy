@@ -274,6 +274,14 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 	current := make(map[string]bool, len(live))
 	for _, a := range live {
 		current[a.ID] = true
+		// An errored account has a rejected credential and cannot serve; only a
+		// successful refresh clears that, and this loop cannot produce one.
+		// Probing it would log the same rejection every cycle — for a long-lived
+		// setup token, forever, on exactly the idle server this feature targets.
+		// Re-login is the recovery.
+		if a.Status == account.StatusErrored {
+			continue
+		}
 		// NOT filtered by credential type here. It used to skip anything that
 		// was not OAuth, on the grounds that an API key has no usage endpoint
 		// (spec §4.4) — true for Quota, and Quota still answers ErrUnsupported
@@ -344,6 +352,20 @@ func (p *Prober) probeAll(ctx context.Context) []error {
 		// catalogue by at most maxBackoff rather than stopping it.
 		if err := p.probeQuota(ctx, prov, a, now); err != nil {
 			errs = append(errs, fmt.Errorf("probe account %s: %w", a.ID, err))
+			if errors.Is(err, provider.ErrCredentialRejected) {
+				// The bearer is dead. Force one refresh: a standard credential
+				// renews and the catalogue can still be read; a long-lived one
+				// is sidelined with the re-login message. Either way, do not
+				// spend a second call on the dead token.
+				if ferr := p.mgr.EnsureFresh(ctx, a.ID, true); ferr != nil {
+					p.log.Warn("credential rejected while probing quota",
+						"account", a.Label, "id", a.ID, "err", ferr)
+					continue
+				}
+				if fresh, ok := p.mgr.Get(a.ID); ok {
+					a = fresh
+				}
+			}
 		}
 		p.probeModels(ctx, prov, a)
 	}
