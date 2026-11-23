@@ -36,16 +36,24 @@ export function renderAccountCard(a, status, extra = null) {
   if (pinned) limits.push(el("span", { class: "pill accent" }, "forced"));
 
   const buckets = Object.entries(a.buckets || {}).sort(([x], [y]) => x.localeCompare(y));
+  const facts = [
+    el("dt", {}, "priority"), el("dd", {}, "p" + a.priority),
+    el("dt", {}, "group"), el("dd", {}, a.group || "—"),
+    el("dt", {}, "in flight"), el("dd", {}, String(a.inFlight ?? 0)),
+    el("dt", {}, "status"), el("dd", {}, a.status),
+  ];
+  // A setup-token account is a static bearer: the expiry is when it must be
+  // re-authorised, so it is a fact worth showing, not hidden in the store.
+  if (a.longLived) {
+    const expires = a.expiresAt ? " · expires " + new Date(a.expiresAt).toISOString().slice(0, 10) : "";
+    facts.push(el("dt", {}, "token"), el("dd", {}, "1-year" + expires));
+  }
   return el("article", { class: "card account" + (a.disabled ? " disabled" : ""), "data-id": a.id },
     el("header", {},
       el("span", { class: "swatch", style: `background:${colorFor(a.id)}` }),
       el("h3", {}, a.label),
       el("span", { class: "muted" }, a.provider)),
-    el("dl", { class: "facts" },
-      el("dt", {}, "priority"), el("dd", {}, "p" + a.priority),
-      el("dt", {}, "group"), el("dd", {}, a.group || "—"),
-      el("dt", {}, "in flight"), el("dd", {}, String(a.inFlight ?? 0)),
-      el("dt", {}, "status"), el("dd", {}, a.status)),
+    el("dl", { class: "facts" }, facts),
     limits.length ? el("div", { class: "pills" }, limits) : null,
     buckets.length
       ? el("div", { class: "gauges" }, buckets.map(([name, f]) => gauge({ fraction: f, label: bucketLabel(name) })))
