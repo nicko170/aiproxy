@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
@@ -29,8 +31,22 @@ import (
 // matched entry's Credential/Identity/Label are replaced in the store AND
 // pushed into the live Manager via UpdateCredential; mgr.Add would instead
 // create the exact duplicate this fix exists to avoid.
-func onLoginSuccess(store *config.Store, mgr *account.Manager, providerName string) func(context.Context, provider.Credential, provider.Profile) error {
+func onLoginSuccess(store *config.Store, mgr *account.Manager, providerName string, log *slog.Logger) func(context.Context, provider.Credential, provider.Profile) error {
+	if log == nil {
+		log = slog.Default()
+	}
 	return func(_ context.Context, cred provider.Credential, profile provider.Profile) error {
+		// A long-lived login asks for a year. If the response is materially
+		// shorter, the server ignored expires_in: the account works, but the
+		// operator needs to know now, not when it dies. The provider itself
+		// stays silent by contract; this is the layer that owns a logger.
+		const longLivedFloor = 300 * 24 * time.Hour
+		if cred.LongLived && cred.ExpiresAt > 0 &&
+			cred.ExpiresAt < time.Now().Add(longLivedFloor).UnixMilli() {
+			log.Warn("long-lived login returned a shorter token than requested",
+				"provider", providerName, "account", profile.Email,
+				"expiresAt", time.UnixMilli(cred.ExpiresAt).UTC().Format(time.RFC3339))
+		}
 		acc := config.Account{
 			ID: config.NewID(), Provider: providerName, Label: loginLabel(profile),
 			Credential: cred,
