@@ -211,7 +211,7 @@ func (refusingProvider) Quota(context.Context, provider.Credential) (provider.Qu
 func (refusingProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
 	return nil, provider.ErrUnsupported
 }
-func (refusingProvider) Login(context.Context) (provider.LoginSession, error) {
+func (refusingProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 func (refusingProvider) Endpoint(provider.Account) *url.URL {

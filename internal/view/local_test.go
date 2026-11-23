@@ -121,7 +121,7 @@ func (stubProvider) Quota(context.Context, provider.Credential) (provider.Quota,
 func (stubProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
 	return nil, provider.ErrUnsupported
 }
-func (stubProvider) Login(context.Context) (provider.LoginSession, error) {
+func (stubProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 func (stubProvider) Endpoint(provider.Account) *url.URL {
@@ -145,7 +145,7 @@ type loginableProvider struct {
 }
 
 func (loginableProvider) Name() string { return "loginable" }
-func (l loginableProvider) Login(context.Context) (provider.LoginSession, error) {
+func (l loginableProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return l.session, l.err
 }
 

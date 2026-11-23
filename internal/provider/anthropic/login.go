@@ -124,7 +124,7 @@ func authorizeQuery(params []authorizeParam) string {
 	return strings.Join(parts, "&")
 }
 
-func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
+func (a *Anthropic) Login(ctx context.Context, _ provider.LoginOptions) (provider.LoginSession, error) {
 	verifier, err := randToken(32)
 	if err != nil {
 		return provider.LoginSession{}, err

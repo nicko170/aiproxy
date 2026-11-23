@@ -143,7 +143,10 @@ func (o *OpenAI) bindCallback() (net.Listener, int, error) {
 // one), and an authorize URL the caller shows and may open in a browser.
 // Login never opens a browser or logs anything itself — see
 // provider.LoginSession's doc comment.
-func (o *OpenAI) Login(ctx context.Context) (provider.LoginSession, error) {
+func (o *OpenAI) Login(ctx context.Context, opts provider.LoginOptions) (provider.LoginSession, error) {
+	if opts.LongLived {
+		return provider.LoginSession{}, fmt.Errorf("%w: long-lived login", provider.ErrUnsupported)
+	}
 	verifier, err := pkceVerifier()
 	if err != nil {
 		return provider.LoginSession{}, err

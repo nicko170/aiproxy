@@ -79,7 +79,7 @@ func (f *fakeProvider) Models(_ context.Context, _ provider.Credential) ([]provi
 	}
 	return f.models, nil
 }
-func (f *fakeProvider) Login(context.Context) (provider.LoginSession, error) {
+func (f *fakeProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 func (f *fakeProvider) Endpoint(provider.Account) *url.URL {

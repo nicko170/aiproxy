@@ -735,7 +735,7 @@ func (l *Local) Login(ctx context.Context, providerName string) (provider.LoginS
 	if !ok {
 		return provider.LoginSession{}, fmt.Errorf("unknown provider %q", providerName)
 	}
-	return p.Login(ctx)
+	return p.Login(ctx, provider.LoginOptions{})
 }
 
 // ImportCredentials reads accounts from an external credential file (spec
