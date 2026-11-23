@@ -273,9 +273,12 @@ func (f *loginFlow) finish(res provider.LoginResult) {
 	f.once.Do(func() {
 		f.cancel()
 		go func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			f.srv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort; the listener is torn down either way
+			// Close, not Shutdown: Shutdown waits for every connection to go
+			// idle, and the browser leaves the one-shot callback page open, so
+			// Done could sit behind the full shutdown grace period. The response
+			// has already been written by the time complete reaches finish; the
+			// listener and its connections are what must be gone before Done.
+			f.srv.Close() //nolint:errcheck // best-effort; the listener is torn down either way
 			f.done <- res
 		}()
 	})
