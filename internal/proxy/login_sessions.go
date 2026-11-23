@@ -75,8 +75,8 @@ func randomSessionID() (string, error) {
 // returns; combined with a bug in loginFlow.awaitTimeout (fixed separately)
 // that silently defeated the whole timeout, every started login leaked its
 // loopback listener, its goroutines, and this registry entry forever.
-func (r *loginSessionRegistry) begin(src view.Source, providerName string) (id, url string, err error) {
-	sess, err := src.Login(context.Background(), providerName)
+func (r *loginSessionRegistry) begin(src view.Source, providerName string, opts provider.LoginOptions) (id, url string, err error) {
+	sess, err := src.Login(context.Background(), providerName, opts)
 	if err != nil {
 		return "", "", err
 	}

@@ -157,6 +157,12 @@ type Account struct {
 	Buckets          map[string]float64 `json:"buckets"`
 	// Group is the account's routing group; empty is ungrouped.
 	Group string `json:"group"`
+	// LongLived marks a setup-token-style account: a one-year static bearer
+	// that cannot be refreshed. ExpiresAt is that credential's expiry (unix
+	// ms), shown so the next login is a date on screen rather than a surprise.
+	// Both are non-secret metadata; the tokens never cross this seam.
+	LongLived bool  `json:"longLived,omitempty"`
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
 }
 
 // Window is a closed-open time range in unix ms, mirroring metrics.Window but

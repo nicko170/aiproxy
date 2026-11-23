@@ -302,7 +302,7 @@ func TestRenderChartKeepsWidthAndShowsSmallColumns(t *testing.T) {
 
 func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	m := fixtureModel(100, 30)
-	res, _ := m.startLogin("anthropic")
+	res, _ := m.startLogin("anthropic", false)
 	m = res.(Model)
 	m, _ = m.updateLogin(loginStartedMsg{sess: view.LoginSession{URL: "https://example.test/authorize?x=1"}})
 	out := m.View()
@@ -330,7 +330,7 @@ type loginRecordingSource struct {
 	gotProvider string
 }
 
-func (s *loginRecordingSource) Login(ctx context.Context, providerName string) (view.LoginSession, error) {
+func (s *loginRecordingSource) Login(ctx context.Context, providerName string, _ view.LoginOptions) (view.LoginSession, error) {
 	s.gotProvider = providerName
 	return view.LoginSession{}, nil
 }

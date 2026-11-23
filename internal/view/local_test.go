@@ -142,10 +142,15 @@ type loginableProvider struct {
 	stubProvider
 	session provider.LoginSession
 	err     error
+	// gotOpts, when non-nil, receives the options Local.Login forwarded.
+	gotOpts *provider.LoginOptions
 }
 
 func (loginableProvider) Name() string { return "loginable" }
-func (l loginableProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
+func (l loginableProvider) Login(_ context.Context, opts provider.LoginOptions) (provider.LoginSession, error) {
+	if l.gotOpts != nil {
+		*l.gotOpts = opts
+	}
 	return l.session, l.err
 }
 
@@ -733,7 +738,7 @@ func TestLoginReturnsTheNamedProvidersSession(t *testing.T) {
 	}
 	h := newHarnessWithProviders(t, nil, providers)
 
-	got, err := h.local.Login(context.Background(), "loginable")
+	got, err := h.local.Login(context.Background(), "loginable", provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -746,7 +751,7 @@ func TestLoginReturnsTheNamedProvidersSession(t *testing.T) {
 // error, not a nil session silently returned.
 func TestLoginUnknownProviderNameReturnsError(t *testing.T) {
 	h := newHarness(t)
-	if _, err := h.local.Login(context.Background(), "does-not-exist"); err == nil {
+	if _, err := h.local.Login(context.Background(), "does-not-exist", provider.LoginOptions{}); err == nil {
 		t.Error("want an error for an unregistered provider name")
 	}
 }
@@ -760,8 +765,62 @@ func TestLoginPropagatesTheProvidersOwnError(t *testing.T) {
 	}
 	h := newHarnessWithProviders(t, nil, providers)
 
-	if _, err := h.local.Login(context.Background(), "loginable"); !errors.Is(err, provider.ErrUnsupported) {
+	if _, err := h.local.Login(context.Background(), "loginable", provider.LoginOptions{}); !errors.Is(err, provider.ErrUnsupported) {
 		t.Errorf("err = %v, want provider.ErrUnsupported", err)
+	}
+}
+
+// The long-lived flag is part of the login request, not a global setting: the
+// provider must receive exactly what the caller asked for.
+func TestLoginPassesLongLivedOptionThrough(t *testing.T) {
+	want := provider.LoginSession{URL: "https://example.invalid/authorize?state=xyz"}
+	var got provider.LoginOptions
+	providers := map[string]provider.Provider{
+		"stub":      stubProvider{},
+		"loginable": loginableProvider{session: want, gotOpts: &got},
+	}
+	h := newHarnessWithProviders(t, nil, providers)
+
+	gotSess, err := h.local.Login(context.Background(), "loginable", provider.LoginOptions{LongLived: true})
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	if gotSess.URL != want.URL {
+		t.Errorf("URL = %q, want %q", gotSess.URL, want.URL)
+	}
+	if !got.LongLived {
+		t.Error("LongLived did not reach the provider")
+	}
+}
+
+// The account view exposes the non-secret token metadata (so an operator can
+// see when a long-lived account needs a fresh login) and never the tokens.
+func TestAccountsExposeLongLivedMetadataWithoutTokens(t *testing.T) {
+	const access, refresh = "sekrit-access-token", "sekrit-refresh-token"
+	h := newHarness(t, config.Account{
+		ID: "a", Provider: "stub", Label: "a",
+		Credential: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: access, RefreshToken: refresh,
+			LongLived: true, ExpiresAt: 1234,
+		},
+	})
+
+	accts, err := h.local.Accounts(context.Background())
+	if err != nil {
+		t.Fatalf("Accounts: %v", err)
+	}
+	if len(accts) != 1 {
+		t.Fatalf("Accounts = %+v, want 1", accts)
+	}
+	if !accts[0].LongLived || accts[0].ExpiresAt != 1234 {
+		t.Errorf("account = %+v, want LongLived and ExpiresAt", accts[0])
+	}
+	b, err := json.Marshal(accts[0])
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if bytes.Contains(b, []byte(access)) || bytes.Contains(b, []byte(refresh)) {
+		t.Errorf("account JSON leaked a token: %s", b)
 	}
 }
 
@@ -807,7 +866,7 @@ func TestLoginSessionNeverCarriesCredentialMaterial(t *testing.T) {
 	}
 	h := newHarnessWithProviders(t, nil, providers)
 
-	sess, err := h.local.Login(context.Background(), "anthropic")
+	sess, err := h.local.Login(context.Background(), "anthropic", provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}

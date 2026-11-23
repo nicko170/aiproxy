@@ -15,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/nicko170/aiproxy/internal/config"
+	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
 )
@@ -372,7 +373,7 @@ func loginBeginHandler(o HandlerOptions, reg *loginSessionRegistry) http.Handler
 		// reg.begin deliberately does not take r.Context(): the session it
 		// starts must outlive this handler, not die the instant it returns
 		// (see loginSessionRegistry.begin's doc comment).
-		id, url, err := reg.begin(src, body.Provider)
+		id, url, err := reg.begin(src, body.Provider, provider.LoginOptions{})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return

@@ -19,7 +19,7 @@ type fakeLoginSource struct {
 	login func(ctx context.Context) (provider.LoginSession, error)
 }
 
-func (f fakeLoginSource) Login(ctx context.Context, _ string) (provider.LoginSession, error) {
+func (f fakeLoginSource) Login(ctx context.Context, _ string, _ provider.LoginOptions) (provider.LoginSession, error) {
 	return f.login(ctx)
 }
 
@@ -38,7 +38,7 @@ func TestLoginSessionRegistryBeginUsesARequestIndependentContext(t *testing.T) {
 		return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 	}}
 
-	id, _, err := reg.begin(src, "anthropic")
+	id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoginSessionRegistryReleasesTerminalSessions(t *testing.T) {
 			return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 		}}
 
-		id, _, err := reg.begin(src, "anthropic")
+		id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
@@ -91,7 +91,7 @@ func TestLoginSessionRegistryReleasesTerminalSessions(t *testing.T) {
 			return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 		}}
 
-		id, _, err := reg.begin(src, "anthropic")
+		id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}

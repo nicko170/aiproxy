@@ -21,6 +21,9 @@ type (
 	LoginSession = provider.LoginSession
 	// LoginResult is provider.LoginResult, re-exported for front-ends.
 	LoginResult = provider.LoginResult
+	// LoginOptions is provider.LoginOptions, re-exported so a front-end can ask
+	// for a long-lived login without importing provider.
+	LoginOptions = provider.LoginOptions
 	// ImportSource is config.ImportSource, re-exported for front-ends.
 	ImportSource = config.ImportSource
 )

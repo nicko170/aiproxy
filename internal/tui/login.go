@@ -21,12 +21,13 @@ type loginState struct {
 	// screen's "i" opens a source picker before ImportCredentials runs (see
 	// acctsState.importing). Nothing else in loginState is meaningful while
 	// this is true.
-	picking  bool
-	active   bool
-	provider string
-	sess     view.LoginSession
-	code     textinput.Model
-	err      string
+	picking   bool
+	active    bool
+	provider  string
+	longLived bool
+	sess      view.LoginSession
+	code      textinput.Model
+	err       string
 }
 
 // loginProviders is the fixed set of providers the login picker offers, in
@@ -67,7 +68,7 @@ type loginDoneMsg struct {
 // startLogin begins the PKCE flow for providerName, which the caller has
 // already chosen (see loginPickKey). A picking prompt in progress is not
 // this function's concern — the caller clears it before calling in.
-func (m Model) startLogin(providerName string) (tea.Model, tea.Cmd) {
+func (m Model) startLogin(providerName string, longLived bool) (tea.Model, tea.Cmd) {
 	if m.login.active {
 		return m, nil
 	}
@@ -76,7 +77,7 @@ func (m Model) startLogin(providerName string) (tea.Model, tea.Cmd) {
 	ti.Placeholder = "paste the code here"
 	ti.CharLimit = 400
 	ti.Focus()
-	m.login = loginState{active: true, code: ti, provider: providerName}
+	m.login = loginState{active: true, code: ti, provider: providerName, longLived: longLived}
 	src := m.src
 	// The flow's context lifetime is the session, not this call: src.Login
 	// returns as soon as its loopback listener is bound, long before the
@@ -94,7 +95,7 @@ func (m Model) startLogin(providerName string) (tea.Model, tea.Cmd) {
 	// itself survives.
 	ctx := m.ctx
 	return m, func() tea.Msg {
-		sess, err := src.Login(ctx, providerName)
+		sess, err := src.Login(ctx, providerName, view.LoginOptions{LongLived: longLived})
 		return loginStartedMsg{sess: sess, err: err}
 	}
 }
@@ -159,7 +160,7 @@ func (m Model) loginPickKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	for _, p := range loginProviders {
 		if p.key == key {
 			m.login = loginState{}
-			return m.startLogin(p.name)
+			return m.startLogin(p.name, false)
 		}
 	}
 	m.login = loginState{}
