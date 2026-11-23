@@ -98,7 +98,7 @@ func TestRulesEditorAddsARule(t *testing.T) {
 	m = typeInto(t, m, "Primary working directory: /Users/n/code/GT")
 	m = press(t, m, "enter")
 	m = typeInto(t, m, "gt")
-	m = press(t, m, "enter")
+	press(t, m, "enter")
 
 	want := []view.RoutingRule{{Match: "Primary working directory: /Users/n/code/GT", Group: "gt"}}
 	if got := rec.last(t); len(got) != 1 || got[0] != want[0] {

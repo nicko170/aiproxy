@@ -63,11 +63,6 @@ func newModelsHarnessWithKey(t *testing.T, apiKey string, specs ...acctSpec) *mo
 	return newModelsHarnessFull(t, false, apiKey, specs...)
 }
 
-func newModelsHarnessWith(t *testing.T, disabled bool, specs ...acctSpec) *modelsHarness {
-	t.Helper()
-	return newModelsHarnessFull(t, disabled, "", specs...)
-}
-
 func newModelsHarnessFull(t *testing.T, disabled bool, apiKey string, specs ...acctSpec) *modelsHarness {
 	t.Helper()
 	accts := make([]config.Account, 0, len(specs))
