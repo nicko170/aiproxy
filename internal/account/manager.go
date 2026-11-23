@@ -162,8 +162,18 @@ func (m *Manager) EnsureFresh(ctx context.Context, id string, force bool) error 
 		m.mu.Unlock()
 		return fmt.Errorf("unknown account %q", id)
 	}
-	// An API key does not expire, so there is nothing to refresh.
+	// An API key does not expire, and a long-lived setup token cannot be
+	// renewed. For the latter a FORCED refresh means upstream already refused
+	// the bearer (401), so the account needs a fresh login: sideline it in one
+	// attempt instead of retrying the same dead token on every request.
 	if a.Credential.Type != provider.CredentialOAuth || a.Credential.RefreshToken == "" {
+		if force && a.Credential.LongLived {
+			const msg = "long-lived token cannot be refreshed; log in again"
+			a.Status = StatusErrored
+			a.LastError = msg
+			m.mu.Unlock()
+			return fmt.Errorf("%w: %s", provider.ErrCredentialRejected, msg)
+		}
 		m.mu.Unlock()
 		return nil
 	}
