@@ -2,11 +2,11 @@ package tui
 
 import (
 	"context"
-
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
 	"strings"
+	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/nicko170/aiproxy/internal/view"
@@ -76,6 +76,17 @@ func (m Model) viewOverview(h int) string {
 		}
 		left := cursor + th.identity(a.ID, th.bold(truncate(a.Label, labelMax))) + th.dim(partic) + forced
 		b.WriteString(spread(left, right, m.width) + "\n")
+
+		// The date a long-lived token must be renewed by is the one thing that
+		// cannot be inferred from the quota gauges, so it gets its own line on
+		// the screen an operator actually sits on.
+		if a.LongLived {
+			line := "long-lived token"
+			if a.ExpiresAt > 0 {
+				line += " · expires " + time.UnixMilli(a.ExpiresAt).In(m.loc).Format("2006-01-02")
+			}
+			b.WriteString("  " + th.dim(truncate(line, m.width-4)) + "\n")
+		}
 
 		if a.LastError != "" && a.Status != "active" {
 			b.WriteString("  " + th.bad(truncate(a.LastError, m.width-4)) + "\n")

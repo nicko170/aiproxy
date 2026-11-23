@@ -309,9 +309,10 @@ On the Anthropic login pane, `ctrl+t` turns on a **long-lived (one-year)**
 login. It requests the same kind of token `claude setup-token` does, with the
 `user:inference user:profile` scope and `expires_in=31536000`. Use it for a
 server that would otherwise need re-authorising every few weeks. The token is
-a static bearer with no refresh token: when it expires, log in again (the
-account shows the date). The dashboard's Claude login has the same option as
-a checkbox.
+a static bearer with no refresh token: when it expires, log in again. The
+Overview screen shows `long-lived token · expires YYYY-MM-DD`, the Accounts
+list marks the row `1y`, and the account detail repeats the date. The
+dashboard's Claude login has the same option as a checkbox.
 
 Then point your agent at it:
 

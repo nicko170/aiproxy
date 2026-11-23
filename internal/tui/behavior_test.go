@@ -902,3 +902,27 @@ func TestAccountDetailShowsLongLivedExpiry(t *testing.T) {
 		t.Errorf("detail = %q, want a long-lived expiry line", out)
 	}
 }
+
+// A one-year token's renewal date must be visible on the screens an operator
+// actually sits on, not only after opening the account detail.
+func TestLongLivedTokenIsVisibleOnOverviewAndAccountsList(t *testing.T) {
+	m := fixtureModel(120, 28)
+	exp := fixtureNow.Add(365 * 24 * time.Hour).UnixMilli()
+	m.accounts = append(m.accounts, view.Account{
+		ID: "oat", Label: "one-year@example.com", Provider: "anthropic",
+		Priority: 3, Status: "active", LongLived: true, ExpiresAt: exp,
+	})
+
+	overview := m.viewOverview(20)
+	if !strings.Contains(overview, "long-lived token · expires 2027-08-17") {
+		t.Errorf("overview = %q, want the token expiry line", overview)
+	}
+
+	list := m.viewAccounts(20)
+	if got := strings.Count(list, "1y ·"); got != 1 {
+		t.Errorf("accounts list has %d long-lived markers, want 1:\n%s", got, list)
+	}
+	if !strings.Contains(list, "1y · ready") {
+		t.Errorf("accounts list = %q, want the long-lived account marked", list)
+	}
+}

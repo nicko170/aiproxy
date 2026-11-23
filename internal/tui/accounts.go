@@ -280,6 +280,12 @@ func (m Model) viewAccounts(h int) string {
 			padRight(truncate(a.Label, 28), 30),
 			padRight(truncate(group, 12), 14))
 		state, sev := accountState(a, nowMS)
+		// A one-year static bearer cannot refresh; flag it in the list so the
+		// account is identifiable without opening detail. Prefix rather than
+		// suffix so the state column's truncation can never eat the marker.
+		if a.LongLived {
+			state = "1y · " + state
+		}
 		util := func(name string) string {
 			u, ok := a.Buckets[name]
 			if !ok {
@@ -330,7 +336,7 @@ func (m Model) viewAccountDetail(a view.Account) string {
 	if a.LongLived {
 		line := "token: long-lived"
 		if a.ExpiresAt > 0 {
-			line += " · expires " + time.UnixMilli(a.ExpiresAt).Format("2006-01-02")
+			line += " · expires " + time.UnixMilli(a.ExpiresAt).In(m.loc).Format("2006-01-02")
 		}
 		b.WriteString("  " + th.dim(line) + "\n")
 	}
