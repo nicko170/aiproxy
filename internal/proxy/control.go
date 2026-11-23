@@ -356,6 +356,9 @@ func updateSettingsHandler(o HandlerOptions) http.HandlerFunc {
 // to start a PKCE session for (e.g. "anthropic").
 type loginBeginBody struct {
 	Provider string `json:"provider"`
+	// LongLived asks for a setup-token-style one-year grant. Only Anthropic
+	// offers it; another provider returns its unsupported error (400).
+	LongLived bool `json:"longLived"`
 }
 
 // loginBeginHandler begins a login session (view.Source.Login's one mapped
@@ -373,12 +376,26 @@ func loginBeginHandler(o HandlerOptions, reg *loginSessionRegistry) http.Handler
 		// reg.begin deliberately does not take r.Context(): the session it
 		// starts must outlive this handler, not die the instant it returns
 		// (see loginSessionRegistry.begin's doc comment).
-		id, url, err := reg.begin(src, body.Provider, provider.LoginOptions{})
+		id, url, err := reg.begin(src, body.Provider, provider.LoginOptions{LongLived: body.LongLived})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"sessionId": id, "url": url})
+	})
+}
+
+// loginCancelHandler answers DELETE .../accounts/login/{sessionId}: abandon a
+// pending session and free its loopback listener now, rather than waiting for
+// the provider's login timeout. The dashboard uses it when the operator flips
+// the long-lived toggle (which restarts the flow) or closes the dialog.
+func loginCancelHandler(o HandlerOptions, reg *loginSessionRegistry) http.HandlerFunc {
+	return controlHandler(o, func(_ view.Source, w http.ResponseWriter, r *http.Request) {
+		if !reg.cancel(chi.URLParam(r, "sessionId")) {
+			writeError(w, http.StatusNotFound, "not_found_error", "no such login session")
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	})
 }
 

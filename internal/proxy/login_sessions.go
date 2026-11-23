@@ -119,6 +119,26 @@ func (r *loginSessionRegistry) begin(src view.Source, providerName string, opts 
 	return id, sess.URL, nil
 }
 
+// cancel abandons a pending session: it removes the registry entry first so a
+// concurrent poll sees "no such session" rather than a stale pending state,
+// then tears the provider flow down. The Done-draining goroutine started by
+// begin still holds its state and exits normally; its later delete is a no-op.
+func (r *loginSessionRegistry) cancel(id string) bool {
+	r.mu.Lock()
+	st, ok := r.sessions[id]
+	if ok {
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if st.sess.Cancel != nil {
+		st.sess.Cancel()
+	}
+	return true
+}
+
 func (r *loginSessionRegistry) get(id string) (*loginSessionState, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

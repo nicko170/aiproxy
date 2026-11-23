@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/nicko170/aiproxy/internal/metrics"
+	"github.com/nicko170/aiproxy/internal/provider/anthropic"
 	"github.com/nicko170/aiproxy/internal/testutil"
 	"github.com/nicko170/aiproxy/internal/updater"
 	"github.com/nicko170/aiproxy/internal/view"
@@ -691,6 +692,96 @@ func TestControlAPILoginUnknownSessionReturns404(t *testing.T) {
 	codeRes.Body.Close()
 	if codeRes.StatusCode != http.StatusNotFound {
 		t.Errorf("submit-code status = %d, want 404", codeRes.StatusCode)
+	}
+}
+
+// The long-lived flag is a request field, and it must reach the provider:
+// the resulting authorize URL is the observable proof (its scope is reduced).
+func TestControlAPILoginBeginPassesLongLived(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	h.p.LoginTimeoutOverride = 5 * time.Second
+
+	beginRes, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login", "application/json",
+		strings.NewReader(`{"provider":"anthropic","longLived":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginBody, _ := io.ReadAll(beginRes.Body)
+	beginRes.Body.Close()
+	if beginRes.StatusCode != 200 {
+		t.Fatalf("begin status = %d: %s", beginRes.StatusCode, beginBody)
+	}
+	var begin struct {
+		SessionID string `json:"sessionId"`
+		URL       string `json:"url"`
+	}
+	if err := json.Unmarshal(beginBody, &begin); err != nil {
+		t.Fatalf("decode begin response: %v", err)
+	}
+	u, err := url.Parse(begin.URL)
+	if err != nil {
+		t.Fatalf("parse authorize URL: %v", err)
+	}
+	if got := u.Query().Get("scope"); got != anthropic.LongLivedScopes {
+		t.Errorf("scope = %q, want %q", got, anthropic.LongLivedScopes)
+	}
+
+	// Release the pending flow rather than leaving its listener bound.
+	req, _ := http.NewRequest(http.MethodDelete, h.srv.URL+ReservedPrefix+"/api/v1/accounts/login/"+begin.SessionID, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	res.Body.Close()
+}
+
+// The dashboard's toggle restarts a login. Without a cancel route, every
+// abandoned session keeps its loopback listener and registry entry until the
+// timeout; DELETE is what makes restarting cheap.
+func TestControlAPILoginDeleteCancelsPendingSession(t *testing.T) {
+	h := newRouterHarness(t, nil, testutil.Script{Status: 200, Body: `{}`})
+	h.p.LoginTimeoutOverride = 5 * time.Second
+
+	beginRes, err := http.Post(h.srv.URL+ReservedPrefix+"/api/v1/accounts/login", "application/json",
+		strings.NewReader(`{"provider":"anthropic"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var begin struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := json.NewDecoder(beginRes.Body).Decode(&begin); err != nil {
+		t.Fatal(err)
+	}
+	beginRes.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, h.srv.URL+ReservedPrefix+"/api/v1/accounts/login/"+begin.SessionID, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Errorf("delete status = %d, want 204", res.StatusCode)
+	}
+
+	poll, err := http.Get(h.srv.URL + ReservedPrefix + "/api/v1/accounts/login/" + begin.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poll.Body.Close()
+	if poll.StatusCode != http.StatusNotFound {
+		t.Errorf("poll after delete = %d, want 404", poll.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodDelete, h.srv.URL+ReservedPrefix+"/api/v1/accounts/login/"+begin.SessionID, nil)
+	again, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Body.Close()
+	if again.StatusCode != http.StatusNotFound {
+		t.Errorf("second delete = %d, want 404", again.StatusCode)
 	}
 }
 
