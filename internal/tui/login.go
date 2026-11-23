@@ -25,6 +25,7 @@ type loginState struct {
 	active    bool
 	provider  string
 	longLived bool
+	seq       int
 	sess      view.LoginSession
 	code      textinput.Model
 	err       string
@@ -58,11 +59,13 @@ func providerDisplayName(name string) string {
 type loginStartedMsg struct {
 	sess view.LoginSession
 	err  error
+	seq  int
 }
 
 type loginDoneMsg struct {
 	res view.LoginResult
 	ok  bool // false: the channel closed without a result — not a success
+	seq int
 }
 
 // startLogin begins the PKCE flow for providerName, which the caller has
@@ -77,7 +80,11 @@ func (m Model) startLogin(providerName string, longLived bool) (tea.Model, tea.C
 	ti.Placeholder = "paste the code here"
 	ti.CharLimit = 400
 	ti.Focus()
-	m.login = loginState{active: true, code: ti, provider: providerName, longLived: longLived}
+	m.loginSeq++
+	seq := m.loginSeq
+	m.login = loginState{
+		active: true, code: ti, provider: providerName, longLived: longLived, seq: seq,
+	}
 	src := m.src
 	// The flow's context lifetime is the session, not this call: src.Login
 	// returns as soon as its loopback listener is bound, long before the
@@ -96,25 +103,25 @@ func (m Model) startLogin(providerName string, longLived bool) (tea.Model, tea.C
 	ctx := m.ctx
 	return m, func() tea.Msg {
 		sess, err := src.Login(ctx, providerName, view.LoginOptions{LongLived: longLived})
-		return loginStartedMsg{sess: sess, err: err}
+		return loginStartedMsg{sess: sess, err: err, seq: seq}
 	}
 }
 
 // waitLogin receives the flow's single result. A closed channel with no
 // value is "no result", never success: a zero LoginResult is
 // indistinguishable from a clean login, so only a received value counts.
-func waitLogin(done <-chan view.LoginResult) tea.Cmd {
+func waitLogin(done <-chan view.LoginResult, seq int) tea.Cmd {
 	return func() tea.Msg {
 		v, ok := <-done
-		return loginDoneMsg{res: v, ok: ok}
+		return loginDoneMsg{res: v, ok: ok, seq: seq}
 	}
 }
 
 func (m Model) updateLogin(msg tea.Msg) (Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case loginStartedMsg:
-		if !m.login.active {
-			// Cancelled before the session arrived; tear the flow down.
+		if !m.login.active || msg.seq != m.login.seq {
+			// Cancelled or replaced before the session arrived; tear it down.
 			if msg.err == nil && msg.sess.Cancel != nil {
 				msg.sess.Cancel()
 			}
@@ -125,10 +132,10 @@ func (m Model) updateLogin(msg tea.Msg) (Model, tea.Cmd) {
 			return m, nil
 		}
 		m.login.sess = msg.sess
-		return m, waitLogin(msg.sess.Done)
+		return m, waitLogin(msg.sess.Done, msg.seq)
 
 	case loginDoneMsg:
-		if !m.login.active {
+		if !m.login.active || msg.seq != m.login.seq {
 			return m, nil
 		}
 		if !msg.ok {
@@ -186,6 +193,20 @@ func (m Model) loginKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		m.login.err = ""
 		return m, nil
+	case "ctrl+t":
+		// Long-lived is an Anthropic-only grant. Restarting is deliberate:
+		// the scope is baked into the authorize URL, so the only way to change
+		// modes is a fresh PKCE flow. The old session is cancelled first.
+		if m.login.provider != "anthropic" {
+			return m, nil
+		}
+		providerName := m.login.provider
+		next := !m.login.longLived
+		if m.login.sess.Cancel != nil {
+			m.login.sess.Cancel()
+		}
+		m.login = loginState{}
+		return m.startLogin(providerName, next)
 	case "ctrl+o":
 		if url := m.login.sess.URL; url != "" {
 			return m, openURL(url)
@@ -231,7 +252,11 @@ func (m Model) viewLogin(h int) string {
 	th := m.th
 	l := m.login
 	var b strings.Builder
-	b.WriteString(th.bold("log in with "+providerDisplayName(l.provider)) + "\n\n")
+	title := "log in with " + providerDisplayName(l.provider)
+	if l.longLived {
+		title += "  ·  long-lived (1 year)"
+	}
+	b.WriteString(th.bold(title) + "\n\n")
 	if l.sess.URL == "" && l.err == "" {
 		b.WriteString(th.dim("starting the login flow…") + "\n")
 	} else if l.sess.URL != "" {
@@ -249,6 +274,14 @@ func (m Model) viewLogin(h int) string {
 		b.WriteString(th.dim("3.") + " if the browser cannot reach this machine, paste the code:\n")
 		b.WriteString("   " + l.code.View() + "\n\n")
 		b.WriteString(th.dim("waiting for the browser or a pasted code…") + "\n")
+	}
+	if l.provider == "anthropic" {
+		state := "off"
+		if l.longLived {
+			state = "on"
+		}
+		b.WriteString("\n" + th.dim("ctrl+t long-lived: ") + th.accent(state) +
+			th.dim("  ·  scope user:inference user:profile") + "\n")
 	}
 	if l.err != "" {
 		b.WriteString("\n" + th.bad(truncate(l.err, max(20, m.width-12))) + "\n")

@@ -327,6 +327,13 @@ func (m Model) viewAccountDetail(a view.Account) string {
 	var b strings.Builder
 	b.WriteString("  " + th.dim(strings.Repeat("─", min(m.width-4, 60))) + "\n")
 	b.WriteString("  " + th.identity(a.ID, th.bold(a.Label)) + th.dim("  ·  "+a.Provider+"  ·  id "+a.ID) + "\n")
+	if a.LongLived {
+		line := "token: long-lived"
+		if a.ExpiresAt > 0 {
+			line += " · expires " + time.UnixMilli(a.ExpiresAt).Format("2006-01-02")
+		}
+		b.WriteString("  " + th.dim(line) + "\n")
+	}
 	if a.LastError != "" {
 		b.WriteString("  " + th.bad("last error: "+truncate(a.LastError, m.width-16)) + "\n")
 	}

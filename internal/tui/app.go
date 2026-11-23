@@ -96,6 +96,10 @@ type Model struct {
 	settings settingsState
 	overview overviewState
 	login    loginState
+	// loginSeq stamps every started flow and its resulting messages. A flow
+	// that is cancelled and replaced (the long-lived toggle) can still deliver
+	// its one result; that stale result must not land on the new pane.
+	loginSeq int
 
 	fetchingStatus   bool
 	fetchingOverview bool
