@@ -71,6 +71,12 @@ func (a *Anthropic) baseURL() string {
 }
 
 func (a *Anthropic) Refresh(ctx context.Context, c provider.Credential) (provider.Credential, error) {
+	// A long-lived credential is a static bearer: setup tokens carry no refresh
+	// token and cannot be renewed. Refuse locally rather than posting an empty
+	// grant; the caller's only recovery is a fresh login.
+	if c.LongLived || c.RefreshToken == "" {
+		return provider.Credential{}, ErrRefreshRejected
+	}
 	return RefreshToken(ctx, a.hc, a.tokenEndpoint(), c.RefreshToken)
 }
 

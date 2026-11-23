@@ -87,7 +87,7 @@ type Source interface {
 	// the account is already persisted and serving traffic without a
 	// restart (spec §6.1) — that happens inside the flow itself, before
 	// Done ever fires; Login here is a thin lookup of the named provider.
-	Login(ctx context.Context, providerName string) (provider.LoginSession, error)
+	Login(ctx context.Context, providerName string, opts LoginOptions) (provider.LoginSession, error)
 
 	// ImportCredentials reads accounts from an external credential file
 	// (config.ImportSourceLegacy or config.ImportSourceClaudeCode, spec

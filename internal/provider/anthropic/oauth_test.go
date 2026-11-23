@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicko170/aiproxy/internal/provider"
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
@@ -125,5 +126,17 @@ func TestRefreshTokenDoesNotRetryRejection(t *testing.T) {
 	}
 	if n := len(up.Requests()); n != 1 {
 		t.Errorf("made %d requests, want exactly 1", n)
+	}
+}
+
+// Setup tokens are static bearers: no refresh token, no refresh. A refresh
+// attempt must be refused locally rather than sent as an empty grant.
+func TestRefreshRefusesLongLivedCredential(t *testing.T) {
+	p := New(http.DefaultClient)
+	_, err := p.Refresh(context.Background(), provider.Credential{
+		Type: provider.CredentialOAuth, AccessToken: "at", LongLived: true,
+	})
+	if !errors.Is(err, ErrRefreshRejected) {
+		t.Fatalf("err = %v, want ErrRefreshRejected", err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -302,16 +303,16 @@ func TestRenderChartKeepsWidthAndShowsSmallColumns(t *testing.T) {
 
 func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 	m := fixtureModel(100, 30)
-	res, _ := m.startLogin("anthropic")
+	res, _ := m.startLogin("anthropic", false)
 	m = res.(Model)
-	m, _ = m.updateLogin(loginStartedMsg{sess: view.LoginSession{URL: "https://example.test/authorize?x=1"}})
+	m, _ = m.updateLogin(loginStartedMsg{sess: view.LoginSession{URL: "https://example.test/authorize?x=1"}, seq: m.loginSeq})
 	out := m.View()
 	if !strings.Contains(out, "https://example.test/authorize?x=1") {
 		t.Error("login must show the authorize URL")
 	}
 
 	// A closed Done without a value is "no result", never success.
-	m, _ = m.updateLogin(loginDoneMsg{ok: false})
+	m, _ = m.updateLogin(loginDoneMsg{ok: false, seq: m.loginSeq})
 	if !m.login.active {
 		t.Error("a resultless close must keep the flow open with an error, not report success")
 	}
@@ -328,10 +329,12 @@ func TestLoginViewShowsURLNeverACredential(t *testing.T) {
 type loginRecordingSource struct {
 	view.Source
 	gotProvider string
+	lastOpts    view.LoginOptions
 }
 
-func (s *loginRecordingSource) Login(ctx context.Context, providerName string) (view.LoginSession, error) {
+func (s *loginRecordingSource) Login(ctx context.Context, providerName string, opts view.LoginOptions) (view.LoginSession, error) {
 	s.gotProvider = providerName
+	s.lastOpts = opts
 	return view.LoginSession{}, nil
 }
 
@@ -814,5 +817,88 @@ func TestActivityShowsModelOverride(t *testing.T) {
 	}
 	if w := modelWidthFor([]view.Event{plain, over}); w != len([]rune(want)) {
 		t.Errorf("override width = %d, want %d", w, len([]rune(want)))
+	}
+}
+
+// --- long-lived login ---
+
+// The toggle is not a separate provider: it restarts the Anthropic login in
+// the other mode, and the second request must carry LongLived=true.
+func TestLoginCtrlTTogglesLongLivedAndRestarts(t *testing.T) {
+	rec := &loginRecordingSource{}
+	m := fixtureModel(120, 28)
+	m.src = rec
+
+	next, cmd := m.startLogin("anthropic", false)
+	m = next.(Model)
+	cmd() // records the first options synchronously
+	if rec.lastOpts.LongLived {
+		t.Fatal("first start should be standard")
+	}
+	standard := m.View()
+	if !strings.Contains(standard, "ctrl+t long-lived: off") {
+		t.Error("standard pane does not show the toggle as off")
+	}
+	// The reduced scope is the on state only; the standard login still asks
+	// for the full set.
+	if strings.Contains(standard, "inference+profile") {
+		t.Error("standard pane misstates the requested scope")
+	}
+
+	cancelled := make(chan struct{})
+	m.login.sess = view.LoginSession{Cancel: func() { close(cancelled) }}
+	next, cmd = m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlT})
+	m = next.(Model)
+	if !m.login.active || !m.login.longLived {
+		t.Fatalf("login = %+v, want a restarted long-lived flow", m.login)
+	}
+	select {
+	case <-cancelled:
+	default:
+		t.Error("ctrl+t did not cancel the previous session")
+	}
+	cmd() // records the restarted options
+	if !rec.lastOpts.LongLived {
+		t.Error("ctrl+t did not restart with LongLived")
+	}
+	out := m.View()
+	if !strings.Contains(out, "long-lived (1 year)") {
+		t.Errorf("title does not say the mode: %q", out)
+	}
+	if !strings.Contains(out, "inference+profile") {
+		t.Error("long-lived pane does not name its scope")
+	}
+}
+
+// Restarting a flow leaves the old session's Done delivering a cancellation.
+// Without a sequence check that message landed on the NEW pane as an error.
+func TestLoginIgnoresStaleDoneFromCancelledFlow(t *testing.T) {
+	m := fixtureModel(120, 28)
+	m.loginSeq = 2
+	m.login = loginState{active: true, seq: 2}
+
+	m, _ = m.updateLogin(loginDoneMsg{ok: true, seq: 1, res: view.LoginResult{Err: context.Canceled}})
+	if m.login.err != "" {
+		t.Errorf("stale done set err = %q", m.login.err)
+	}
+	if !m.login.active {
+		t.Error("stale done closed the new flow")
+	}
+
+	m, _ = m.updateLogin(loginDoneMsg{ok: true, seq: 2, res: view.LoginResult{Err: context.Canceled}})
+	if m.login.err == "" {
+		t.Error("current done was ignored")
+	}
+}
+
+func TestAccountDetailShowsLongLivedExpiry(t *testing.T) {
+	m := fixtureModel(120, 28)
+	exp := fixtureNow.Add(365 * 24 * time.Hour).UnixMilli()
+	out := m.viewAccountDetail(view.Account{
+		ID: "a1", Label: "one", Provider: "anthropic",
+		LongLived: true, ExpiresAt: exp,
+	})
+	if !strings.Contains(out, "long-lived") || !strings.Contains(out, "expires") {
+		t.Errorf("detail = %q, want a long-lived expiry line", out)
 	}
 }

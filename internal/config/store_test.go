@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"sync"
@@ -294,5 +295,44 @@ func TestPrivacyNonPositiveBoundsFallBackToDefaults(t *testing.T) {
 	}
 	if cfg.Privacy.CacheEntries <= 0 || cfg.Privacy.NER.MaxScanBytes <= 0 {
 		t.Errorf("bounds were not corrected on load: %+v", cfg.Privacy)
+	}
+}
+
+// A long-lived marker must survive the round trip: if it were dropped on
+// restart, the account would look like a standard credential with no refresh
+// token and retry its dead bearer forever instead of sidelining for re-login.
+func TestCredentialLongLivedRoundTrips(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	s := NewStore(path)
+
+	const expiresAt = int64(1_826_937_600_000)
+	if _, err := s.Update(func(c *Config) error {
+		c.Accounts = append(c.Accounts, Account{
+			ID: "oat", Provider: "anthropic", Label: "one",
+			Credential: provider.Credential{
+				Type: provider.CredentialOAuth, AccessToken: "at",
+				LongLived: true, ExpiresAt: expiresAt,
+			},
+		})
+		return nil
+	}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	reloaded, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	got := reloaded.Accounts[0].Credential
+	if !got.LongLived || got.ExpiresAt != expiresAt {
+		t.Errorf("credential = %+v, want LongLived and ExpiresAt preserved", got)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"longLived": true`)) {
+		t.Errorf("config JSON = %s, want a longLived field", raw)
 	}
 }

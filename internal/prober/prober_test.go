@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -79,7 +80,7 @@ func (f *fakeProvider) Models(_ context.Context, _ provider.Credential) ([]provi
 	}
 	return f.models, nil
 }
-func (f *fakeProvider) Login(context.Context) (provider.LoginSession, error) {
+func (f *fakeProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 func (f *fakeProvider) Endpoint(provider.Account) *url.URL {
@@ -101,7 +102,7 @@ func (f *fakeProvider) Quota(ctx context.Context, c provider.Credential) (provid
 		return provider.Quota{}, provider.ErrUnsupported
 	}
 	if f.requireToken != "" && c.AccessToken != f.requireToken {
-		return provider.Quota{}, errors.New("usage: HTTP 401")
+		return provider.Quota{}, fmt.Errorf("%w: usage: HTTP 401", provider.ErrCredentialRejected)
 	}
 	if f.started != nil {
 		f.started <- struct{}{}
@@ -134,6 +135,16 @@ func oauthAcct(id string) config.Account {
 	return config.Account{
 		ID: id, Provider: "fake", Label: id,
 		Credential: provider.Credential{Type: provider.CredentialOAuth, AccessToken: "at"},
+	}
+}
+
+func longLivedAcct(id string) config.Account {
+	return config.Account{
+		ID: id, Provider: "fake", Label: id,
+		Credential: provider.Credential{
+			Type: provider.CredentialOAuth, AccessToken: "oat", LongLived: true,
+			ExpiresAt: time.Now().Add(365 * 24 * time.Hour).UnixMilli(),
+		},
 	}
 }
 
@@ -771,5 +782,37 @@ func TestProbeToleratesUnsupportedModels(t *testing.T) {
 
 	if err := p.ProbeNow(context.Background()); err != nil {
 		t.Errorf("ProbeNow: %v; an unsupported catalogue is not a probe failure", err)
+	}
+}
+
+// An idle server is exactly where a long-lived token expires: no inference
+// request is around to hit the 401 path, so the probe must sideline it once
+// instead of logging the same failed read every cycle forever.
+func TestProbeSidelinesALongLivedCredentialRejectedByQuota(t *testing.T) {
+	fp := &fakeProvider{requireToken: "never", results: []quotaResult{quotaOK()}}
+	mgr := newMgr(t, fp, longLivedAcct("a"))
+	p := New(mgr, map[string]provider.Provider{"fake": fp}, time.Hour)
+
+	// The first cycle reads with the dead bearer, sees the rejection, and
+	// sidelines the account.
+	_ = p.ProbeNow(context.Background())
+	a, ok := mgr.Get("a")
+	if !ok {
+		t.Fatal("account a should exist")
+	}
+	if a.Status != account.StatusErrored || !strings.Contains(a.LastError, "log in again") {
+		t.Errorf("account = %+v, want errored with the re-login message", a)
+	}
+	if got := fp.refreshCount(); got != 0 {
+		t.Errorf("refreshes = %d, want 0: a long-lived token cannot refresh", got)
+	}
+	if got := fp.callCount(); got != 1 {
+		t.Fatalf("quota calls = %d, want 1", got)
+	}
+
+	// The next cycle must not spend a call on it again.
+	_ = p.ProbeNow(context.Background())
+	if got := fp.callCount(); got != 1 {
+		t.Errorf("quota calls after the second cycle = %d, want 1", got)
 	}
 }

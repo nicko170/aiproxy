@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/nicko170/aiproxy/internal/account"
 	"github.com/nicko170/aiproxy/internal/config"
@@ -24,7 +28,7 @@ func TestOnLoginSuccessAddsANewAccountButDedupesARelogin(t *testing.T) {
 		Persist:         func(string, provider.Credential) error { return nil },
 	})
 
-	hook := onLoginSuccess(store, mgr, "anthropic")
+	hook := onLoginSuccess(store, mgr, "anthropic", slog.Default())
 
 	profile1 := provider.Profile{
 		Email: "a@example.com", OrgName: "Acme", AccountUUID: "uuid-1", OrgUUID: "org-1", Plan: "pro",
@@ -168,4 +172,51 @@ func TestMergeLoginAccountDedupesOnUUIDThenLabel(t *testing.T) {
 			t.Fatalf("accounts = %d, want 2", len(cfg.Accounts))
 		}
 	})
+}
+
+// A long-lived login that comes back materially shorter than a year means the
+// server ignored expires_in. The login still works; the operator must be told
+// now rather than discovering it when the account dies in an hour.
+func TestOnLoginSuccessWarnsWhenLongLivedTokenIsShort(t *testing.T) {
+	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	mgr := account.New(nil, map[string]provider.Provider{}, account.Options{
+		Persist: func(string, provider.Credential) error { return nil },
+	})
+	var buf bytes.Buffer
+	hook := onLoginSuccess(store, mgr, "anthropic", slog.New(slog.NewTextHandler(&buf, nil)))
+
+	err := hook(context.Background(), provider.Credential{
+		Type: provider.CredentialOAuth, AccessToken: "at", LongLived: true,
+		ExpiresAt: time.Now().Add(24 * time.Hour).UnixMilli(),
+	}, provider.Profile{Email: "a@example.com", AccountUUID: "u1"})
+	if err != nil {
+		t.Fatalf("hook: %v", err)
+	}
+	log := buf.String()
+	if !strings.Contains(log, "shorter") {
+		t.Errorf("log = %q, want a downgrade warning", log)
+	}
+	if !strings.Contains(log, "expiresIn=") {
+		t.Errorf("log = %q, want the actual lifetime named", log)
+	}
+}
+
+func TestOnLoginSuccessDoesNotWarnForAFullYearLongLivedToken(t *testing.T) {
+	store := config.NewStore(filepath.Join(t.TempDir(), "config.json"))
+	mgr := account.New(nil, map[string]provider.Provider{}, account.Options{
+		Persist: func(string, provider.Credential) error { return nil },
+	})
+	var buf bytes.Buffer
+	hook := onLoginSuccess(store, mgr, "anthropic", slog.New(slog.NewTextHandler(&buf, nil)))
+
+	err := hook(context.Background(), provider.Credential{
+		Type: provider.CredentialOAuth, AccessToken: "at", LongLived: true,
+		ExpiresAt: time.Now().Add(365 * 24 * time.Hour).UnixMilli(),
+	}, provider.Profile{Email: "b@example.com", AccountUUID: "u2"})
+	if err != nil {
+		t.Fatalf("hook: %v", err)
+	}
+	if strings.Contains(buf.String(), "shorter") {
+		t.Errorf("log = %q, want no downgrade warning", buf.String())
+	}
 }

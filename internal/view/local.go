@@ -283,6 +283,8 @@ func (l *Local) Accounts(ctx context.Context) ([]Account, error) {
 			PausedUntil:      a.PausedUntil,
 			Buckets:          buckets,
 			Group:            a.Group,
+			LongLived:        a.Credential.LongLived,
+			ExpiresAt:        a.Credential.ExpiresAt,
 		})
 	}
 	return out, nil
@@ -730,12 +732,12 @@ func setAccountField(c *config.Config, accountID string, fn func(*config.Account
 // SetPriority/RemoveAccount/etc. here would not help and holding a lock
 // across an operation that can take up to two minutes would be actively
 // harmful.
-func (l *Local) Login(ctx context.Context, providerName string) (provider.LoginSession, error) {
+func (l *Local) Login(ctx context.Context, providerName string, opts LoginOptions) (provider.LoginSession, error) {
 	p, ok := l.mgr.Provider(providerName)
 	if !ok {
 		return provider.LoginSession{}, fmt.Errorf("unknown provider %q", providerName)
 	}
-	return p.Login(ctx)
+	return p.Login(ctx, opts)
 }
 
 // ImportCredentials reads accounts from an external credential file (spec

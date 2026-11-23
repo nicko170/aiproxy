@@ -55,6 +55,17 @@ type Credential struct {
 	// chatgpt-account-id header on every Responses call; Anthropic has no
 	// equivalent and leaves this empty.
 	AccountID string `json:"accountId,omitempty"`
+	// LongLived marks a credential obtained through a setup-token-style login:
+	// a static bearer with no refresh token. It is never refreshed; renewal is
+	// a fresh login. Only Anthropic's long-lived login sets it.
+	LongLived bool `json:"longLived,omitempty"`
+}
+
+// LoginOptions selects a login flavour. Zero is the provider's standard
+// interactive login. LongLived asks for a setup-token-style one-year grant and
+// is unsupported by providers that have no such thing.
+type LoginOptions struct {
+	LongLived bool
 }
 
 // Profile identifies who a credential belongs to.
@@ -292,8 +303,10 @@ type Provider interface {
 	// ephemeral port, and an authorize URL carrying its challenge (spec
 	// §6.1). It returns immediately; the flow completes asynchronously on
 	// LoginSession.Done. A provider with no interactive login (none in v1)
-	// may return ErrUnsupported.
-	Login(ctx context.Context) (LoginSession, error)
+	// may return ErrUnsupported. opts selects a flavour; a provider that does
+	// not offer the requested one returns ErrUnsupported rather than silently
+	// substituting its standard login.
+	Login(ctx context.Context, opts LoginOptions) (LoginSession, error)
 
 	Endpoint(a Account) *url.URL
 	Authorize(r *http.Request, c Credential)

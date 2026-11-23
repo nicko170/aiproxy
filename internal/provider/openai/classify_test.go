@@ -19,10 +19,8 @@ func hdr(kv map[string]string) *http.Response {
 
 func hdrStatus(status int, kv map[string]string) *http.Response {
 	h := http.Header{}
-	if kv != nil {
-		for k, v := range kv {
-			h.Set(k, v)
-		}
+	for k, v := range kv {
+		h.Set(k, v)
 	}
 	return &http.Response{StatusCode: status, Header: h}
 }

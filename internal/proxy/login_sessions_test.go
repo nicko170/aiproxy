@@ -19,7 +19,7 @@ type fakeLoginSource struct {
 	login func(ctx context.Context) (provider.LoginSession, error)
 }
 
-func (f fakeLoginSource) Login(ctx context.Context, _ string) (provider.LoginSession, error) {
+func (f fakeLoginSource) Login(ctx context.Context, _ string, _ provider.LoginOptions) (provider.LoginSession, error) {
 	return f.login(ctx)
 }
 
@@ -38,7 +38,7 @@ func TestLoginSessionRegistryBeginUsesARequestIndependentContext(t *testing.T) {
 		return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 	}}
 
-	id, _, err := reg.begin(src, "anthropic")
+	id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
@@ -72,7 +72,7 @@ func TestLoginSessionRegistryReleasesTerminalSessions(t *testing.T) {
 			return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 		}}
 
-		id, _, err := reg.begin(src, "anthropic")
+		id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
@@ -91,7 +91,7 @@ func TestLoginSessionRegistryReleasesTerminalSessions(t *testing.T) {
 			return provider.LoginSession{URL: "https://example.invalid", Done: done}, nil
 		}}
 
-		id, _, err := reg.begin(src, "anthropic")
+		id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
 		if err != nil {
 			t.Fatalf("begin: %v", err)
 		}
@@ -114,4 +114,35 @@ func assertSessionReleased(t *testing.T, reg *loginSessionRegistry, id string) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("session %s was never released from the registry", id)
+}
+
+func TestLoginSessionRegistryCancelCancelsAndReleases(t *testing.T) {
+	cancelled := make(chan struct{})
+	src := fakeLoginSource{login: func(context.Context) (provider.LoginSession, error) {
+		return provider.LoginSession{
+			URL:    "https://example.invalid/authorize",
+			Done:   make(chan provider.LoginResult, 1),
+			Cancel: func() { close(cancelled) },
+		}, nil
+	}}
+	reg := newLoginSessionRegistry()
+	id, _, err := reg.begin(src, "anthropic", provider.LoginOptions{})
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+
+	if !reg.cancel(id) {
+		t.Fatal("cancel returned false for a live session")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Cancel was not called")
+	}
+	if _, ok := reg.get(id); ok {
+		t.Error("cancelled session is still registered")
+	}
+	if reg.cancel(id) {
+		t.Error("a second cancel reported success")
+	}
 }

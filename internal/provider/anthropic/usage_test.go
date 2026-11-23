@@ -171,3 +171,19 @@ func TestQuotaUnsupportedForAPIKeyCredential(t *testing.T) {
 		t.Fatalf("err = %v, want provider.ErrUnsupported", err)
 	}
 }
+
+// The prober treats a 401 from the usage endpoint as a dead bearer: it forces a
+// refresh, which sidles a long-lived credential. That only works if the error
+// is recognizable as a credential rejection rather than a generic HTTP string.
+func TestQuota401WrapsCredentialRejected(t *testing.T) {
+	up := testutil.NewFakeUpstream(t, testutil.Script{Status: 401, Body: `{}`})
+	p := New(http.DefaultClient)
+	p.BaseURLOverride = up.URL()
+
+	_, err := p.Quota(context.Background(), provider.Credential{
+		Type: provider.CredentialOAuth, AccessToken: "at",
+	})
+	if !errors.Is(err, provider.ErrCredentialRejected) {
+		t.Fatalf("err = %v, want it to wrap ErrCredentialRejected", err)
+	}
+}

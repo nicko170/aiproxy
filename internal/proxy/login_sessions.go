@@ -75,8 +75,8 @@ func randomSessionID() (string, error) {
 // returns; combined with a bug in loginFlow.awaitTimeout (fixed separately)
 // that silently defeated the whole timeout, every started login leaked its
 // loopback listener, its goroutines, and this registry entry forever.
-func (r *loginSessionRegistry) begin(src view.Source, providerName string) (id, url string, err error) {
-	sess, err := src.Login(context.Background(), providerName)
+func (r *loginSessionRegistry) begin(src view.Source, providerName string, opts provider.LoginOptions) (id, url string, err error) {
+	sess, err := src.Login(context.Background(), providerName, opts)
 	if err != nil {
 		return "", "", err
 	}
@@ -117,6 +117,26 @@ func (r *loginSessionRegistry) begin(src view.Source, providerName string) (id, 
 	}()
 
 	return id, sess.URL, nil
+}
+
+// cancel abandons a pending session: it removes the registry entry first so a
+// concurrent poll sees "no such session" rather than a stale pending state,
+// then tears the provider flow down. The Done-draining goroutine started by
+// begin still holds its state and exits normally; its later delete is a no-op.
+func (r *loginSessionRegistry) cancel(id string) bool {
+	r.mu.Lock()
+	st, ok := r.sessions[id]
+	if ok {
+		delete(r.sessions, id)
+	}
+	r.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if st.sess.Cancel != nil {
+		st.sess.Cancel()
+	}
+	return true
 }
 
 func (r *loginSessionRegistry) get(id string) (*loginSessionState, bool) {

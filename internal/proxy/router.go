@@ -54,6 +54,7 @@ func NewRouter(o HandlerOptions) http.Handler {
 		cp.Post("/api/v1/accounts/login", loginBeginHandler(o, loginSessions))
 		cp.Post("/api/v1/accounts/login/{sessionId}/code", loginSubmitCodeHandler(o, loginSessions))
 		cp.Get("/api/v1/accounts/login/{sessionId}", loginPollHandler(o, loginSessions))
+		cp.Delete("/api/v1/accounts/login/{sessionId}", loginCancelHandler(o, loginSessions))
 
 		// The dashboard mounts INSIDE the reserved prefix, as a sibling of the
 		// API routes rather than by relaxing cp.NotFound. That handler exists so

@@ -18,6 +18,15 @@ const (
 	TokenEndpoint = "https://platform.claude.com/v1/oauth/token"
 	AuthorizeURL  = "https://claude.ai/oauth/authorize"
 	Scopes        = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
+
+	// LongLivedScopes is the grant a setup-token-style login asks for. The
+	// token endpoint honours a custom expiry only for a grant without
+	// org:create_api_key (and the other non-inference scopes); user:profile
+	// stays because aiproxy reads identity and quota with it.
+	LongLivedScopes = "user:inference user:profile"
+	// LongLivedTokenTTLSeconds is the one-year lifetime `claude setup-token`
+	// requests: 365 days, the same value Claude Code 2.1.330 hardwires.
+	LongLivedTokenTTLSeconds int64 = 31536000
 )
 
 // ErrRefreshRejected reports that the refresh token was refused. It is not

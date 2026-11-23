@@ -63,11 +63,6 @@ func newModelsHarnessWithKey(t *testing.T, apiKey string, specs ...acctSpec) *mo
 	return newModelsHarnessFull(t, false, apiKey, specs...)
 }
 
-func newModelsHarnessWith(t *testing.T, disabled bool, specs ...acctSpec) *modelsHarness {
-	t.Helper()
-	return newModelsHarnessFull(t, disabled, "", specs...)
-}
-
 func newModelsHarnessFull(t *testing.T, disabled bool, apiKey string, specs ...acctSpec) *modelsHarness {
 	t.Helper()
 	accts := make([]config.Account, 0, len(specs))
@@ -211,7 +206,7 @@ func (refusingProvider) Quota(context.Context, provider.Credential) (provider.Qu
 func (refusingProvider) Models(context.Context, provider.Credential) ([]provider.Model, error) {
 	return nil, provider.ErrUnsupported
 }
-func (refusingProvider) Login(context.Context) (provider.LoginSession, error) {
+func (refusingProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 func (refusingProvider) Endpoint(provider.Account) *url.URL {

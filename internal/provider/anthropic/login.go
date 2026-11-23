@@ -124,7 +124,7 @@ func authorizeQuery(params []authorizeParam) string {
 	return strings.Join(parts, "&")
 }
 
-func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
+func (a *Anthropic) Login(ctx context.Context, opts provider.LoginOptions) (provider.LoginSession, error) {
 	verifier, err := randToken(32)
 	if err != nil {
 		return provider.LoginSession{}, err
@@ -172,6 +172,10 @@ func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 	// authorize endpoint actually inspects order was never confirmed either
 	// way — the fix is to stop being the one difference from a request known
 	// to work, not to first prove which difference mattered.
+	scope := Scopes
+	if opts.LongLived {
+		scope = LongLivedScopes
+	}
 	authURL.RawQuery = authorizeQuery([]authorizeParam{
 		// code=true selects the CLI-style authorize flow that produces a
 		// pasteable code; omitting it makes the consent page submit a
@@ -181,7 +185,7 @@ func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 		{"client_id", ClientID},
 		{"response_type", "code"},
 		{"redirect_uri", redirectURI},
-		{"scope", Scopes},
+		{"scope", scope},
 		{"code_challenge", pkceChallenge(verifier)},
 		{"code_challenge_method", "S256"},
 		{"state", state},
@@ -189,7 +193,8 @@ func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 
 	f := &loginFlow{
 		a: a, verifier: verifier, state: state, redirectURI: redirectURI,
-		done: make(chan provider.LoginResult, 1),
+		longLived: opts.LongLived,
+		done:      make(chan provider.LoginResult, 1),
 	}
 	f.ctx, f.cancel = context.WithCancel(ctx)
 
@@ -218,6 +223,9 @@ func (a *Anthropic) Login(ctx context.Context) (provider.LoginSession, error) {
 type loginFlow struct {
 	a                            *Anthropic
 	verifier, state, redirectURI string
+	// longLived asks the token endpoint for a one-year grant and marks the
+	// resulting credential as a static bearer (see Credential.LongLived).
+	longLived bool
 
 	srv  *http.Server
 	done chan provider.LoginResult
@@ -273,9 +281,12 @@ func (f *loginFlow) finish(res provider.LoginResult) {
 	f.once.Do(func() {
 		f.cancel()
 		go func() {
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			f.srv.Shutdown(shutdownCtx) //nolint:errcheck // best-effort; the listener is torn down either way
+			// Close, not Shutdown: Shutdown waits for every connection to go
+			// idle, and the browser leaves the one-shot callback page open, so
+			// Done could sit behind the full shutdown grace period. The response
+			// has already been written by the time complete reaches finish; the
+			// listener and its connections are what must be gone before Done.
+			f.srv.Close() //nolint:errcheck // best-effort; the listener is torn down either way
 			f.done <- res
 		}()
 	})
@@ -438,14 +449,21 @@ func (f *loginFlow) complete(code string) {
 // Mirrors refreshOnce's shape (spec's token endpoint is the same one), but
 // with an authorization_code grant instead of refresh_token.
 func (f *loginFlow) exchange(code string) (provider.Credential, error) {
-	payload, err := json.Marshal(map[string]string{
+	payloadBody := map[string]any{
 		"grant_type":    "authorization_code",
 		"code":          code,
 		"state":         f.state,
 		"client_id":     ClientID,
 		"redirect_uri":  f.redirectURI,
 		"code_verifier": f.verifier,
-	})
+	}
+	if f.longLived {
+		// The setup-token expiry request. This is the only request-shape
+		// difference beyond the reduced scope; the token endpoint reads it as
+		// seconds.
+		payloadBody["expires_in"] = LongLivedTokenTTLSeconds
+	}
+	payload, err := json.Marshal(payloadBody)
 	if err != nil {
 		return provider.Credential{}, err
 	}
@@ -486,6 +504,12 @@ func (f *loginFlow) exchange(code string) (provider.Credential, error) {
 		AccessToken:  tr.AccessToken,
 		RefreshToken: tr.RefreshToken,
 		ExpiresAt:    NormalizeExpiresAt(tr.ExpiresAt),
+		LongLived:    f.longLived,
+	}
+	if f.longLived {
+		// Setup tokens are static bearers. Storing a refresh token we must not
+		// use would only invite a later path to try to renew it.
+		cred.RefreshToken = ""
 	}
 	if cred.ExpiresAt == 0 {
 		secs := tr.ExpiresIn

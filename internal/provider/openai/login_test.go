@@ -19,6 +19,16 @@ import (
 	"github.com/nicko170/aiproxy/internal/testutil"
 )
 
+// Long-lived tokens are an Anthropic subscription feature; OpenAI has no such
+// grant. Asking for one must fail loudly rather than silently producing a
+// standard one-hour login the caller believes is a year.
+func TestLoginRejectsLongLived(t *testing.T) {
+	_, err := New(http.DefaultClient).Login(context.Background(), provider.LoginOptions{LongLived: true})
+	if !errors.Is(err, provider.ErrUnsupported) {
+		t.Fatalf("err = %v, want ErrUnsupported", err)
+	}
+}
+
 // PKCE S256 against a known vector, so a change to the encoding is caught here
 // rather than as an opaque invalid_grant from the token endpoint.
 func TestPkceChallengeIsS256Base64URLNoPad(t *testing.T) {
@@ -201,7 +211,7 @@ func TestLoginReturnsAWellFormedAuthorizeURLAndNeverTheVerifier(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -232,7 +242,7 @@ func TestLoginCallbackWithCorrectStateSucceedsAndPersists(t *testing.T) {
 		return nil
 	}
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -276,7 +286,7 @@ func TestLoginOnLoginSuccessErrorFailsTheLogin(t *testing.T) {
 		return persistErr
 	}
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -307,7 +317,7 @@ func TestLoginCallbackWithWrongStateDoesNotConsumeTheFlow(t *testing.T) {
 	p := newLoginProvider(t, up)
 	p.LoginTimeoutOverride = 5 * time.Second // long enough that only completion, not a timeout, explains the result
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -348,7 +358,7 @@ func TestLoginCallbackWithOnlyWrongStateEventuallyTimesOut(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -374,7 +384,7 @@ func TestLoginTimesOutAndCleansUpTheListener(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -396,7 +406,7 @@ func TestLoginCancelCleansUpTheListenerAndDeliversExactlyOneResult(t *testing.T)
 	p := newLoginProvider(t, up)
 	p.LoginTimeoutOverride = 5 * time.Second // long enough that only Cancel could explain completion
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -417,7 +427,7 @@ func TestLoginSubmitCodeAcceptsAPastedCodeWithoutTheBrowser(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -441,7 +451,7 @@ func TestLoginSubmitCodeWithWrongStateIsRejected(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -463,7 +473,7 @@ func TestLoginDoubleSubmitIsRejectedNotAPanic(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -489,7 +499,7 @@ func TestLoginNeverReturnsCredentialMaterial(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), secretRefresh)
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -520,7 +530,7 @@ func TestLoginParentContextCancellationTerminatesTheFlow(t *testing.T) {
 	p.LoginTimeoutOverride = 5 * time.Second // long enough that only cancellation explains a prompt result
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sess, err := p.Login(ctx)
+	sess, err := p.Login(ctx, provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -556,7 +566,7 @@ func TestLoginCancelMidExchangeNeverPersistsTheAccount(t *testing.T) {
 		return nil
 	}
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -598,7 +608,7 @@ func TestLoginAuthorizeURLPinsExactProtocolParameters(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -656,7 +666,7 @@ func TestLoginSubmitCodeAcceptsAFullPastedCallbackURL(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -684,7 +694,7 @@ func TestLoginSubmitCodeWithFullPastedURLAndWrongStateIsRejected(t *testing.T) {
 	up := loginUpstream(t, loginAccessToken(t), "rt")
 	p := newLoginProvider(t, up)
 
-	sess, err := p.Login(context.Background())
+	sess, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -733,7 +743,7 @@ func TestLoginBindsTheRegisteredCallbackPortWithFallback(t *testing.T) {
 	// Phase 1: with both ports free, Login must bind the registered port
 	// 1455 exactly — it is not interchangeable with the fallback while it is
 	// available.
-	sess1, err := p.Login(context.Background())
+	sess1, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
@@ -750,7 +760,7 @@ func TestLoginBindsTheRegisteredCallbackPortWithFallback(t *testing.T) {
 
 	// Phase 2: with 1455 now held by sess1's still-open listener, a second
 	// Login must fall back to 1457 rather than fail.
-	sess2, err := p.Login(context.Background())
+	sess2, err := p.Login(context.Background(), provider.LoginOptions{})
 	if err != nil {
 		sess1.Cancel()
 		awaitResult(t, sess1.Done)

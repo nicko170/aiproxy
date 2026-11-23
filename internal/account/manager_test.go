@@ -66,7 +66,7 @@ func (s *stubProvider) Refresh(ctx context.Context, c provider.Credential) (prov
 func (s *stubProvider) Profile(context.Context, provider.Credential) (provider.Profile, error) {
 	return provider.Profile{}, provider.ErrUnsupported
 }
-func (s *stubProvider) Login(context.Context) (provider.LoginSession, error) {
+func (s *stubProvider) Login(context.Context, provider.LoginOptions) (provider.LoginSession, error) {
 	return provider.LoginSession{}, provider.ErrUnsupported
 }
 
@@ -642,5 +642,38 @@ func TestEnsureFreshIgnoresAPIKeyCredentials(t *testing.T) {
 	}
 	if n := p.refreshes.Load(); n != 0 {
 		t.Errorf("refreshed %d times, want 0 — an API key does not expire", n)
+	}
+}
+
+// A long-lived setup token is a static bearer: no refresh token, no renewal.
+// A forced refresh (the 401 path) must sideline it in one attempt with a
+// message that tells the operator what to do, rather than sending an empty
+// grant or retrying the same dead token on every request. A fresh login is
+// what clears it.
+func TestEnsureFreshForceSidelinesLongLivedCredential(t *testing.T) {
+	p := &stubProvider{}
+	m := New([]config.Account{{
+		ID: "a1", Provider: "stub", Label: "one",
+		Credential: provider.Credential{Type: provider.CredentialOAuth, AccessToken: "at", LongLived: true},
+	}}, map[string]provider.Provider{"stub": p}, Options{})
+
+	if err := m.EnsureFresh(context.Background(), "a1", true); !errors.Is(err, provider.ErrCredentialRejected) {
+		t.Fatalf("err = %v, want ErrCredentialRejected", err)
+	}
+	if n := p.refreshes.Load(); n != 0 {
+		t.Errorf("provider.Refresh called %d times, want 0", n)
+	}
+	a, _ := m.Get("a1")
+	if a.Status != StatusErrored || !strings.Contains(a.LastError, "log in again") {
+		t.Errorf("account = %+v, want errored with the re-login message", a)
+	}
+
+	if err := m.UpdateCredential("a1",
+		provider.Credential{Type: provider.CredentialOAuth, AccessToken: "at2", LongLived: true},
+		config.Identity{}, "one"); err != nil {
+		t.Fatalf("UpdateCredential: %v", err)
+	}
+	if a, _ := m.Get("a1"); a.Status != StatusActive || a.LastError != "" {
+		t.Errorf("after re-login account = %+v, want active and clear", a)
 	}
 }

@@ -384,8 +384,8 @@ func buildHandler(cfg config.Config, store *config.Store, log *slog.Logger, ing 
 	// so a successful login persists and goes live without a restart (spec
 	// §6.1). See accounts.go's onLoginSuccess for the full "persist, then
 	// apply" + re-login-dedupe story.
-	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr, "anthropic")
-	oai.OnLoginSuccess = onLoginSuccess(store, mgr, "openai")
+	anthropicProvider.OnLoginSuccess = onLoginSuccess(store, mgr, "anthropic", log)
+	oai.OnLoginSuccess = onLoginSuccess(store, mgr, "openai", log)
 
 	go repairPlaceholderLabels(store, mgr, providers, log)
 

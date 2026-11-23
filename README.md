@@ -305,6 +305,14 @@ provider (Anthropic or ChatGPT) — a browser opens for the OAuth flow, and if
 it can't reach one you can paste the authorization code back in. Repeat for
 each account you want in the rotation, across either or both providers.
 
+On the Anthropic login pane, `ctrl+t` turns on a **long-lived (one-year)**
+login. It requests the same kind of token `claude setup-token` does, with the
+`user:inference user:profile` scope and `expires_in=31536000`. Use it for a
+server that would otherwise need re-authorising every few weeks. The token is
+a static bearer with no refresh token: when it expires, log in again (the
+account shows the date). The dashboard's Claude login has the same option as
+a checkbox.
+
 Then point your agent at it:
 
 ```sh
@@ -337,8 +345,10 @@ have to re-authorize an account you have already logged into there.
 
 `tab` / `shift+tab` cycle screens. `?` opens help, `q` quits (and shuts the
 proxy down with it). `l` asks which provider (`a` Anthropic, `c` ChatGPT) and
-starts that login, `p` forces a quota probe, `o` opens the dashboard, and `u`
-installs an available update (see [Updating](#updating)).
+starts that login; on the Anthropic pane `ctrl+t` restarts it in long-lived
+mode, `ctrl+o` opens the URL, and `esc` cancels. `p` forces a quota probe, `o`
+opens the dashboard, and `u` installs an available update (see
+[Updating](#updating)).
 
 Per-screen keys are shown in the footer: `space` pauses the activity feed,
 `a`/`m`/`c` filter it by account/model/outcome and `v` toggles the log view;
@@ -712,7 +722,9 @@ internet access, and is served by the proxy itself at
   link the dashboard shows, approve, and paste back the code the provider's page
   displays. The OAuth callback listens on the *server's* loopback, which a
   browser on another machine can never reach, so this is the only path that
-  works there.
+  works there. Tick **Long-lived (1 year)** before approving for a token that
+  does not need re-authorising every few weeks; toggling it regenerates the
+  link.
 
 ## Control API
 
@@ -739,6 +751,7 @@ POST   /_aiproxy/api/v1/probe
 POST   /_aiproxy/api/v1/update
 POST   /_aiproxy/api/v1/accounts/import
 POST   /_aiproxy/api/v1/accounts/login
+DELETE /_aiproxy/api/v1/accounts/login/{sessionId}
 ```
 
 Anything under the prefix that isn't a control route is a 404, never a proxied
