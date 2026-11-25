@@ -74,14 +74,16 @@ func onLoginSuccess(store *config.Store, mgr *account.Manager, providerName stri
 }
 
 // accountDedupeKey identifies an account for login-dedupe purposes: its
-// credential's account uuid when known, else its label — the same two
-// fields config.ImportFile's dedupe (view's importDedupeKey) keys on, so a
-// re-login lands on the same account an import would already have deduped
-// onto. Empty for an account with neither, which is treated as never a
-// duplicate: there is nothing to key on.
+// account uuid paired with its org uuid when known, else its label. The org
+// uuid is part of the key because an Anthropic account uuid identifies the
+// user, not the subscription: one email that belongs to both a personal org
+// and a Team org has the same account uuid in each, and keying on the account
+// uuid alone made logging into the second org overwrite the first. Empty for
+// an account with neither, which is treated as never a duplicate: there is
+// nothing to key on.
 func accountDedupeKey(a config.Account) string {
 	if a.Identity.AccountUUID != "" {
-		return "uuid:" + a.Identity.AccountUUID
+		return "uuid:" + a.Identity.AccountUUID + "|org:" + a.Identity.OrgUUID
 	}
 	if a.Label != "" {
 		return "label:" + a.Label

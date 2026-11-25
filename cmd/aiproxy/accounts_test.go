@@ -158,6 +158,37 @@ func TestMergeLoginAccountDedupesOnUUIDThenLabel(t *testing.T) {
 		}
 	})
 
+	t.Run("same account uuid in a different org is a separate account", func(t *testing.T) {
+		// One email in both a personal org and a Team org: Anthropic returns
+		// the same account uuid for both. Logging into the second must not
+		// overwrite the first.
+		cfg := &config.Config{Accounts: []config.Account{
+			{ID: "personal", Identity: config.Identity{AccountUUID: "u1", OrgUUID: "org-personal"},
+				Credential: provider.Credential{AccessToken: "personal-token"}},
+		}}
+		acc := config.Account{ID: "team", Identity: config.Identity{AccountUUID: "u1", OrgUUID: "org-team"},
+			Credential: provider.Credential{AccessToken: "team-token"}}
+
+		id, isNew := mergeLoginAccount(cfg, acc)
+		if !isNew || id != "team" {
+			t.Errorf("got (%q, %v), want (\"team\", true): a different org is a different account", id, isNew)
+		}
+		if len(cfg.Accounts) != 2 {
+			t.Fatalf("accounts = %d, want 2", len(cfg.Accounts))
+		}
+		if cfg.Accounts[0].Credential.AccessToken != "personal-token" {
+			t.Errorf("personal account credential overwritten: %q", cfg.Accounts[0].Credential.AccessToken)
+		}
+
+		// A re-login into the same org still dedupes.
+		again := config.Account{ID: "fresh", Identity: config.Identity{AccountUUID: "u1", OrgUUID: "org-team"},
+			Credential: provider.Credential{AccessToken: "team-token-2"}}
+		id, isNew = mergeLoginAccount(cfg, again)
+		if isNew || id != "team" || len(cfg.Accounts) != 2 {
+			t.Errorf("re-login into same org: got (%q, %v, %d accounts), want (\"team\", false, 2)", id, isNew, len(cfg.Accounts))
+		}
+	})
+
 	t.Run("appends when nothing matches", func(t *testing.T) {
 		cfg := &config.Config{Accounts: []config.Account{
 			{ID: "existing", Identity: config.Identity{AccountUUID: "u1"}},
